@@ -1,0 +1,19 @@
+# Linux domain member client.
+#
+# Two join paths are installed deliberately so the lab can exercise both:
+#   realmd + sssd  - the high-level, distro-blessed path
+#   adcli / net ads - the low-level path, useful when realmd hides the error
+FROM docker.io/library/ubuntu:latest
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        realmd adcli sssd sssd-ad sssd-tools libnss-sss libpam-sss \
+        samba-common-bin smbclient krb5-user krb5-config \
+        dnsutils iproute2 iputils-ping procps ldap-utils \
+        oddjob oddjob-mkhomedir packagekit ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY edy-domain-install.sh /usr/local/sbin/edy-domain-install
+RUN chmod 0755 /usr/local/sbin/edy-domain-install
+# Restart an already-enrolled edy-agent across container restarts (the
+# overlay keeps its binary and /etc/edy-agent state). First install and
+# enrollment are 40-agent.sh's job, not the image's.
+ENTRYPOINT ["/bin/bash","-c","if [ -x /usr/local/bin/edy-agent ] && [ -s /etc/edy-agent/state.json ]; then (setsid /usr/local/bin/edy-agent run --manage-dns=false >>/var/log/edy-agent.log 2>&1 &); fi; exec sleep infinity"]

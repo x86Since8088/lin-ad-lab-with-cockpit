@@ -1,0 +1,21 @@
+[Unit]
+Description=Replicate SYSVOL from the PDC emulator to every other Samba DC
+Documentation=file:///opt/sc/git/samba-ad-lab/source/sysvol/README.md
+# The DCs are rootful podman containers; podman.socket is not required, but the
+# containers must exist. The script skips any DC that is not running.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/sc/git/samba-ad-lab/source/sysvol/sysvol-replicate.sh --quiet
+# Replication is a filesystem+ACL operation on containers owned by root.
+User=root
+# A run that hangs must not block the next one forever; the flock in the script
+# makes a late start harmless, but do not let one wedge indefinitely.
+TimeoutStartSec=600
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

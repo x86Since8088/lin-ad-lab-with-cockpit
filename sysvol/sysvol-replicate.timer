@@ -1,0 +1,17 @@
+[Unit]
+Description=Periodic SYSVOL replication (Samba has no DFS-R)
+Documentation=file:///opt/sc/git/samba-ad-lab/source/sysvol/README.md
+
+[Timer]
+# Every 5 minutes, matching the interval the Samba wiki's own rsync cron
+# example uses. This interval IS the convergence window: a GPO edited on the
+# PDC emulator is invisible on the other four DCs for up to 5 minutes, and a
+# client that binds to one of them during that window gets the OLD policy.
+# Windows DFS-R is change-driven and converges in seconds; this does not.
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

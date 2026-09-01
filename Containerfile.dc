@@ -1,0 +1,26 @@
+# Samba Active Directory Domain Controller.
+#
+# Provides the three services that constitute a domain: LDAP directory,
+# Kerberos KDC, and DNS. Deliberately NOT run on the host - the host's smbd is
+# a hardened standalone file server and AD DC mode is mutually exclusive.
+FROM docker.io/library/ubuntu:latest
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        samba samba-dsdb-modules samba-vfs-modules winbind \
+        samba-ad-dc samba-ad-provision \
+        krb5-user krb5-config ldb-tools ldap-utils python3-samba \
+        python3-setproctitle \
+        dnsutils iproute2 iputils-ping procps ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# Ubuntu 26.04 splits the AD DC daemon out of `samba`: /usr/sbin/samba lives
+# in samba-ad-dc, and the AD schema .ldf files in samba-ad-provision. Without
+# BOTH, provisioning aborts or the daemon is simply absent (`samba: not found`). python3-setproctitle lets samba scrub
+# the admin password from its process title shortly after start.
+# Samba provisions its own smb.conf; a shipped one would just be overwritten.
+RUN rm -f /etc/samba/smb.conf
+COPY edy-domain-install.sh /usr/local/sbin/edy-domain-install
+COPY dc-entrypoint.sh /usr/local/sbin/dc-entrypoint.sh
+RUN chmod 0755 /usr/local/sbin/dc-entrypoint.sh /usr/local/sbin/edy-domain-install
+EXPOSE 53/tcp 53/udp 88/tcp 88/udp 135/tcp 139/tcp 389/tcp 389/udp \
+       445/tcp 464/tcp 464/udp 636/tcp 3268/tcp 3269/tcp
+ENTRYPOINT ["/usr/local/sbin/dc-entrypoint.sh"]

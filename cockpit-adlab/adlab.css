@@ -1,0 +1,117 @@
+/* AD Lab — Cockpit plugin styles. Light-first, dark via prefers-color-scheme,
+   matching the house plugins (headscale/wireguard): plain CSS, no framework. */
+
+:root {
+    --al-bg: #ffffff;       --al-ink: #151515;     --al-sub: #6a6e73;
+    --al-card: #f7f8fa;     --al-border: #d2d2d2;  --al-accent: #0066cc;
+    --al-ok: #1e7d34;       --al-ok-bg: #e6f4ea;
+    --al-warn: #92610f;     --al-warn-bg: #fdf3d9;
+    --al-err: #b0261c;      --al-err-bg: #fbe9e7;
+    --al-code-bg: #f0f0f0;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --al-bg: #1b1d21;   --al-ink: #e8e8e8;     --al-sub: #9a9da1;
+        --al-card: #24262b; --al-border: #3c3f45;  --al-accent: #4d9fef;
+        --al-ok: #6ec684;   --al-ok-bg: #1c2f22;
+        --al-warn: #e8c268; --al-warn-bg: #33290f;
+        --al-err: #f0705f;  --al-err-bg: #3a1f1c;
+        --al-code-bg: #2b2d33;
+    }
+}
+
+html, body { margin: 0; padding: 0; background: var(--al-bg); color: var(--al-ink);
+    font-family: "RedHatText", "Open Sans", Helvetica, Arial, sans-serif; font-size: 14px; }
+#adlab-root { max-width: 1300px; margin: 0 auto; padding: 0 1rem 3rem; }
+
+.al-header { display: flex; justify-content: space-between; align-items: baseline;
+    padding: 1rem 0 0.4rem; }
+.al-header h1 { margin: 0; font-size: 1.45rem; }
+.al-sub { color: var(--al-sub); font-size: 0.85rem; margin-top: 2px; }
+.al-conn { font-size: 0.85rem; color: var(--al-sub); }
+
+.al-tabs { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 2px solid var(--al-border);
+    margin-bottom: 1rem; }
+.al-tabs button { background: none; border: none; border-bottom: 3px solid transparent;
+    padding: 0.55rem 0.9rem; font-size: 0.95rem; color: var(--al-ink); cursor: pointer; }
+.al-tabs button:hover { color: var(--al-accent); }
+.al-tabs button.active { border-bottom-color: var(--al-accent); color: var(--al-accent);
+    font-weight: 600; }
+
+.al-loading { color: var(--al-sub); padding: 2rem 0; }
+.al-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+    gap: 0.9rem; }
+.al-card { background: var(--al-card); border: 1px solid var(--al-border);
+    border-radius: 6px; padding: 0.85rem 1rem; }
+.al-card h3 { margin: 0 0 0.55rem; font-size: 1.02rem; }
+.al-card.wide { grid-column: 1 / -1; }
+
+table.al { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+table.al th { text-align: left; color: var(--al-sub); font-weight: 600;
+    border-bottom: 1px solid var(--al-border); padding: 0.3rem 0.5rem; }
+table.al td { padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--al-border);
+    vertical-align: top; }
+table.al tr:last-child td { border-bottom: none; }
+.al-scroll { overflow-x: auto; }
+
+.badge { display: inline-block; border-radius: 10px; padding: 0.06rem 0.55rem;
+    font-size: 0.78rem; font-weight: 600; }
+.badge.ok   { background: var(--al-ok-bg);   color: var(--al-ok); }
+.badge.warn { background: var(--al-warn-bg); color: var(--al-warn); }
+.badge.err  { background: var(--al-err-bg);  color: var(--al-err); }
+.badge.dim  { background: var(--al-code-bg); color: var(--al-sub); }
+
+button.al-btn { background: var(--al-accent); color: #fff; border: none;
+    border-radius: 4px; padding: 0.4rem 0.85rem; font-size: 0.88rem; cursor: pointer; }
+button.al-btn:hover { filter: brightness(1.1); }
+button.al-btn.secondary { background: transparent; color: var(--al-accent);
+    border: 1px solid var(--al-accent); }
+button.al-btn.danger { background: var(--al-err); }
+button.al-btn:disabled { opacity: 0.5; cursor: default; }
+.al-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.6rem 0; }
+
+.al-alert { border-radius: 4px; padding: 0.55rem 0.8rem; margin: 0.6rem 0;
+    font-size: 0.88rem; }
+.al-alert.err  { background: var(--al-err-bg);  color: var(--al-err); }
+.al-alert.ok   { background: var(--al-ok-bg);   color: var(--al-ok); }
+.al-alert.warn { background: var(--al-warn-bg); color: var(--al-warn); }
+.al-alert:empty { display: none; }
+
+pre.al-log { background: var(--al-code-bg); border: 1px solid var(--al-border);
+    border-radius: 4px; padding: 0.6rem; font-size: 0.8rem; max-height: 420px;
+    overflow: auto; white-space: pre-wrap; word-break: break-all; }
+
+/* schema-driven forms */
+.al-form label { display: block; margin: 0.55rem 0 0.15rem; font-weight: 600;
+    font-size: 0.86rem; }
+.al-form .hint { color: var(--al-sub); font-weight: 400; font-size: 0.8rem; }
+.al-form input, .al-form select, .al-form textarea {
+    width: 100%; box-sizing: border-box; padding: 0.42rem 0.5rem;
+    border: 1px solid var(--al-border); border-radius: 4px;
+    background: var(--al-bg); color: var(--al-ink); font-size: 0.9rem; }
+.al-form .row { display: flex; gap: 0.6rem; margin-top: 0.9rem; }
+
+/* modal */
+#al-modal-host .al-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.45);
+    display: flex; align-items: flex-start; justify-content: center; z-index: 50; }
+.al-modal { background: var(--al-bg); color: var(--al-ink); border-radius: 8px;
+    border: 1px solid var(--al-border); margin-top: 8vh; width: min(560px, 92vw);
+    max-height: 80vh; overflow: auto; padding: 1rem 1.2rem 1.2rem;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.35); }
+.al-modal h2 { margin: 0 0 0.3rem; font-size: 1.15rem; }
+.al-modal .danger-note { color: var(--al-err); font-size: 0.86rem; }
+
+kbd.al { background: var(--al-code-bg); border: 1px solid var(--al-border);
+    border-radius: 3px; padding: 0 0.3rem; font-size: 0.82rem; }
+
+/* GPO compose modal — the layer stack */
+.al-stack-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0;
+    border-bottom: 1px solid var(--al-border); }
+.al-stack-row:last-child { border-bottom: none; }
+.al-stack-label { flex: 1; font-size: 0.88rem; word-break: break-all; }
+.al-modal .al-card { margin: 0.6rem 0; }
+.al-modal label { display: block; margin: 0.5rem 0 0.15rem; font-weight: 600; font-size: 0.84rem; }
+.al-modal select, .al-modal input { width: 100%; box-sizing: border-box; padding: 0.4rem 0.5rem;
+    border: 1px solid var(--al-border); border-radius: 4px; background: var(--al-bg);
+    color: var(--al-ink); font-size: 0.88rem; }
+.al-modal .al-actions .al-btn { width: auto; }

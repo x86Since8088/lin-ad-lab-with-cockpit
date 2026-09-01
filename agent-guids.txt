@@ -1,0 +1,22 @@
+# Pinned edy-agent GUID per lab container. Generated once; never edit a
+# line for a container that has ever enrolled -- the GUID IS its fleet
+# identity (CN = <guid>.agents.ad.edt1.lab), and pinning it means a
+# recreated container re-enrolls as the same agent instead of littering
+# the fleet with duplicates. 40-agent.sh appends new lines automatically.
+dc1 32da322d-a535-418a-9c40-e810da4ff455
+dc2 5c096ddd-fc72-466b-b710-ef3c59409f05
+dc3 3967c2b5-ae12-40b6-80cd-e082a9c09bd7
+dc4 87d06733-812c-4409-adaa-5a431ad622ad
+dc5 8b0d02e9-55cf-49bd-b201-9da882093a2e
+client1 a46a7ee0-a002-4182-aece-12ba8135b400
+client2 df633c63-2431-4f68-9a45-80616b9ac61c
+client3 850a504a-3668-4656-b5e2-9af595da9c4a
+client4 eda85176-d1a3-4074-93f8-d81ce7d5c4dc
+client5 9c79dda7-9e50-414f-9559-60013a88743a
+client6 82abb7f0-84c1-4aa5-8921-fd64fac15872
+client7 4da88352-4b82-445f-bc33-0a6f218569e9
+client8 2f0cc2f9-7866-4a7a-969d-ed88f546c201
+client9 388afd0e-0105-4485-9a8f-3f20931ef8cd
+client10 f6080a04-e84e-4dc8-b962-19fc856f479a
+rdp1 54b8de8a-160c-44da-a715-b784751c3d6e
+rdp2 aac7ddac-870d-42f6-ae67-325291296c91

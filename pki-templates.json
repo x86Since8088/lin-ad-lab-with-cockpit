@@ -1,0 +1,47 @@
+{
+  "_doc": [
+    "Lab PKI templates — the AD-CS-style template layer for this lab.",
+    "edy-proxy-go's signing profiles are FIXED IN CODE (user | machine |",
+    "code-signing | uefi; internal/pki/profiles.go) with no server-side",
+    "template concept, so templates live HERE: a named intent maps to a",
+    "profile plus key/subject/SAN policy, expanded by 42-tls-from-edy-ca.sh.",
+    "Placeholders: {fqdn} {host} {ip} {domain}. SANs use dns:/ip: prefixes.",
+    "The issuing CA is the EDY Proxy Root CA (pathlen:0 — it signs leaves",
+    "only; a subordinate 'AD Lab Issuing CA' needs a root with pathlen>0",
+    "first, which is a controller-side change)."
+  ],
+  "templates": {
+    "domain-controller": {
+      "profile": "machine",
+      "key": "rsa:3072",
+      "subject": "/O=EDT1 Lab/CN={fqdn}",
+      "sans": "DNS:{fqdn},DNS:{domain},IP:{ip}",
+      "validity_days": 365,
+      "purpose": "DC LDAPS/GC server cert: ServerAuth+ClientAuth, SANs for host FQDN, domain, and address."
+    },
+    "member-server": {
+      "profile": "machine",
+      "key": "rsa:2048",
+      "subject": "/O=EDT1 Lab/CN={fqdn}",
+      "sans": "DNS:{fqdn},IP:{ip}",
+      "validity_days": 365,
+      "purpose": "Domain member service cert (e.g. xrdp TLS, web endpoints)."
+    },
+    "client-auth": {
+      "profile": "user",
+      "key": "rsa:2048",
+      "subject": "/O=EDT1 Lab/CN={fqdn}",
+      "sans": "DNS:{fqdn}",
+      "validity_days": 365,
+      "purpose": "Client-only authentication (no ServerAuth) — user/workstation identities."
+    },
+    "code-signing": {
+      "profile": "code-signing",
+      "key": "rsa:3072",
+      "subject": "/O=EDT1 Lab/CN={host} code signing",
+      "sans": "",
+      "validity_days": 1095,
+      "purpose": "Script/agent signing inside the lab."
+    }
+  }
+}

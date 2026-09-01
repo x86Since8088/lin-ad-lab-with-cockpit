@@ -1,0 +1,1493 @@
+#!/usr/bin/env python3
+"""adlab-admin — the ONLY root entry point for the Cockpit AD Lab plugin.
+
+Same contract as wg-admin / hs-admin (see cockpit-wireguard/docs/CONTRACT.md):
+  - the plugin never runs raw commands; it calls this helper with a narrow verb
+  - every verb prints ONE JSON object on stdout and NOTHING else
+  - diagnostics, warnings and errors go to stderr
+  - exit 0 = success; on failure stdout carries {"error": ...} and exit != 0
+
+Install:  /usr/local/sbin/adlab-admin, mode 0755, root:root
+Call as:  cockpit.spawn(["/usr/local/sbin/adlab-admin", VERB, ...],
+                        { superuser: "require", err: "message" })
+
+Design rules, all load-bearing:
+  - The verb table (VERBS) is the single source of truth for the UI: the
+    `schema` verb dumps it as JSON and the plugin builds every control,
+    form and modal from that dump. Change a verb here and the UI follows.
+  - The lab is ROOTFUL podman; every domain operation is `podman exec`
+    into a DC container (host samba-tool cannot authenticate over ldap://).
+  - GPO and DNS writes target the PDC EMULATOR, discovered live via
+    `fsmo show`, never hardcoded — SYSVOL replication is single-master
+    with --delete-after, so writes anywhere else are silently deleted.
+  - Passwords NEVER appear on argv or in the audit log. They travel on
+    stdin (samba-tool's getpass falls back to stdin when there is no tty)
+    or through a mode-600 authfile created and removed inside the
+    container in one bash -c.
+  - Every invocation is appended to /var/log/adlab-admin.log (verb + arg
+    names, never values of password-typed args) — this is the plugin's
+    "API activity" data plane.
+  - Pure logic (parsers, validation, dispatch) is separated from effects
+    (Runner) so the whole verb surface is unit-testable without podman.
+
+stdlib only. No pip. Python 3.9+.
+"""
+
+import base64
+import json
+import os
+import re
+import secrets
+import string
+import struct
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+LAB_ENV = "/opt/sc/git/samba-ad-lab/source/lab.env"
+RDP_ENV = "/opt/sc/git/samba-ad-lab/source/rdp/rdp.env"
+SYSVOL_REPL = "/opt/sc/git/samba-ad-lab/source/sysvol/sysvol-replicate.sh"
+AUDIT_LOG = "/var/log/adlab-admin.log"
+VERSION = "1.0.0.20260901"
+
+# --------------------------------------------------------------------------
+# lab configuration (parsed from lab.env; defaults match the deployed lab)
+# --------------------------------------------------------------------------
+
+def load_lab(path=LAB_ENV, rdp_path=RDP_ENV):
+    cfg = {
+        "REALM": "AD.EDT1.LAB", "DOMAIN_DNS": "ad.edt1.lab",
+        "DOMAIN_NB": "EDT1LAB", "DC_COUNT": 5, "CLIENT_COUNT": 10,
+        "NET": "static-edt", "NET_PREFIX": "172.15.4",
+        "DC_BASE": 10, "CLIENT_BASE": 20, "RDP_BASE": 30, "RDP_COUNT": 2,
+        "FORWARDER": "8.8.8.8",
+        "IMG_DC": "localhost/samba-ad-dc:latest",
+        "IMG_CLIENT": "localhost/ad-client:latest",
+        "ADMIN_PASS_FILE": "/opt/sc/git/samba-ad-lab/.secrets/administrator.pass",
+    }
+    ints = {"DC_COUNT", "CLIENT_COUNT", "DC_BASE", "CLIENT_BASE",
+            "RDP_BASE", "RDP_COUNT"}
+    for p in (path, rdp_path):
+        try:
+            with open(p) as f:
+                for line in f:
+                    m = re.match(r'^([A-Z_]+)="?([^"#\n]*)"?\s*(#.*)?$', line)
+                    if m and m.group(1) in cfg:
+                        v = m.group(2).strip()
+                        cfg[m.group(1)] = int(v) if m.group(1) in ints else v
+        except OSError:
+            pass
+    cfg["DOMAIN_DNS"] = cfg["REALM"].lower()
+    return cfg
+
+LAB = load_lab()
+
+def dc_name(i):  return "dc%d" % i
+def dc_ip(i):    return "%s.%d" % (LAB["NET_PREFIX"], LAB["DC_BASE"] + i - 1)
+def client_name(i): return "client%d" % i
+def client_ip(i):   return "%s.%d" % (LAB["NET_PREFIX"], LAB["CLIENT_BASE"] + i - 1)
+def all_dcs():   return [dc_name(i) for i in range(1, LAB["DC_COUNT"] + 1)]
+def all_clients(): return [client_name(i) for i in range(1, LAB["CLIENT_COUNT"] + 1)]
+def domain_dn(): return "DC=" + ",DC=".join(LAB["DOMAIN_DNS"].split("."))
+
+SAM = "/var/lib/samba/private/sam.ldb"
+
+# --------------------------------------------------------------------------
+# effects: every subprocess goes through the Runner so tests can fake it
+# --------------------------------------------------------------------------
+
+class Runner:
+    def run(self, argv, stdin=None, timeout=120):
+        """Returns (rc, stdout, stderr). Never raises on non-zero exit."""
+        try:
+            p = subprocess.run(argv, input=stdin, capture_output=True,
+                               text=True, timeout=timeout)
+            return p.returncode, p.stdout, p.stderr
+        except subprocess.TimeoutExpired:
+            return 124, "", "timeout after %ss: %s" % (timeout, argv[0])
+        except OSError as e:
+            return 127, "", str(e)
+
+RUN = Runner()
+
+def podman(ctr, args, stdin=None, timeout=120):
+    argv = ["podman", "exec"]
+    if stdin is not None:
+        argv.append("-i")
+    argv += [ctr] + args
+    return RUN.run(argv, stdin=stdin, timeout=timeout)
+
+def ctr_state(name):
+    rc, out, _ = RUN.run(["podman", "inspect", name, "--format",
+                          "{{.State.Status}}"])
+    return out.strip() if rc == 0 else "missing"
+
+def ctr_ip(name):
+    rc, out, _ = RUN.run(["podman", "inspect", name, "--format",
+                          "{{range $k,$v := .NetworkSettings.Networks}}{{$v.IPAddress}}{{end}}"])
+    return out.strip() if rc == 0 else ""
+
+def first_up_dc():
+    for d in all_dcs():
+        if ctr_state(d) == "running":
+            return d
+    raise Fail("no DC container is running")
+
+def pdc_emulator():
+    """Which DC holds the PDC emulator role — queried, never hardcoded."""
+    d = first_up_dc()
+    rc, out, err = podman(d, ["samba-tool", "fsmo", "show"])
+    if rc != 0:
+        raise Fail("fsmo show failed on %s: %s" % (d, err.strip() or out.strip()))
+    roles = parse_fsmo(out)
+    holder = roles.get("PdcEmulationMasterRole", "")
+    if not holder:
+        raise Fail("could not determine the PDC emulator")
+    return holder.lower()
+
+class Fail(Exception):
+    pass
+
+# Run a samba-tool command that needs domain credentials. The password moves
+# via a mode-600 authfile created and removed INSIDE the container in one
+# bash -c; the host-side admin password file is mounted at /run/adminpass.
+AUTH_WRAP = (
+    "umask 077; "
+    'printf "username=Administrator\\npassword=%s\\ndomain={nb}\\n" '
+    '"$(cat /run/adminpass)" > /run/adlab.auth; '
+    "{cmd} -A /run/adlab.auth; rc=$?; rm -f /run/adlab.auth; exit $rc"
+)
+
+def podman_auth(ctr, cmd_str, timeout=120, stdin=None):
+    # stdin (e.g. `gpo load` JSON) reaches the samba-tool command, not the
+    # authfile printf, so the credential and the payload never collide.
+    script = AUTH_WRAP.format(nb=LAB["DOMAIN_NB"], cmd=cmd_str)
+    return podman(ctr, ["bash", "-c", script], timeout=timeout, stdin=stdin)
+
+def shq(s):
+    """Shell-quote one word for embedding in a bash -c string."""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+# --------------------------------------------------------------------------
+# pure parsers (unit-tested against captured samba-tool output)
+# --------------------------------------------------------------------------
+
+def parse_fsmo(text):
+    """'SchemaMasterRole owner: CN=NTDS Settings,CN=DC2,...' -> {role: 'dc2'}"""
+    roles = {}
+    for m in re.finditer(r'^(\w+Role) owner: CN=NTDS Settings,CN=([^,]+),',
+                         text, re.M):
+        roles[m.group(1)] = m.group(2).lower()
+    return roles
+
+def parse_showrepl(text):
+    """drs showrepl -> {dsa, neighbors: [{nc, partner, direction, ok,
+    consecutive_failures, last_status}]}"""
+    out = {"dsa": "", "neighbors": []}
+    m = re.search(r'^DSA Options?:.*$|^DSA object GUID: (\S+)', text, re.M)
+    direction = ""
+    cur = None
+    for line in text.splitlines():
+        s = line.strip()
+        if "INBOUND NEIGHBORS" in line:
+            direction = "inbound"; continue
+        if "OUTBOUND NEIGHBORS" in line:
+            direction = "outbound"; continue
+        if "KCC CONNECTION OBJECTS" in line:
+            direction = ""; continue
+        if not direction:
+            continue
+        if re.match(r'^(DC=|CN=)', s):
+            cur = {"nc": s, "partner": "", "direction": direction,
+                   "consecutive_failures": 0, "last_status": "", "ok": True}
+            out["neighbors"].append(cur)
+        elif cur is not None and " via RPC" in s:
+            cur["partner"] = s.replace(" via RPC", "").strip()
+        elif cur is not None and "consecutive failure" in s:
+            n = re.match(r'(\d+) consecutive failure', s)
+            if n:
+                cur["consecutive_failures"] = int(n.group(1))
+                cur["ok"] = cur["ok"] and int(n.group(1)) == 0
+        elif cur is not None and s.startswith("Last attempt"):
+            cur["last_status"] = s
+            if "was successful" not in s:
+                cur["ok"] = False
+    return out
+
+def parse_ldif_entries(text):
+    """ldbsearch/samba-tool LDIF-ish output -> list of {attr: [values]}."""
+    entries, cur = [], None
+    for raw in text.splitlines():
+        if not raw.strip():
+            cur = None
+            continue
+        if raw.startswith("#"):
+            continue
+        m = re.match(r'^([A-Za-z][\w;-]*): (.*)$', raw)
+        if not m:
+            continue
+        if m.group(1) == "dn" or cur is None:
+            cur = {}
+            entries.append(cur)
+        cur.setdefault(m.group(1), []).append(m.group(2))
+    return [e for e in entries if e]
+
+def parse_name_list(text):
+    return sorted(l.strip() for l in text.splitlines() if l.strip())
+
+def parse_gpo_listall(text):
+    """samba-tool gpo listall blocks -> list of dicts."""
+    gpos, cur = [], None
+    for line in text.splitlines():
+        m = re.match(r'^([a-z][\w ]*?)\s*:\s*(.*)$', line.strip(), re.I)
+        if not m:
+            continue
+        key = m.group(1).strip().lower().replace(" ", "_")
+        if key == "gpo":
+            cur = {"gpo": m.group(2).strip()}
+            gpos.append(cur)
+        elif cur is not None:
+            cur[key] = m.group(2).strip()
+    return gpos
+
+# ---- Group Policy registry.pol (PReg) + ADMX parsing ----------------------
+# registry.pol is Windows "PReg" format: a 'PReg' magic + version, then
+# records [key\0;value\0;type;size;data] with UTF-16LE strings and 4-byte LE
+# ints. This is what Administrative-Template / ADMX settings compile down to,
+# so parsing it lets the UI SHOW a GPO's registry policy without any Windows
+# tooling. Pure function — unit-tested against captured bytes.
+
+REG_TYPES = {1: "REG_SZ", 2: "REG_EXPAND_SZ", 3: "REG_BINARY", 4: "REG_DWORD",
+             5: "REG_DWORD_BE", 7: "REG_MULTI_SZ", 11: "REG_QWORD"}
+REG_TYPE_IDS = {v: k for k, v in REG_TYPES.items()}
+
+def _reg_decode(type_id, data):
+    if type_id in (1, 2):                       # REG_SZ / REG_EXPAND_SZ
+        return data.decode("utf-16-le", "replace").rstrip("\x00")
+    if type_id == 4:                            # REG_DWORD (LE)
+        return struct.unpack("<I", data[:4])[0] if len(data) >= 4 else 0
+    if type_id == 5:                            # REG_DWORD_BE
+        return struct.unpack(">I", data[:4])[0] if len(data) >= 4 else 0
+    if type_id == 11:                           # REG_QWORD
+        return struct.unpack("<Q", data[:8])[0] if len(data) >= 8 else 0
+    if type_id == 7:                            # REG_MULTI_SZ
+        s = data.decode("utf-16-le", "replace").rstrip("\x00")
+        return [x for x in s.split("\x00") if x]
+    return list(data)                           # REG_BINARY -> byte list
+
+def parse_preg(blob):
+    """PReg registry.pol bytes -> [{keyname, valuename, type, data}]."""
+    entries = []
+    if len(blob) < 8 or blob[:4] != b"PReg":
+        return entries
+    n, i = len(blob), 8
+    def u16(j):                                 # read UTF-16LE up to \0\0
+        s = j
+        while j + 1 < n and blob[j:j + 2] != b"\x00\x00":
+            j += 2
+        return blob[s:j].decode("utf-16-le", "replace"), j + 2
+    SEMI = b";\x00"
+    while i + 2 <= n and blob[i:i + 2] == b"[\x00":
+        try:
+            i += 2
+            key, i = u16(i)
+            if blob[i:i + 2] == SEMI: i += 2
+            val, i = u16(i)
+            if blob[i:i + 2] == SEMI: i += 2
+            type_id = struct.unpack("<I", blob[i:i + 4])[0]; i += 4
+            if blob[i:i + 2] == SEMI: i += 2
+            size = struct.unpack("<I", blob[i:i + 4])[0]; i += 4
+            if blob[i:i + 2] == SEMI: i += 2
+            data = blob[i:i + size]; i += size
+            if blob[i:i + 2] == b"]\x00": i += 2
+        except (struct.error, IndexError):
+            break
+        entries.append({"keyname": key, "valuename": val,
+                        "type": REG_TYPES.get(type_id, "REG_%d" % type_id),
+                        "data": _reg_decode(type_id, data)})
+    return entries
+
+def _admx_local(tag):
+    return tag.rsplit("}", 1)[-1]               # strip XML namespace
+
+def _admx_value(node):
+    """<enabledValue><decimal value='1'/></enabledValue> -> ('REG_DWORD', 1)."""
+    for c in list(node):
+        t = _admx_local(c.tag)
+        if t == "decimal":
+            return "REG_DWORD", int(c.get("value", "0") or 0)
+        if t == "longDecimal":
+            return "REG_QWORD", int(c.get("value", "0") or 0)
+        if t == "string":
+            return "REG_SZ", (c.text or "")
+    return None, None
+
+def parse_admx(xml_text):
+    """samba/Windows ADMX -> [{id, class, key, valuename, has_enabled,
+    has_disabled, enabled_type/data, disabled_type/data, elements:[...]}].
+    Captures enough to write the right registry.pol entry when a policy is
+    toggled Enabled/Disabled. Best-effort over the common policy shape."""
+    out = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return out
+    for pol in root.iter():
+        if _admx_local(pol.tag) != "policy":
+            continue
+        p = {"id": pol.get("name", ""), "class": pol.get("class", "Both"),
+             "key": pol.get("key", ""), "valuename": pol.get("valueName", ""),
+             "display": (pol.get("displayName", "") or "").strip("$()"),
+             "explain": (pol.get("explainText", "") or "").strip("$()"),
+             "has_enabled": False, "has_disabled": False,
+             "enabled_type": None, "enabled_data": None,
+             "disabled_type": None, "disabled_data": None, "elements": []}
+        for ch in list(pol):
+            t = _admx_local(ch.tag)
+            if t == "enabledValue":
+                p["has_enabled"] = True
+                p["enabled_type"], p["enabled_data"] = _admx_value(ch)
+            elif t == "disabledValue":
+                p["has_disabled"] = True
+                p["disabled_type"], p["disabled_data"] = _admx_value(ch)
+            elif t == "elements":
+                for e in list(ch):
+                    kind = _admx_local(e.tag)
+                    reg = {"boolean": "REG_DWORD", "decimal": "REG_DWORD",
+                           "longDecimal": "REG_QWORD", "text": "REG_SZ",
+                           "enum": "REG_SZ", "multiText": "REG_MULTI_SZ"}.get(kind, "REG_SZ")
+                    p["elements"].append({"kind": kind, "id": e.get("id", ""),
+                                          "valuename": e.get("valueName", ""),
+                                          "type": reg})
+        # a bare enabled policy with no explicit enabledValue still enables by
+        # writing its valueName=1 (the ADMX default), so treat it as enable-able
+        if p["valuename"] and not p["has_enabled"] and not p["elements"]:
+            p["has_enabled"] = True
+            p["enabled_type"], p["enabled_data"] = "REG_DWORD", 1
+            p["has_disabled"] = True
+            p["disabled_type"], p["disabled_data"] = "REG_DWORD", 0
+        out.append(p)
+    return out
+
+def parse_gpo_manage_list(text):
+    """Generic `gpo manage <cse> list` output -> list of non-empty lines."""
+    return [l.rstrip() for l in text.splitlines() if l.strip()]
+
+def parse_dns_zonelist(text):
+    return sorted(set(m.group(1) for m in
+                      re.finditer(r'pszZoneName\s*:\s*(\S+)', text)))
+
+def parse_dns_query(text):
+    """samba-tool dns query output -> [{name, type, data, ttl}]."""
+    recs, name = [], ""
+    for line in text.splitlines():
+        m = re.match(r'\s*Name=(.*?), Records=', line)
+        if m:
+            name = m.group(1).strip() or "@"
+            continue
+        m = re.match(r'\s*([A-Z]+):\s+(.*?)\s*\(flags=[^,]*,\s*serial=\d+,\s*ttl=(\d+)\)', line)
+        if m:
+            recs.append({"name": name, "type": m.group(1),
+                         "data": m.group(2), "ttl": int(m.group(3))})
+    return recs
+
+def parse_processes(text):
+    procs = []
+    for line in text.splitlines():
+        m = re.match(r'^([\w()\[\]. -]+?)\s+(\d+)\s*$', line.strip())
+        if m and m.group(1).lower() not in ("service:", "-" * 4):
+            procs.append({"service": m.group(1).strip(), "pid": int(m.group(2))})
+    return procs
+
+def parse_domain_info(text):
+    info = {}
+    for line in text.splitlines():
+        m = re.match(r'^([\w ]+?)\s*:\s*(.*)$', line.strip())
+        if m:
+            info[m.group(1).strip().lower().replace(" ", "_")] = m.group(2).strip()
+    return info
+
+# --------------------------------------------------------------------------
+# verb handlers
+# --------------------------------------------------------------------------
+
+def v_version(a):
+    return {"version": VERSION, "realm": LAB["REALM"],
+            "domain": LAB["DOMAIN_DNS"], "netbios": LAB["DOMAIN_NB"]}
+
+def v_schema(a):
+    table = {}
+    for name, spec in VERBS.items():
+        table[name] = {
+            "help": spec["help"], "group": spec["group"],
+            "danger": spec.get("danger", False),
+            "args": spec.get("args", []),
+        }
+    return {"version": VERSION, "verbs": table}
+
+def v_status(a):
+    out = []
+    for i in range(1, LAB["DC_COUNT"] + 1):
+        out.append({"name": dc_name(i), "kind": "dc",
+                    "ip": ctr_ip(dc_name(i)) or dc_ip(i),
+                    "state": ctr_state(dc_name(i))})
+    for i in range(1, LAB["CLIENT_COUNT"] + 1):
+        out.append({"name": client_name(i), "kind": "client",
+                    "ip": ctr_ip(client_name(i)) or client_ip(i),
+                    "state": ctr_state(client_name(i))})
+    for i in range(1, LAB["RDP_COUNT"] + 1):
+        n = "rdp%d" % i
+        out.append({"name": n, "kind": "rdp", "ip": ctr_ip(n),
+                    "state": ctr_state(n)})
+    return {"containers": out}
+
+def v_domain_info(a):
+    d = first_up_dc()
+    rc, out, err = podman(d, ["samba-tool", "domain", "info", ctr_ip(d) or dc_ip(1)])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    info = parse_domain_info(out)
+    rc2, out2, _ = podman(d, ["samba-tool", "domain", "level", "show"])
+    if rc2 == 0:
+        info["levels"] = parse_domain_info(out2)
+    return {"queried_dc": d, "info": info}
+
+def v_health(a):
+    dcs = []
+    for d in all_dcs():
+        st = ctr_state(d)
+        row = {"dc": d, "state": st, "replication_ok": None,
+               "failures": None, "links": 0}
+        if st == "running":
+            rc, out, _ = podman(d, ["samba-tool", "drs", "showrepl"])
+            if rc == 0:
+                rep = parse_showrepl(out)
+                row["links"] = len(rep["neighbors"])
+                bad = [n for n in rep["neighbors"] if not n["ok"]]
+                row["failures"] = len(bad)
+                row["replication_ok"] = not bad and bool(rep["neighbors"])
+        dcs.append(row)
+    return {"dcs": dcs}
+
+def v_fsmo_show(a):
+    d = first_up_dc()
+    rc, out, err = podman(d, ["samba-tool", "fsmo", "show"])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"queried_dc": d, "roles": parse_fsmo(out)}
+
+FSMO_ROLES = ["rid", "pdc", "infrastructure", "schema", "naming",
+              "domaindns", "forestdns"]
+
+def v_fsmo_transfer(a):
+    rc, out, err = podman_auth(a["to_dc"],
+                               "samba-tool fsmo transfer --role=" + shq(a["role"]))
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"transferred": a["role"], "to": a["to_dc"], "output": out.strip()}
+
+def v_fsmo_seize(a):
+    rc, out, err = podman(a["to_dc"], ["bash", "-c",
+        "echo Y | " + AUTH_WRAP.format(nb=LAB["DOMAIN_NB"],
+            cmd="samba-tool fsmo seize --role=" + shq(a["role"]))])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"seized": a["role"], "to": a["to_dc"],
+            "warning": "the previous holder must NEVER boot again",
+            "output": out.strip()}
+
+# ---- users (dsa.msc) ------------------------------------------------------
+
+def _gen_password():
+    a = string.ascii_letters + string.digits
+    return "".join(secrets.choice(a) for _ in range(20)) + "!aA1"
+
+def v_user_list(a):
+    d = first_up_dc()
+    rc, out, err = podman(d, ["samba-tool", "user", "list"])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    users = parse_name_list(out)
+    flt = (a.get("filter") or "").lower()
+    if flt:
+        users = [u for u in users if flt in u.lower()]
+    return {"users": users, "count": len(users)}
+
+def v_user_show(a):
+    d = first_up_dc()
+    rc, out, err = podman(d, ["samba-tool", "user", "show", a["name"]])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    ent = parse_ldif_entries(out)
+    return {"user": ent[0] if ent else {}}
+
+def v_user_create(a):
+    d = pdc_emulator()
+    pw = _gen_password()
+    argv = ["samba-tool", "user", "create", a["name"]]
+    if a.get("given"):   argv += ["--given-name", a["given"]]
+    if a.get("surname"): argv += ["--surname", a["surname"]]
+    if a.get("mail"):    argv += ["--mail-address", a["mail"]]
+    # password via stdin: samba-tool prompts twice when none is on argv
+    rc, out, err = podman(d, argv, stdin=pw + "\n" + pw + "\n")
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"created": a["name"], "on": d, "password": pw,
+            "note": "password shown once; store it now"}
+
+def v_user_delete(a):
+    rc, out, err = podman(pdc_emulator(),
+                          ["samba-tool", "user", "delete", a["name"]])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"deleted": a["name"]}
+
+def v_user_enable(a):
+    rc, out, err = podman(pdc_emulator(),
+                          ["samba-tool", "user", "enable", a["name"]])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"enabled": a["name"]}
+
+def v_user_disable(a):
+    rc, out, err = podman(pdc_emulator(),
+                          ["samba-tool", "user", "disable", a["name"]])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"disabled": a["name"]}
+
+def v_user_setpassword(a):
+    pw = sys.stdin.readline().rstrip("\n")
+    if not pw:
+        raise Fail("new password expected on stdin")
+    rc, out, err = podman(pdc_emulator(),
+                          ["samba-tool", "user", "setpassword", a["name"]],
+                          stdin=pw + "\n" + pw + "\n")
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"password_set": a["name"]}
+
+# ---- groups ---------------------------------------------------------------
+
+def v_group_list(a):
+    d = first_up_dc()
+    rc, out, err = podman(d, ["samba-tool", "group", "list"])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"groups": parse_name_list(out)}
+
+def v_group_show(a):
+    d = first_up_dc()
+    rc, out, err = podman(d, ["samba-tool", "group", "show", a["name"]])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    ent = parse_ldif_entries(out)
+    rc2, out2, _ = podman(d, ["samba-tool", "group", "listmembers", a["name"]])
+    return {"group": ent[0] if ent else {},
+            "members": parse_name_list(out2) if rc2 == 0 else []}
+
+def v_group_create(a):
+    rc, out, err = podman(pdc_emulator(),
+                          ["samba-tool", "group", "create", a["name"]])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"created": a["name"]}
+
+def v_group_delete(a):
+    rc, out, err = podman(pdc_emulator(),
+                          ["samba-tool", "group", "delete", a["name"]])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"deleted": a["name"]}
+
+def v_group_add_member(a):
+    rc, out, err = podman(pdc_emulator(),
+        ["samba-tool", "group", "addmembers", a["group"], a["member"]])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"group": a["group"], "added": a["member"]}
+
+def v_group_remove_member(a):
+    rc, out, err = podman(pdc_emulator(),
+        ["samba-tool", "group", "removemembers", a["group"], a["member"]])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"group": a["group"], "removed": a["member"]}
+
+def v_computer_list(a):
+    d = first_up_dc()
+    rc, out, err = podman(d, ["samba-tool", "computer", "list"])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"computers": parse_name_list(out)}
+
+# ---- OUs ------------------------------------------------------------------
+
+def v_ou_list(a):
+    d = first_up_dc()
+    rc, out, err = podman(d, ["samba-tool", "ou", "list"])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"ous": parse_name_list(out)}
+
+def v_ou_create(a):
+    rc, out, err = podman(pdc_emulator(), ["samba-tool", "ou", "create", a["dn"]])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"created": a["dn"]}
+
+def v_ou_delete(a):
+    rc, out, err = podman(pdc_emulator(), ["samba-tool", "ou", "delete", a["dn"]])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"deleted": a["dn"]}
+
+# ---- GPO (gpmc.msc) — ALWAYS the PDC emulator -----------------------------
+
+def v_gpo_list(a):
+    d = pdc_emulator()
+    rc, out, err = podman_auth(d, "samba-tool gpo listall")
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"pdc_emulator": d, "gpos": parse_gpo_listall(out)}
+
+def v_gpo_create(a):
+    d = pdc_emulator()
+    rc, out, err = podman_auth(d, "samba-tool gpo create " + shq(a["name"]))
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    m = re.search(r'\{[0-9A-Fa-f-]{36}\}', out)
+    return {"created": a["name"], "gpo": m.group(0) if m else "", "on": d,
+            "note": "SYSVOL replication propagates it within 5 minutes"}
+
+def v_gpo_delete(a):
+    d = pdc_emulator()
+    rc, out, err = podman_auth(d, "samba-tool gpo del " + shq(a["gpo"]))
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"deleted": a["gpo"], "on": d}
+
+def v_gpo_link(a):
+    d = pdc_emulator()
+    rc, out, err = podman_auth(d, "samba-tool gpo setlink %s %s"
+                               % (shq(a["container_dn"]), shq(a["gpo"])))
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"linked": a["gpo"], "to": a["container_dn"], "on": d}
+
+def v_gpo_unlink(a):
+    d = pdc_emulator()
+    rc, out, err = podman_auth(d, "samba-tool gpo dellink %s %s"
+                               % (shq(a["container_dn"]), shq(a["gpo"])))
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"unlinked": a["gpo"], "from": a["container_dn"], "on": d}
+
+# ---- GPO settings: Administrative Templates / registry.pol ----------------
+# The three layers the compose modal stacks:
+#   1. template GPOs  -> gpo-registry-list a source, feed its entries here
+#   2. ADMX templates -> gpo-admxload + pick a policy -> registry entries
+#   3. preferences    -> gpo-pref-set (the samba `gpo manage <cse>` CSEs)
+# All Administrative-Template settings compile to registry.pol entries applied
+# with `samba-tool gpo load` (a JSON array on stdin).
+
+GPO_TEMPLATE_DIR = "/var/lib/samba/gpo-templates"   # persists (bind mount)
+DEFAULT_REG_CSE = "{35378EAC-683F-11D2-A89A-00C04FBBCFA2}"  # registry policy
+REG_CLASSES = ["MACHINE", "USER", "BOTH"]
+GPO_CSES = ["smb_conf", "security", "motd", "issue", "sudoers", "files",
+            "symlink", "openssh", "scripts", "access"]
+
+def _gpo_guid(a, key="gpo"):
+    g = a[key].strip()
+    if not re.match(r'^\{[0-9A-Fa-f-]{36}\}$', g):
+        raise Fail("%s must be a GPO GUID like {31B2F340-...}" % key)
+    return g
+
+def _sysvol_gpo_dir(gpo):
+    return "/var/lib/samba/sysvol/%s/Policies/%s" % (LAB["DOMAIN_DNS"], gpo)
+
+def _read_registry_pol(dc, gpo):
+    """Read a GPO's Machine + User registry.pol from sysvol, parse to entries
+    tagged with class. Returns [] when the GPO has no registry policy yet."""
+    entries = []
+    base = _sysvol_gpo_dir(gpo)
+    for cls, sub in (("MACHINE", "Machine"), ("USER", "User")):
+        # sysvol casing varies; find the .pol case-insensitively
+        rc, out, _ = podman(dc, ["bash", "-c",
+            "f=$(find %s/%s -maxdepth 1 -iname 'registry.pol' 2>/dev/null | head -1); "
+            "[ -n \"$f\" ] && base64 -w0 \"$f\" || true"
+            % (shq(base), sub)])
+        b64 = (out or "").strip()
+        if not b64:
+            continue
+        try:
+            blob = base64.b64decode(b64)
+        except Exception:
+            continue
+        for e in parse_preg(blob):
+            e["class"] = cls
+            entries.append(e)
+    return entries
+
+def v_gpo_registry_list(a):
+    d = pdc_emulator()
+    gpo = _gpo_guid(a)
+    return {"gpo": gpo, "on": d, "settings": _read_registry_pol(d, gpo)}
+
+def _validate_entries(raw):
+    try:
+        entries = json.loads(raw)
+    except Exception as e:
+        raise Fail("entries is not valid JSON: %s" % e)
+    if not isinstance(entries, list) or not entries:
+        raise Fail("entries must be a non-empty JSON array")
+    for e in entries:
+        for k in ("keyname", "valuename", "class", "type"):
+            if k not in e:
+                raise Fail("each entry needs keyname/valuename/class/type (%s)" % json.dumps(e)[:80])
+        if e["class"].upper() not in REG_CLASSES:
+            raise Fail("class must be MACHINE|USER|BOTH, got %r" % e["class"])
+        if e["type"] not in REG_TYPES.values():
+            raise Fail("type %r not one of %s" % (e["type"], ", ".join(sorted(REG_TYPES.values()))))
+        e["class"] = e["class"].upper()
+    return entries
+
+def v_gpo_settings_apply(a):
+    """Apply Administrative-Template (registry.pol) settings to a GPO via
+    `gpo load`. entries = JSON array of {keyname,valuename,class,type,data}."""
+    d = pdc_emulator()
+    gpo = _gpo_guid(a)
+    entries = _validate_entries(a["entries"])
+    cmd = "samba-tool gpo load %s --machine-ext-name=%s --user-ext-name=%s" % (
+        shq(gpo), shq(DEFAULT_REG_CSE), shq(DEFAULT_REG_CSE))
+    if str(a.get("replace", "")).lower() in ("1", "yes", "true"):
+        cmd += " --replace"
+    rc, out, err = podman_auth(d, cmd, stdin=json.dumps(entries), timeout=180)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-600:])
+    return {"gpo": gpo, "on": d, "applied": len(entries),
+            "note": "registry.pol updated; SYSVOL replicates within 5 minutes"}
+
+def v_gpo_settings_remove(a):
+    d = pdc_emulator()
+    gpo = _gpo_guid(a)
+    try:
+        entries = json.loads(a["entries"])
+    except Exception as e:
+        raise Fail("entries is not valid JSON: %s" % e)
+    keys = [{"keyname": e["keyname"], "valuename": e["valuename"],
+             "class": e["class"].upper()} for e in entries]
+    rc, out, err = podman_auth(d, "samba-tool gpo remove " + shq(gpo),
+                               stdin=json.dumps(keys), timeout=120)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-600:])
+    return {"gpo": gpo, "on": d, "removed": len(keys)}
+
+# ---- ADMX central store ---------------------------------------------------
+
+def v_gpo_admxload(a):
+    d = pdc_emulator()
+    rc, out, err = podman_auth(d, "samba-tool gpo admxload", timeout=180)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-600:])
+    # report what landed in the central store
+    rc2, ls, _ = podman(d, ["bash", "-c",
+        "ls %s 2>/dev/null" % shq("%s/PolicyDefinitions" % _pol_root(d))])
+    return {"on": d, "loaded": True,
+            "central_store": [x for x in (ls or "").split() if x.endswith(".admx")]}
+
+def _pol_root(dc):
+    return "/var/lib/samba/sysvol/%s/Policies" % LAB["DOMAIN_DNS"]
+
+def v_gpo_admx_list(a):
+    """List ADMX files in the central store and parse their policies."""
+    d = pdc_emulator()
+    root = "%s/PolicyDefinitions" % _pol_root(d)
+    rc, ls, _ = podman(d, ["bash", "-c",
+        "ls %s/*.admx 2>/dev/null" % shq(root)])
+    files = [x for x in (ls or "").split() if x.endswith(".admx")]
+    policies, admx = [], []
+    for f in files:
+        name = f.rsplit("/", 1)[-1]
+        admx.append(name)
+        rc2, b64, _ = podman(d, ["bash", "-c", "base64 -w0 %s" % shq(f)])
+        if rc2 != 0 or not b64.strip():
+            continue
+        try:
+            xml = base64.b64decode(b64.strip()).decode("utf-8", "replace")
+        except Exception:
+            continue
+        for p in parse_admx(xml):
+            p["admx"] = name
+            policies.append(p)
+    return {"on": d, "loaded": bool(files), "admx_files": admx,
+            "policies": policies, "policy_count": len(policies)}
+
+# ---- template GPOs: backup / restore / stack ------------------------------
+
+def v_gpo_backup(a):
+    """Snapshot a GPO to the persistent template store so it can be reused."""
+    d = pdc_emulator()
+    gpo = _gpo_guid(a)
+    name = re.sub(r'[^A-Za-z0-9_.-]', '_', a.get("name") or gpo.strip("{}"))
+    dest = "%s/%s" % (GPO_TEMPLATE_DIR, name)
+    rc, out, err = podman_auth(d,
+        "mkdir -p %s && samba-tool gpo backup %s --tmpdir=%s"
+        % (shq(dest), shq(gpo), shq(dest)), timeout=180)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-600:])
+    return {"backed_up": gpo, "template": name, "path": dest, "on": d}
+
+def v_gpo_template_list(a):
+    """Everything usable as a stacking source: existing GPOs + saved backups."""
+    d = pdc_emulator()
+    rc, out, err = podman_auth(d, "samba-tool gpo listall")
+    gpos = parse_gpo_listall(out) if rc == 0 else []
+    rc2, ls, _ = podman(d, ["bash", "-c",
+        "ls -1 %s 2>/dev/null" % shq(GPO_TEMPLATE_DIR)])
+    backups = [x for x in (ls or "").split() if x]
+    return {"on": d, "gpos": gpos, "backups": backups}
+
+def v_gpo_template_stack(a):
+    """Stack Administrative-Template settings from one or more SOURCE GPOs into
+    a TARGET GPO, in order — later sources override earlier ones. Reads each
+    source's registry.pol and applies the merged set with `gpo load`."""
+    d = pdc_emulator()
+    target = _gpo_guid(a, "target")
+    sources = [s.strip() for s in a["sources"].split(",") if s.strip()]
+    if not sources:
+        raise Fail("sources must be a comma-separated list of GPO GUIDs")
+    merged, layers = [], []
+    for s in sources:
+        if not re.match(r'^\{[0-9A-Fa-f-]{36}\}$', s):
+            raise Fail("source %r is not a GPO GUID" % s)
+        ent = _read_registry_pol(d, s)
+        merged.extend(ent)              # order preserved; later overrides
+        layers.append({"source": s, "settings": len(ent)})
+    if not merged:
+        raise Fail("no registry settings found on the source GPO(s)")
+    cmd = "samba-tool gpo load %s --machine-ext-name=%s --user-ext-name=%s" % (
+        shq(target), shq(DEFAULT_REG_CSE), shq(DEFAULT_REG_CSE))
+    payload = [{"keyname": e["keyname"], "valuename": e["valuename"],
+                "class": e["class"], "type": e["type"], "data": e["data"]}
+               for e in merged]
+    rc, out, err = podman_auth(d, cmd, stdin=json.dumps(payload), timeout=180)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-600:])
+    return {"target": target, "on": d, "layers": layers,
+            "applied": len(payload)}
+
+def v_gpo_restore(a):
+    """Restore a saved template backup as a brand-NEW GPO."""
+    d = pdc_emulator()
+    tpl = re.sub(r'[^A-Za-z0-9_.-]', '_', a["template"])
+    src = "%s/%s" % (GPO_TEMPLATE_DIR, tpl)
+    rc, out, err = podman_auth(d,
+        "samba-tool gpo restore %s %s" % (shq(a["name"]), shq(src)), timeout=180)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-600:])
+    m = re.search(r'\{[0-9A-Fa-f-]{36}\}', out)
+    return {"restored_as": a["name"], "gpo": m.group(0) if m else "",
+            "from_template": tpl, "on": d}
+
+# ---- GPO preferences (samba CSEs via `gpo manage`) ------------------------
+
+def v_gpo_pref_list(a):
+    d = pdc_emulator()
+    gpo = _gpo_guid(a)
+    cse = a["cse"]
+    if cse not in GPO_CSES:
+        raise Fail("cse must be one of: %s" % ", ".join(GPO_CSES))
+    rc, out, err = podman_auth(d,
+        "samba-tool gpo manage %s list %s" % (cse, shq(gpo)))
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"gpo": gpo, "cse": cse, "on": d,
+            "items": parse_gpo_manage_list(out)}
+
+def v_gpo_pref_set(a):
+    """Set a preference/CSE setting. Command shape varies per CSE; entry and
+    value are appended when provided (motd/issue take only a value; smb_conf
+    and security take entry + value)."""
+    d = pdc_emulator()
+    gpo = _gpo_guid(a)
+    cse = a["cse"]
+    if cse not in GPO_CSES:
+        raise Fail("cse must be one of: %s" % ", ".join(GPO_CSES))
+    cmd = "samba-tool gpo manage %s set %s" % (cse, shq(gpo))
+    if a.get("entry"):
+        cmd += " " + shq(a["entry"])
+    if a.get("value"):
+        cmd += " " + shq(a["value"])
+    rc, out, err = podman_auth(d, cmd, timeout=120)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"gpo": gpo, "cse": cse, "entry": a.get("entry", ""),
+            "set": bool(a.get("value")), "on": d, "output": (out or "").strip()[-300:]}
+
+def v_gpo_show(a):
+    """Rich GPO detail for the plugin's detail modal: metadata + links +
+    registry settings count."""
+    d = pdc_emulator()
+    gpo = _gpo_guid(a)
+    rc, out, err = podman_auth(d, "samba-tool gpo show " + shq(gpo))
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    meta = {}
+    for line in out.splitlines():
+        m = re.match(r'^([A-Za-z][\w ]*?)\s*:\s*(.*)$', line.strip())
+        if m:
+            meta[m.group(1).strip().lower().replace(" ", "_")] = m.group(2).strip()
+    rc2, lout, _ = podman_auth(d, "samba-tool gpo listcontainers " + shq(gpo))
+    links = re.findall(r'DN:\s*(.+)', lout) if rc2 == 0 else []
+    return {"gpo": gpo, "on": d, "meta": meta, "links": links,
+            "settings": _read_registry_pol(d, gpo)}
+
+# ---- sites & replication --------------------------------------------------
+
+def v_sites_list(a):
+    d = first_up_dc()
+    base = "CN=Sites,CN=Configuration," + domain_dn()
+    rc, out, err = podman(d, ["ldbsearch", "-H", SAM, "-b", base,
+                              "(objectClass=site)", "name"])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    sites = [e.get("name", ["?"])[0] for e in parse_ldif_entries(out)
+             if "name" in e]
+    rc2, out2, _ = podman(d, ["ldbsearch", "-H", SAM, "-b", base,
+                              "(objectClass=subnet)", "name", "siteObject"])
+    subnets = []
+    if rc2 == 0:
+        for e in parse_ldif_entries(out2):
+            if "name" in e:
+                subnets.append({"subnet": e["name"][0],
+                                "site": (e.get("siteObject", [""])[0]
+                                         .split(",")[0].replace("CN=", ""))})
+    return {"sites": sorted(sites), "subnets": subnets}
+
+def v_repl_status(a):
+    targets = [a["dc"]] if a.get("dc") else all_dcs()
+    result = []
+    for d in targets:
+        if ctr_state(d) != "running":
+            result.append({"dc": d, "error": "not running"})
+            continue
+        rc, out, err = podman(d, ["samba-tool", "drs", "showrepl"])
+        if rc != 0:
+            result.append({"dc": d, "error": err.strip() or out.strip()})
+        else:
+            rep = parse_showrepl(out)
+            result.append({"dc": d, "neighbors": rep["neighbors"]})
+    return {"replication": result}
+
+def v_repl_now(a):
+    """Trigger KCC + a full replication cycle on one DC (or all)."""
+    targets = [a["dc"]] if a.get("dc") else all_dcs()
+    done = []
+    for d in targets:
+        if ctr_state(d) != "running":
+            done.append({"dc": d, "error": "not running"})
+            continue
+        rc, out, err = podman(d, ["samba-tool", "drs", "kcc"])
+        done.append({"dc": d, "kcc": "ok" if rc == 0 else (err.strip() or out.strip())})
+    return {"triggered": done}
+
+def v_sysvol_status(a):
+    rows = []
+    script = ('find /var/lib/samba/sysvol -type f -exec sha256sum {} \\; '
+              '2>/dev/null | sed "s| .*/sysvol/| |" | sort | sha256sum | cut -c1-16')
+    for d in all_dcs():
+        if ctr_state(d) != "running":
+            rows.append({"dc": d, "error": "not running"})
+            continue
+        rc, h, _ = podman(d, ["bash", "-c", script])
+        rc2, n, _ = podman(d, ["bash", "-c",
+                               "find /var/lib/samba/sysvol -type f | wc -l"])
+        rows.append({"dc": d, "hash": h.strip(), "files": int(n.strip() or 0)})
+    hashes = set(r.get("hash") for r in rows if "hash" in r)
+    return {"dcs": rows, "identical": len(hashes) == 1}
+
+def v_sysvol_sync(a):
+    rc, out, err = RUN.run(["bash", SYSVOL_REPL], timeout=300)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-800:])
+    return {"synced": True, "output": out.strip()[-800:]}
+
+def v_sysvolcheck(a):
+    rc, out, err = podman(a["dc"], ["samba-tool", "ntacl", "sysvolcheck"])
+    return {"dc": a["dc"], "clean": rc == 0,
+            "output": (out + err).strip()[-400:]}
+
+# ---- DNS (dnsmgmt.msc) ----------------------------------------------------
+
+def v_dns_zones(a):
+    d = pdc_emulator()
+    rc, out, err = podman_auth(d, "samba-tool dns zonelist 127.0.0.1")
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"server": d, "zones": parse_dns_zonelist(out)}
+
+def v_dns_records(a):
+    d = pdc_emulator()
+    rc, out, err = podman_auth(d, "samba-tool dns query 127.0.0.1 %s @ ALL"
+                               % shq(a["zone"]))
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"zone": a["zone"], "records": parse_dns_query(out)}
+
+DNS_TYPES = ["A", "AAAA", "CNAME", "MX", "NS", "PTR", "SRV", "TXT"]
+
+def v_dns_add(a):
+    d = pdc_emulator()
+    rc, out, err = podman_auth(d, "samba-tool dns add 127.0.0.1 %s %s %s %s"
+        % (shq(a["zone"]), shq(a["name"]), shq(a["type"]), shq(a["data"])))
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"added": "%s %s %s" % (a["name"], a["type"], a["data"]),
+            "zone": a["zone"]}
+
+def v_dns_delete(a):
+    d = pdc_emulator()
+    rc, out, err = podman_auth(d, "samba-tool dns delete 127.0.0.1 %s %s %s %s"
+        % (shq(a["zone"]), shq(a["name"]), shq(a["type"]), shq(a["data"])))
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"deleted": "%s %s %s" % (a["name"], a["type"], a["data"]),
+            "zone": a["zone"]}
+
+# ---- DCs: logs, tracing, RPC, promote/demote, remoting --------------------
+
+def v_dc_list(a):
+    roles = {}
+    try:
+        d = first_up_dc()
+        rc, out, _ = podman(d, ["samba-tool", "fsmo", "show"])
+        if rc == 0:
+            roles = parse_fsmo(out)
+    except Fail:
+        pass
+    dcs = []
+    for i in range(1, LAB["DC_COUNT"] + 1):
+        n = dc_name(i)
+        held = sorted(r for r, h in roles.items() if h == n)
+        dcs.append({"dc": n, "ip": ctr_ip(n) or dc_ip(i),
+                    "state": ctr_state(n), "fsmo_roles": held})
+    return {"dcs": dcs}
+
+def v_dc_logs(a):
+    lines = int(a.get("lines") or 80)
+    rc, out, err = RUN.run(["podman", "logs", "--tail", str(lines), a["dc"]])
+    return {"dc": a["dc"], "log": (out + err)[-16000:]}
+
+def v_dc_debug(a):
+    lvl = int(a["level"])
+    if not 0 <= lvl <= 10:
+        raise Fail("debug level must be 0..10")
+    rc, out, err = podman(a["dc"], ["smbcontrol", "all", "debug", str(lvl)])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"dc": a["dc"], "debug_level": lvl,
+            "note": "samba log verbosity changed live; level 0 restores quiet"}
+
+def v_dc_processes(a):
+    rc, out, err = podman(a["dc"], ["samba-tool", "processes"])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"dc": a["dc"], "processes": parse_processes(out)}
+
+def v_dc_rpc(a):
+    """Model of an RPC activity view: live TCP sessions into the DC's
+    directory/RPC ports, plus the samba service processes serving them."""
+    rc, out, _ = podman(a["dc"], ["bash", "-c",
+        "ss -tn state established 2>/dev/null | awk 'NR>1{print $3, $4}'"])
+    sessions = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            local, peer = parts
+            port = local.rsplit(":", 1)[-1]
+            svc = {"88": "kerberos", "135": "epmap/rpc", "389": "ldap",
+                   "445": "smb", "464": "kpasswd", "636": "ldaps",
+                   "3268": "gc", "3269": "gcs", "53": "dns"}.get(port, "high/rpc")
+            sessions.append({"local": local, "peer": peer, "service": svc})
+    rc2, out2, _ = podman(a["dc"], ["samba-tool", "processes"])
+    return {"dc": a["dc"], "sessions": sessions,
+            "processes": parse_processes(out2) if rc2 == 0 else []}
+
+def v_dc_restart(a):
+    rc, out, err = RUN.run(["podman", "restart", a["dc"]], timeout=180)
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"restarted": a["dc"],
+            "note": "resolv.conf and the edy-agent are restored by the entrypoint/40-agent.sh"}
+
+def v_dc_shell(a):
+    """One-shot remote command on a DC — the 'remoting' surface."""
+    rc, out, err = podman(a["dc"], ["bash", "-c", a["command"]], timeout=60)
+    return {"dc": a["dc"], "rc": rc, "stdout": out[-8000:], "stderr": err[-4000:]}
+
+def v_dc_promote(a):
+    """Bring up dcN+1 as a new replication partner — DC promotion."""
+    i = LAB["DC_COUNT"] + 1
+    while ctr_state(dc_name(i)) != "missing":
+        i += 1
+    n, ip = dc_name(i), dc_ip(i)
+    pass_mount = LAB["ADMIN_PASS_FILE"] + ":/run/adminpass:ro"
+    rc, out, err = RUN.run([
+        "podman", "run", "-d", "--name", n, "--hostname", n,
+        "--network", LAB["NET"], "--ip", ip,
+        "--cap-add", "SYS_ADMIN,NET_ADMIN,SYS_TIME",
+        "--security-opt", "seccomp=unconfined",
+        "-v", pass_mount,
+        "-e", "ROLE=join", "-e", "REALM=" + LAB["REALM"],
+        "-e", "DOMAIN_NB=" + LAB["DOMAIN_NB"],
+        "-e", "DC_IP=" + ip, "-e", "PEER_IP=" + dc_ip(1),
+        "-e", "FORWARDER=" + LAB["FORWARDER"],
+        "-e", "ADMIN_PASS_FILE=/run/adminpass",
+        LAB["IMG_DC"]], timeout=120)
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"promoting": n, "ip": ip,
+            "note": "join runs in the background; watch dc-logs %s" % n}
+
+def v_dc_demote(a):
+    """samba-tool domain demote ON the DC, then remove its container."""
+    if a["dc"] == dc_name(1):
+        raise Fail("refusing to demote dc1 (provisioning DC and default peer)")
+    rc, out, err = podman_auth(a["dc"], "samba-tool domain demote", timeout=300)
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    RUN.run(["podman", "rm", "-f", a["dc"]])
+    return {"demoted": a["dc"], "container_removed": True,
+            "output": out.strip()[-600:]}
+
+# ---- clients & onboarding -------------------------------------------------
+
+def v_client_list(a):
+    rows = []
+    d1 = None
+    try:
+        d1 = first_up_dc()
+    except Fail:
+        pass
+    accounts = set()
+    if d1:
+        rc, out, _ = podman(d1, ["samba-tool", "computer", "list"])
+        if rc == 0:
+            accounts = set(x.rstrip("$").lower() for x in parse_name_list(out))
+    for i in range(1, LAB["CLIENT_COUNT"] + 1):
+        n = client_name(i)
+        rows.append({"name": n, "ip": ctr_ip(n) or client_ip(i),
+                     "state": ctr_state(n), "joined": n in accounts})
+    return {"clients": rows}
+
+def v_client_onboard(a):
+    """Create the next clientN container and join it — client onboarding."""
+    i = LAB["CLIENT_COUNT"] + 1
+    while ctr_state(client_name(i)) != "missing":
+        i += 1
+    n, ip = client_name(i), client_ip(i)
+    pass_mount = LAB["ADMIN_PASS_FILE"] + ":/run/adminpass:ro"
+    rc, out, err = RUN.run([
+        "podman", "run", "-d", "--name", n, "--hostname", n,
+        "--network", LAB["NET"], "--ip", ip,
+        "--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined",
+        "-v", pass_mount, LAB["IMG_CLIENT"]], timeout=120)
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    peer = dc_ip((i % LAB["DC_COUNT"]) + 1)
+    rc2, out2, err2 = podman(n, ["/usr/local/sbin/edy-domain-install",
+        "--role", "client", "--realm", LAB["REALM"],
+        "--domain-nb", LAB["DOMAIN_NB"], "--peer", peer,
+        "--forwarder", LAB["FORWARDER"], "--pass-file", "/run/adminpass"],
+        timeout=300)
+    return {"onboarded": n, "ip": ip, "joined_via": peer,
+            "join_ok": rc2 == 0,
+            "join_tail": (out2 + err2).strip()[-500:]}
+
+def v_client_remove(a):
+    if not re.match(r'^client\d+$', a["name"]):
+        raise Fail("only clientN containers can be removed here")
+    RUN.run(["podman", "rm", "-f", a["name"]])
+    try:
+        podman(pdc_emulator(), ["samba-tool", "computer", "delete", a["name"]])
+    except Fail:
+        pass
+    return {"removed": a["name"]}
+
+# ---- activity / audit -----------------------------------------------------
+
+def v_audit_log(a):
+    lines = int(a.get("lines") or 100)
+    try:
+        with open(AUDIT_LOG) as f:
+            tail = f.readlines()[-lines:]
+    except OSError:
+        tail = []
+    return {"entries": [l.rstrip("\n") for l in tail]}
+
+# --------------------------------------------------------------------------
+# the verb table — the schema that drives every UI control
+# --------------------------------------------------------------------------
+
+def arg(name, type_="str", required=True, help_="", choices=None, default=None):
+    a = {"name": name, "type": type_, "required": required, "help": help_}
+    if choices: a["choices"] = choices
+    if default is not None: a["default"] = default
+    return a
+
+DC_CHOICES = all_dcs()
+
+VERBS = {
+    "version":       {"fn": v_version, "group": "meta", "help": "Helper and lab identity."},
+    "schema":        {"fn": v_schema, "group": "meta", "help": "This verb table, as JSON — drives the UI."},
+    "status":        {"fn": v_status, "group": "overview", "help": "Every lab container with state and IP."},
+    "domain-info":   {"fn": v_domain_info, "group": "overview", "help": "Domain identity and functional levels."},
+    "health":        {"fn": v_health, "group": "overview", "help": "Per-DC replication health summary."},
+    "fsmo-show":     {"fn": v_fsmo_show, "group": "fsmo", "help": "All seven FSMO role holders."},
+    "fsmo-transfer": {"fn": v_fsmo_transfer, "group": "fsmo", "danger": True,
+                      "help": "Gracefully transfer a FSMO role to a DC (run there).",
+                      "args": [arg("role", "enum", help_="role to move", choices=FSMO_ROLES),
+                               arg("to_dc", "enum", help_="receiving DC", choices=DC_CHOICES)]},
+    "fsmo-seize":    {"fn": v_fsmo_seize, "group": "fsmo", "danger": True,
+                      "help": "SEIZE a role (dead holder only — it must never boot again).",
+                      "args": [arg("role", "enum", choices=FSMO_ROLES),
+                               arg("to_dc", "enum", choices=DC_CHOICES)]},
+    "user-list":     {"fn": v_user_list, "group": "users", "help": "All users, optionally filtered.",
+                      "args": [arg("filter", required=False, help_="substring filter")]},
+    "user-show":     {"fn": v_user_show, "group": "users", "help": "One user's directory entry.",
+                      "args": [arg("name")]},
+    "user-create":   {"fn": v_user_create, "group": "users",
+                      "help": "Create a user; a generated password is returned once.",
+                      "args": [arg("name"), arg("given", required=False),
+                               arg("surname", required=False), arg("mail", required=False)]},
+    "user-delete":   {"fn": v_user_delete, "group": "users", "danger": True,
+                      "help": "Delete a user.", "args": [arg("name")]},
+    "user-enable":   {"fn": v_user_enable, "group": "users", "help": "Enable an account.",
+                      "args": [arg("name")]},
+    "user-disable":  {"fn": v_user_disable, "group": "users", "help": "Disable an account.",
+                      "args": [arg("name")]},
+    "user-setpassword": {"fn": v_user_setpassword, "group": "users",
+                      "help": "Set a user's password (sent on stdin, never argv).",
+                      "args": [arg("name"),
+                               arg("password", "password-stdin", help_="new password, via stdin")]},
+    "group-list":    {"fn": v_group_list, "group": "groups", "help": "All groups."},
+    "group-show":    {"fn": v_group_show, "group": "groups", "help": "Group entry and members.",
+                      "args": [arg("name")]},
+    "group-create":  {"fn": v_group_create, "group": "groups", "help": "Create a group.",
+                      "args": [arg("name")]},
+    "group-delete":  {"fn": v_group_delete, "group": "groups", "danger": True,
+                      "help": "Delete a group.", "args": [arg("name")]},
+    "group-add-member":    {"fn": v_group_add_member, "group": "groups",
+                      "help": "Add a member.", "args": [arg("group"), arg("member")]},
+    "group-remove-member": {"fn": v_group_remove_member, "group": "groups",
+                      "help": "Remove a member.", "args": [arg("group"), arg("member")]},
+    "computer-list": {"fn": v_computer_list, "group": "users", "help": "All computer accounts."},
+    "ou-list":       {"fn": v_ou_list, "group": "users", "help": "All organizational units."},
+    "ou-create":     {"fn": v_ou_create, "group": "users", "help": "Create an OU by DN.",
+                      "args": [arg("dn", help_="e.g. OU=Workstations")]},
+    "ou-delete":     {"fn": v_ou_delete, "group": "users", "danger": True,
+                      "help": "Delete an OU by DN.", "args": [arg("dn")]},
+    "gpo-list":      {"fn": v_gpo_list, "group": "gpo", "help": "All GPOs (queried on the PDC emulator)."},
+    "gpo-create":    {"fn": v_gpo_create, "group": "gpo",
+                      "help": "Create a GPO on the PDC emulator.", "args": [arg("name")]},
+    "gpo-delete":    {"fn": v_gpo_delete, "group": "gpo", "danger": True,
+                      "help": "Delete a GPO.", "args": [arg("gpo", help_="{GUID}")]},
+    "gpo-link":      {"fn": v_gpo_link, "group": "gpo",
+                      "help": "Link a GPO to a container (site/domain/OU DN).",
+                      "args": [arg("gpo", help_="{GUID}"), arg("container_dn")]},
+    "gpo-unlink":    {"fn": v_gpo_unlink, "group": "gpo", "danger": True,
+                      "help": "Remove a GPO link.",
+                      "args": [arg("gpo"), arg("container_dn")]},
+    "gpo-show":      {"fn": v_gpo_show, "group": "gpo",
+                      "help": "GPO detail: metadata, links, and registry settings.",
+                      "args": [arg("gpo", help_="{GUID}")]},
+    "gpo-registry-list": {"fn": v_gpo_registry_list, "group": "gpo",
+                      "help": "List a GPO's Administrative-Template (registry.pol) settings.",
+                      "args": [arg("gpo", help_="{GUID}")]},
+    "gpo-settings-apply": {"fn": v_gpo_settings_apply, "group": "gpo",
+                      "help": "Apply registry-policy settings to a GPO (gpo load).",
+                      "args": [arg("gpo", help_="{GUID}"),
+                               arg("entries", help_="JSON array of {keyname,valuename,class,type,data}"),
+                               arg("replace", required=False, help_="yes = replace instead of merge")]},
+    "gpo-settings-remove": {"fn": v_gpo_settings_remove, "group": "gpo", "danger": True,
+                      "help": "Remove registry-policy settings from a GPO.",
+                      "args": [arg("gpo"), arg("entries", help_="JSON array of {keyname,valuename,class}")]},
+    "gpo-admxload":  {"fn": v_gpo_admxload, "group": "gpo",
+                      "help": "Load samba ADMX templates into the SYSVOL central store."},
+    "gpo-admx-list": {"fn": v_gpo_admx_list, "group": "gpo",
+                      "help": "List ADMX files in the central store and their policies."},
+    "gpo-backup":    {"fn": v_gpo_backup, "group": "gpo",
+                      "help": "Snapshot a GPO into the reusable template store.",
+                      "args": [arg("gpo", help_="{GUID}"),
+                               arg("name", required=False, help_="template name")]},
+    "gpo-template-list": {"fn": v_gpo_template_list, "group": "gpo",
+                      "help": "GPOs and saved backups usable as stacking sources."},
+    "gpo-template-stack": {"fn": v_gpo_template_stack, "group": "gpo",
+                      "help": "Stack settings from source GPO(s) into a target (later overrides).",
+                      "args": [arg("target", help_="target GPO {GUID}"),
+                               arg("sources", help_="comma-separated source GPO {GUID}s")]},
+    "gpo-restore":   {"fn": v_gpo_restore, "group": "gpo",
+                      "help": "Restore a saved template backup as a new GPO.",
+                      "args": [arg("name", help_="new GPO display name"),
+                               arg("template", help_="template name from gpo-template-list")]},
+    "gpo-pref-list": {"fn": v_gpo_pref_list, "group": "gpo",
+                      "help": "List a GPO preference/CSE (samba `gpo manage`).",
+                      "args": [arg("gpo", help_="{GUID}"),
+                               arg("cse", "enum", choices=GPO_CSES)]},
+    "gpo-pref-set":  {"fn": v_gpo_pref_set, "group": "gpo",
+                      "help": "Set a GPO preference/CSE setting.",
+                      "args": [arg("gpo", help_="{GUID}"),
+                               arg("cse", "enum", choices=GPO_CSES),
+                               arg("entry", required=False, help_="setting name/key (per CSE)"),
+                               arg("value", required=False, help_="value (empty unsets)")]},
+    "sites-list":    {"fn": v_sites_list, "group": "sites", "help": "Sites and subnets (Sites & Services)."},
+    "repl-status":   {"fn": v_repl_status, "group": "sites",
+                      "help": "drs showrepl for one DC or all.",
+                      "args": [arg("dc", "enum", required=False, choices=DC_CHOICES)]},
+    "repl-now":      {"fn": v_repl_now, "group": "sites",
+                      "help": "Run the KCC now on one DC or all.",
+                      "args": [arg("dc", "enum", required=False, choices=DC_CHOICES)]},
+    "sysvol-status": {"fn": v_sysvol_status, "group": "sites",
+                      "help": "SYSVOL content hash on every DC (must be identical)."},
+    "sysvol-sync":   {"fn": v_sysvol_sync, "group": "sites",
+                      "help": "Run one SYSVOL replication cycle from the PDC emulator now."},
+    "sysvolcheck":   {"fn": v_sysvolcheck, "group": "sites",
+                      "help": "samba-tool ntacl sysvolcheck on one DC.",
+                      "args": [arg("dc", "enum", choices=DC_CHOICES)]},
+    "dns-zones":     {"fn": v_dns_zones, "group": "dns", "help": "DNS zones served by the domain."},
+    "dns-records":   {"fn": v_dns_records, "group": "dns", "help": "All records in a zone.",
+                      "args": [arg("zone")]},
+    "dns-add":       {"fn": v_dns_add, "group": "dns", "help": "Add a record (on the PDC emulator).",
+                      "args": [arg("zone"), arg("name"),
+                               arg("type", "enum", choices=DNS_TYPES), arg("data")]},
+    "dns-delete":    {"fn": v_dns_delete, "group": "dns", "danger": True,
+                      "help": "Delete a record.",
+                      "args": [arg("zone"), arg("name"),
+                               arg("type", "enum", choices=DNS_TYPES), arg("data")]},
+    "dc-list":       {"fn": v_dc_list, "group": "dcs", "help": "DCs with state, IP and FSMO roles held."},
+    "dc-logs":       {"fn": v_dc_logs, "group": "dcs", "help": "Tail a DC's container log.",
+                      "args": [arg("dc", "enum", choices=DC_CHOICES),
+                               arg("lines", "int", required=False, default=80)]},
+    "dc-debug":      {"fn": v_dc_debug, "group": "dcs",
+                      "help": "Set samba's live debug level (tracing), 0..10.",
+                      "args": [arg("dc", "enum", choices=DC_CHOICES),
+                               arg("level", "int", help_="0 = quiet, 10 = firehose")]},
+    "dc-processes":  {"fn": v_dc_processes, "group": "dcs",
+                      "help": "samba service processes on a DC.",
+                      "args": [arg("dc", "enum", choices=DC_CHOICES)]},
+    "dc-rpc":        {"fn": v_dc_rpc, "group": "dcs",
+                      "help": "Live RPC/LDAP/SMB sessions into a DC.",
+                      "args": [arg("dc", "enum", choices=DC_CHOICES)]},
+    "dc-restart":    {"fn": v_dc_restart, "group": "dcs", "danger": True,
+                      "help": "Restart a DC container.",
+                      "args": [arg("dc", "enum", choices=DC_CHOICES)]},
+    "dc-shell":      {"fn": v_dc_shell, "group": "dcs", "danger": True,
+                      "help": "Run one command on a DC (remoting).",
+                      "args": [arg("dc", "enum", choices=DC_CHOICES),
+                               arg("command", help_="one shell command")]},
+    "dc-promote":    {"fn": v_dc_promote, "group": "dcs", "danger": True,
+                      "help": "Promote a NEW DC (next free dcN joins as a replica)."},
+    "dc-demote":     {"fn": v_dc_demote, "group": "dcs", "danger": True,
+                      "help": "Gracefully demote a DC and remove its container.",
+                      "args": [arg("dc", "enum", choices=DC_CHOICES)]},
+    "client-list":   {"fn": v_client_list, "group": "clients",
+                      "help": "Client containers with join state."},
+    "client-onboard": {"fn": v_client_onboard, "group": "clients",
+                      "help": "Onboard a new client: create the next clientN and join it."},
+    "client-remove": {"fn": v_client_remove, "group": "clients", "danger": True,
+                      "help": "Remove a client container and its computer account.",
+                      "args": [arg("name", help_="clientN")]},
+    "audit-log":     {"fn": v_audit_log, "group": "activity",
+                      "help": "Recent adlab-admin invocations (the API activity log).",
+                      "args": [arg("lines", "int", required=False, default=100)]},
+}
+
+# --------------------------------------------------------------------------
+# argument parsing, validation, audit, main
+# --------------------------------------------------------------------------
+
+def parse_args(spec, argv):
+    """--name value pairs -> validated dict. Pure; raises Fail."""
+    given = {}
+    i = 0
+    while i < len(argv):
+        if not argv[i].startswith("--"):
+            raise Fail("expected --arg, got %r" % argv[i])
+        key = argv[i][2:]
+        if i + 1 >= len(argv):
+            raise Fail("missing value for --%s" % key)
+        given[key] = argv[i + 1]
+        i += 2
+    out = {}
+    for a in spec.get("args", []):
+        name, typ = a["name"], a["type"]
+        if typ == "password-stdin":
+            continue                      # travels on stdin, never argv
+        if name in given:
+            v = given.pop(name)
+            if typ == "int":
+                try:
+                    v = int(v)
+                except ValueError:
+                    raise Fail("--%s must be an integer" % name)
+            if typ == "enum" and a.get("choices") and v not in a["choices"]:
+                raise Fail("--%s must be one of: %s"
+                           % (name, ", ".join(a["choices"])))
+            out[name] = v
+        elif a.get("required"):
+            raise Fail("missing required --%s" % name)
+        elif "default" in a:
+            out[name] = a["default"]
+    if given:
+        raise Fail("unknown argument(s): %s"
+                   % ", ".join("--" + k for k in given))
+    return out
+
+def audit(verb, args, ok):
+    """Append one line per invocation. Argument VALUES are logged except for
+    password-typed args (never present in args anyway); errors are not."""
+    try:
+        line = "%s %s %s %s\n" % (
+            time.strftime("%Y-%m-%dT%H:%M:%S%z"), "OK " if ok else "ERR",
+            verb, json.dumps(args, sort_keys=True))
+        with open(AUDIT_LOG, "a") as f:
+            f.write(line)
+        os.chmod(AUDIT_LOG, 0o600)
+    except OSError:
+        pass
+
+def main(argv):
+    if len(argv) < 1 or argv[0] in ("-h", "--help"):
+        print(json.dumps({"error": "usage: adlab-admin VERB [--arg value ...]",
+                          "verbs": sorted(VERBS)}))
+        return 2
+    verb = argv[0]
+    spec = VERBS.get(verb)
+    if not spec:
+        print(json.dumps({"error": "unknown verb %r" % verb,
+                          "verbs": sorted(VERBS)}))
+        return 2
+    try:
+        args = parse_args(spec, argv[1:])
+    except Fail as e:
+        print(json.dumps({"error": str(e)}))
+        return 2
+    try:
+        result = spec["fn"](args)
+        audit(verb, args, True)
+        print(json.dumps(result))
+        return 0
+    except Fail as e:
+        audit(verb, args, False)
+        print(json.dumps({"error": str(e)}))
+        return 1
+    except Exception as e:            # noqa: BLE001 — contract: JSON always
+        audit(verb, args, False)
+        print(json.dumps({"error": "internal: %s" % e}))
+        sys.stderr.write("adlab-admin internal error on %s: %r\n" % (verb, e))
+        return 3
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

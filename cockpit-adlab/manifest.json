@@ -1,0 +1,43 @@
+{
+    "version": "1.0.0.20260901",
+    "requires": {
+        "cockpit": "266"
+    },
+    "conditions": [
+        {
+            "path-exists": "/opt/sc/git/samba-ad-lab/source/lab.env"
+        }
+    ],
+    "menu": {
+        "index": {
+            "label": "AD Lab",
+            "order": 56,
+            "docs": [
+                {
+                    "label": "samba-tool documentation",
+                    "url": "https://wiki.samba.org/index.php/Samba_AD_DC_Port_Usage"
+                }
+            ],
+            "keywords": [
+                {
+                    "matches": [
+                        "active directory",
+                        "ad",
+                        "samba",
+                        "domain",
+                        "dc",
+                        "fsmo",
+                        "gpo",
+                        "dns",
+                        "replication",
+                        "kerberos",
+                        "ldap",
+                        "sysvol",
+                        "dsa",
+                        "gpmc"
+                    ]
+                }
+            ]
+        }
+    }
+}

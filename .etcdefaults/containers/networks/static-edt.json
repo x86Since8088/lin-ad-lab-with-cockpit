@@ -1,0 +1,19 @@
+{
+     "name": "static-edt",
+     "id": "8c6e504012abfec6a2f987d590e64102fb7a2b9f974f1d98c4d1888c6fb1a537",
+     "driver": "bridge",
+     "network_interface": "br-static-edt",
+     "created": "2026-08-27T01:08:05.664571796-05:00",
+     "subnets": [
+          {
+               "subnet": "172.15.4.0/24",
+               "gateway": "172.15.4.1"
+          }
+     ],
+     "ipv6_enabled": false,
+     "internal": false,
+     "dns_enabled": true,
+     "ipam_options": {
+          "driver": "host-local"
+     }
+}

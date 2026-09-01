@@ -1,0 +1,59 @@
+# =============================================================================
+# IGNORE EVERYTHING BY DEFAULT, then whitelist the install-ready set.
+# Any NEW top-level tree is invisible to git until explicitly whitelisted here.
+# =============================================================================
+*
+
+# ---- top-level files --------------------------------------------------------
+!README.md
+!LICENSE
+!VERSION
+!.gitignore
+!lab.env
+!agent.env
+!agent-guids.txt
+!pki-templates.json
+!Containerfile.dc
+!Containerfile.client
+!dc-entrypoint.sh
+!edy-domain-install.sh
+!10-build.sh
+!20-up.sh
+!21-start.sh
+!22-persist.sh
+!30-verify.sh
+!40-agent.sh
+!42-tls-from-edy-ca.sh
+!45-agent-verify.sh
+!99-down.sh
+
+# ---- tracked trees ----------------------------------------------------------
+!docs
+!docs/**
+!rdp
+!rdp/**
+!stress
+!stress/**
+!sysvol
+!sysvol/**
+!tools
+!tools/**
+!cockpit-adlab
+!cockpit-adlab/**
+
+# Install-ready /etc artifacts captured from the running host.
+!.etcdefaults
+!.etcdefaults/**
+
+# =============================================================================
+# Re-ignore generated / transient junk that lives under whitelisted trees.
+# =============================================================================
+**/__pycache__/
+*.pyc
+rdp/evidence/
+tools/dc-ca.pem
+tools/dc-ca.jks
+# never track lab secrets or per-host state even if a path ever points here
+*.pass
+*.keytab
+.secrets/
