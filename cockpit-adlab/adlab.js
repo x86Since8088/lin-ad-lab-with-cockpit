@@ -508,59 +508,288 @@
     }
 
     // -------- GPO compose modal: STACK template / ADMX / preference layers
+    var REG_TYPES = ["REG_SZ", "REG_EXPAND_SZ", "REG_DWORD", "REG_QWORD",
+                     "REG_MULTI_SZ", "REG_BINARY"];
+    var GPO_CSES = ["smb_conf", "security", "motd", "issue", "sudoers",
+                    "files", "symlink", "openssh", "scripts", "access"];
+
+    function dataPreview(type, data) {
+        if (type === "REG_BINARY" && Array.isArray(data))
+            return data.slice(0, 24).map(function (b) { return ("0" + (b & 255).toString(16)).slice(-2); }).join(" ") + (data.length > 24 ? " …" : "");
+        if (type === "REG_MULTI_SZ" && Array.isArray(data)) return data.join(" ¦ ");
+        return String(data === undefined || data === null ? "" : data);
+    }
+
+    /* Reusable picker: a filterable table with a vertically scrolling body and
+     * horizontal scroll, single- or multi-select. Cells cap at 420px and wrap.
+     * opts: {columns:[{key,label}], rows, mode:"single"|"multi", rowKey,
+     *        height, selectedKeys, actions:row->node, onChange:rows->void} */
+    function pickerTable(opts) {
+        var mode = opts.mode || "single";
+        var rowKey = opts.rowKey || function (r, i) { return String(i); };
+        var selected = {};
+        (opts.selectedKeys || []).forEach(function (k) { selected[k] = true; });
+        var wrap = el("div", "al-picker");
+        var filter = el("input", "al-picker-filter"); filter.type = "search";
+        filter.placeholder = "filter…"; wrap.appendChild(filter);
+        var scroll = el("div", "al-picker-scroll");
+        if (opts.height) scroll.style.maxHeight = opts.height + "px";
+        var table = el("table", "al al-picker-table");
+        scroll.appendChild(table); wrap.appendChild(scroll);
+        var countEl = el("div", "al-picker-count"); wrap.appendChild(countEl);
+        var rows = opts.rows || [];
+
+        function matches(row, q) {
+            if (!q) return true;
+            q = q.toLowerCase();
+            return opts.columns.some(function (c) {
+                return String(row[c.key] == null ? "" : row[c.key]).toLowerCase().indexOf(q) >= 0;
+            });
+        }
+        function keyFor(row, i) { return rowKey(row, i); }
+        function toggle(k, row, on) {
+            if (mode === "single") selected = {};
+            if (on) selected[k] = row; else delete selected[k];
+            if (opts.onChange) opts.onChange(list());
+            draw();
+        }
+        function list() {
+            var out = [];
+            rows.forEach(function (r, i) { if (selected[keyFor(r, i)]) out.push(r); });
+            return out;
+        }
+        function draw() {
+            clear(table);
+            var head = el("tr");
+            head.appendChild(el("th", "al-pick-selcol", ""));
+            opts.columns.forEach(function (c) { head.appendChild(el("th", null, c.label)); });
+            if (opts.actions) head.appendChild(el("th", null, ""));
+            table.appendChild(head);
+            var q = filter.value, shown = 0;
+            rows.forEach(function (row, i) {
+                if (!matches(row, q)) return;
+                shown++;
+                var k = keyFor(row, i);
+                var tr = el("tr", selected[k] ? "al-pick-sel" : "");
+                var selTd = el("td", "al-pick-selcol");
+                var input = el("input"); input.type = mode === "multi" ? "checkbox" : "radio";
+                input.checked = !!selected[k];
+                input.addEventListener("change", function () { toggle(k, row, input.checked); });
+                selTd.appendChild(input); tr.appendChild(selTd);
+                tr.addEventListener("click", function (ev) {
+                    var tag = ev.target.tagName;
+                    if (tag === "BUTTON" || tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+                    toggle(k, row, !selected[k]);
+                });
+                opts.columns.forEach(function (c) {
+                    var td = el("td", "al-wrapcell");
+                    var v = row[c.key];
+                    td.textContent = v == null ? "" : String(v);
+                    tr.appendChild(td);
+                });
+                if (opts.actions) { var atd = el("td"); atd.appendChild(opts.actions(row)); tr.appendChild(atd); }
+                table.appendChild(tr);
+            });
+            countEl.textContent = shown + " shown · " + list().length + " selected";
+        }
+        filter.addEventListener("input", draw);
+        draw();
+        return {
+            node: wrap, selected: list,
+            setRows: function (r) { rows = r; selected = {}; draw(); },
+            clearSel: function () { selected = {}; draw(); }
+        };
+    }
+
+    /* Editor for one registry value. Adapts to the type (single-select picker),
+     * with Hex/Text view-mode selection for REG_BINARY and one-string-per-line
+     * for REG_MULTI_SZ (stored null-separated, double-null terminated). */
+    function valueEditor(initialType, initialData) {
+        var curType = initialType || "REG_SZ";
+        var wrap = el("div", "al-veditor");
+        var typePick = pickerTable({
+            columns: [{ key: "type", label: "type" }],
+            rows: REG_TYPES.map(function (t) { return { type: t }; }),
+            mode: "single", rowKey: function (r) { return r.type; },
+            selectedKeys: [curType], height: 140,
+            onChange: function (sel) { if (sel[0]) { curType = sel[0].type; renderData(); } }
+        });
+        wrap.appendChild(el("label", null, "type")); wrap.appendChild(typePick.node);
+        var dataHost = el("div", "al-vdata"); wrap.appendChild(dataHost);
+
+        // REG_BINARY state
+        var binMode = "Hex";
+        var binBytes = (curType === "REG_BINARY" && Array.isArray(initialData)) ? initialData.slice() : [];
+
+        function bytesToText(bytes) { return bytes.map(function (b) { return String.fromCharCode(b & 255); }).join(""); }
+        function textToBytes(s) { var out = []; for (var i = 0; i < s.length; i++) out.push(s.charCodeAt(i) & 255); return out; }
+        function bytesToHex(bytes) { return bytes.map(function (b) { return ("0" + (b & 255).toString(16)).slice(-2); }).join(" "); }
+        function hexToBytes(s) { return (s.match(/[0-9a-fA-F]{2}/g) || []).map(function (h) { return parseInt(h, 16); }); }
+
+        var ta, dwordInput;
+        function renderData() {
+            clear(dataHost);
+            if (curType === "REG_SZ" || curType === "REG_EXPAND_SZ") {
+                ta = el("input"); ta.type = "text";
+                ta.value = (typeof initialData === "string") ? initialData : "";
+                dataHost.appendChild(el("label", null, "value")); dataHost.appendChild(ta);
+            } else if (curType === "REG_DWORD" || curType === "REG_QWORD") {
+                dwordInput = el("input"); dwordInput.type = "text";
+                dwordInput.placeholder = "decimal or 0x…";
+                dwordInput.value = (typeof initialData === "number") ? String(initialData) : "";
+                dataHost.appendChild(el("label", null, "value (decimal or 0x hex)")); dataHost.appendChild(dwordInput);
+            } else if (curType === "REG_MULTI_SZ") {
+                ta = el("textarea"); ta.rows = 4;
+                ta.value = Array.isArray(initialData) ? initialData.join("\n") : "";
+                dataHost.appendChild(el("label", null, "one string per line"));
+                dataHost.appendChild(el("div", "hint", "stored null-separated, double-null terminated"));
+                dataHost.appendChild(ta);
+            } else if (curType === "REG_BINARY") {
+                var modeRow = el("div", "al-vmode");
+                ["Hex", "Text"].forEach(function (m) {
+                    var b = el("button", "al-btn " + (binMode === m ? "" : "secondary"), m);
+                    b.type = "button";
+                    b.addEventListener("click", function () {
+                        // convert current textarea (old mode) -> bytes, switch, re-render
+                        binBytes = (binMode === "Hex") ? hexToBytes(ta.value) : textToBytes(ta.value);
+                        binMode = m; renderData();
+                    });
+                    modeRow.appendChild(b);
+                });
+                dataHost.appendChild(el("label", null, "binary value")); dataHost.appendChild(modeRow);
+                ta = el("textarea"); ta.rows = 3;
+                ta.value = (binMode === "Hex") ? bytesToHex(binBytes) : bytesToText(binBytes);
+                dataHost.appendChild(el("div", "hint", binMode === "Hex" ? "space/comma-separated hex bytes (e.g. 01 ff 00)" : "text — each character is one byte"));
+                dataHost.appendChild(ta);
+            }
+        }
+        renderData();
+
+        function getValue() {
+            if (curType === "REG_SZ" || curType === "REG_EXPAND_SZ") return { type: curType, data: ta.value };
+            if (curType === "REG_DWORD" || curType === "REG_QWORD") {
+                var v = (dwordInput.value || "").trim();
+                var n = /^0x/i.test(v) ? parseInt(v, 16) : parseInt(v || "0", 10);
+                return { type: curType, data: isNaN(n) ? 0 : n };
+            }
+            if (curType === "REG_MULTI_SZ")
+                return { type: curType, data: ta.value.split("\n").map(function (s) { return s.replace(/\r$/, ""); }).filter(function (s) { return s.length; }) };
+            if (curType === "REG_BINARY")
+                return { type: curType, data: (binMode === "Hex") ? hexToBytes(ta.value) : textToBytes(ta.value) };
+            return { type: curType, data: ta ? ta.value : "" };
+        }
+        return { node: wrap, getValue: getValue };
+    }
+
+    /* The Group Policy compose modal — a full registry.pol editor + stacker.
+     * On open it AUTO-LOADS the target GPO's current settings into an editable
+     * table; sources (template GPOs, ADMX policies, raw registry, preferences)
+     * add rows; Apply is surgical (adds/edits merge via gpo load, removed
+     * current entries are removed, preferences set via gpo manage). */
     function gpoComposeModal(target) {
         if (!target) { closeModalDom(); return; }
-        var layers = [];       // ordered stack: {kind, label, entries?|pref?}
+        var working = [];          // {id, keyname, valuename, class, type, data, origin, dirty}
+        var removed = [];          // current entries the user removed
+        var prefs = [];            // staged preference ops
+        var seq = 0;
+        function nid() { return "e" + (seq++); }
+
         modal("Compose Group Policy", function (box) {
             box.appendChild(el("div", "hint", "Target GPO: ")).appendChild(el("kbd", "al", target));
-            var stackCard = el("div", "al-card"); stackCard.appendChild(el("h3", null, "Layers to apply (top → bottom; later overrides)"));
-            var stackList = el("div"); stackCard.appendChild(stackList);
-            box.appendChild(stackCard);
 
-            function redrawStack() {
-                clear(stackList);
-                if (!layers.length) {
-                    stackList.appendChild(el("div", "al-loading", "No layers yet — add from the sources below."));
-                    return;
-                }
-                layers.forEach(function (L, idx) {
+            var regCard = el("div", "al-card");
+            regCard.appendChild(el("h3", null, "Registry settings (auto-loaded — edit to stage changes)"));
+            var regHost = el("div"); regHost.appendChild(el("div", "al-loading", "loading current settings…"));
+            regCard.appendChild(regHost);
+            box.appendChild(regCard);
+
+            var stagedCard = el("div", "al-card");
+            stagedCard.appendChild(el("h3", null, "Staged preferences (samba CSEs)"));
+            var prefHost = el("div"); stagedCard.appendChild(prefHost);
+            box.appendChild(stagedCard);
+
+            function drawReg() {
+                clear(regHost);
+                if (!working.length) { regHost.appendChild(el("div", "hint", "no registry settings — add from the sources below")); return; }
+                var picker = pickerTable({
+                    columns: [{ key: "class", label: "class" }, { key: "keyname", label: "key" },
+                              { key: "valuename", label: "value" }, { key: "type", label: "type" },
+                              { key: "_preview", label: "data" }, { key: "_state", label: "" }],
+                    rows: working.map(function (e) {
+                        return { _e: e, class: e.class, keyname: e.keyname, valuename: e.valuename,
+                                 type: e.type, _preview: dataPreview(e.type, e.data),
+                                 _state: e.origin === "added" ? "new" : (e.dirty ? "edited" : "") };
+                    }),
+                    mode: "multi", rowKey: function (r) { return r._e.id; }, height: 240,
+                    actions: function (r) {
+                        var b = el("button", "al-btn secondary", "edit");
+                        b.addEventListener("click", function () { editEntry(r._e); });
+                        return b;
+                    }
+                });
+                regHost.appendChild(picker.node);
+                var rm = el("button", "al-btn danger", "Remove selected");
+                rm.addEventListener("click", function () {
+                    picker.selected().forEach(function (r) {
+                        var e = r._e;
+                        if (e.origin === "current") removed.push(e);
+                        working = working.filter(function (x) { return x.id !== e.id; });
+                    });
+                    drawReg();
+                });
+                regHost.appendChild(rm);
+            }
+            function drawPrefs() {
+                clear(prefHost);
+                if (!prefs.length) { prefHost.appendChild(el("div", "hint", "none staged")); return; }
+                prefs.forEach(function (p, i) {
                     var row = el("div", "al-stack-row");
-                    row.appendChild(badge(L.kind, L.kind === "pref" ? "warn" : "ok"));
-                    row.appendChild(el("span", "al-stack-label", L.label));
-                    var ctl = el("span", "al-actions");
-                    var up = el("button", "al-btn secondary", "↑");
-                    up.disabled = idx === 0;
-                    up.addEventListener("click", function () {
-                        var t = layers[idx - 1]; layers[idx - 1] = layers[idx]; layers[idx] = t; redrawStack();
-                    });
-                    var dn = el("button", "al-btn secondary", "↓");
-                    dn.disabled = idx === layers.length - 1;
-                    dn.addEventListener("click", function () {
-                        var t = layers[idx + 1]; layers[idx + 1] = layers[idx]; layers[idx] = t; redrawStack();
-                    });
-                    var rm = el("button", "al-btn danger", "✕");
-                    rm.addEventListener("click", function () { layers.splice(idx, 1); redrawStack(); });
-                    ctl.appendChild(up); ctl.appendChild(dn); ctl.appendChild(rm);
-                    row.appendChild(ctl);
-                    stackList.appendChild(row);
+                    row.appendChild(badge("pref", "warn"));
+                    row.appendChild(el("span", "al-stack-label", p.cse + " " + (p.entry || "") + " = " + (p.value || "(unset)")));
+                    var x = el("button", "al-btn danger", "✕");
+                    x.addEventListener("click", function () { prefs.splice(i, 1); drawPrefs(); });
+                    row.appendChild(x); prefHost.appendChild(row);
                 });
             }
-            redrawStack();
 
-            // three source panels
-            box.appendChild(composeTemplatePanel(layers, redrawStack));
-            box.appendChild(composeAdmxPanel(layers, redrawStack));
-            box.appendChild(composeRegistryPanel(layers, redrawStack));
-            box.appendChild(composePrefPanel(layers, redrawStack));
+            // Edit a value INLINE (no nested modal) so the composed state —
+            // working set, removals, staged prefs — is never lost.
+            function editEntry(e) {
+                clear(regHost);
+                regHost.appendChild(el("div", "hint", "Editing  " + e.class + "  " + e.keyname + "\\" + e.valuename));
+                var ve = valueEditor(e.type, e.data);
+                regHost.appendChild(ve.node);
+                var row = el("div", "row");
+                var save = el("button", "al-btn", "Save value");
+                save.addEventListener("click", function () {
+                    var v = ve.getValue(); e.type = v.type; e.data = v.data;
+                    if (e.origin === "current") e.dirty = true;
+                    drawReg();
+                });
+                var back = el("button", "al-btn secondary", "Cancel");
+                back.addEventListener("click", drawReg);
+                row.appendChild(save); row.appendChild(back); regHost.appendChild(row);
+            }
+
+            // ---- source panels (filterable picker tables) ------------------
+            box.appendChild(sourceTemplate());
+            box.appendChild(sourceAdmx());
+            box.appendChild(sourceRaw());
+            box.appendChild(sourcePref());
 
             var alertBox = el("div", "al-alert err"); box.appendChild(alertBox);
             var rowb = el("div", "row");
-            var apply = el("button", "al-btn", "Apply stack to GPO");
+            var apply = el("button", "al-btn", "Apply to GPO");
             apply.addEventListener("click", function () {
                 alertBox.textContent = "";
-                if (!layers.length) { alertBox.textContent = "Add at least one layer."; return; }
+                var applyList = working.filter(function (e) { return e.origin === "added" || e.dirty; })
+                    .map(function (e) { return { keyname: e.keyname, valuename: e.valuename, class: e.class, type: e.type, data: e.data }; });
+                var removeList = removed.map(function (e) { return { keyname: e.keyname, valuename: e.valuename, class: e.class }; });
+                if (!applyList.length && !removeList.length && !prefs.length) {
+                    alertBox.textContent = "Nothing to apply — edit, add, or remove a setting first."; return;
+                }
                 apply.disabled = true;
-                applyStack(target, layers).then(function (results) {
+                applyCompose(target, applyList, removeList, prefs).then(function (results) {
                     clear(box);
                     box.appendChild(el("h2", null, "Applied to GPO"));
                     box.appendChild(el("pre", "al-log", JSON.stringify(results, null, 2)));
@@ -573,156 +802,179 @@
             cancel.addEventListener("click", closeModal);
             rowb.appendChild(apply); rowb.appendChild(cancel);
             box.appendChild(rowb);
-        });
-    }
 
-    function panel(title) {
-        var p = el("div", "al-card"); p.appendChild(el("h3", null, title)); return p;
-    }
-
-    function composeTemplatePanel(layers, redraw) {
-        var p = panel("① Stack from a template GPO");
-        var sel = el("select"); sel.appendChild(el("option", null, "loading GPOs…"));
-        p.appendChild(sel);
-        var add = el("button", "al-btn secondary", "Add template layer");
-        var msg = el("span", "hint", "");
-        run("gpo-template-list").then(function (r) {
-            clear(sel);
-            (r.gpos || []).forEach(function (g) {
-                var o = el("option", null, (g.display_name || g.gpo) + "  " + g.gpo);
-                o.value = g.gpo; sel.appendChild(o);
-            });
-        }).catch(function () { clear(sel); sel.appendChild(el("option", null, "(list failed)")); });
-        add.addEventListener("click", function () {
-            var src = sel.value; if (!src) return;
-            add.disabled = true; msg.textContent = " reading settings…";
-            run("gpo-registry-list", { gpo: src }).then(function (r) {
-                add.disabled = false;
-                var ent = (r.settings || []).map(function (s) {
-                    return { keyname: s.keyname, valuename: s.valuename, class: s.class, type: s.type, data: s.data };
+            // sources close over working/prefs; each re-renders the reg table
+            function sourceTemplate() {
+                var p = el("div", "al-card"); p.appendChild(el("h3", null, "Add settings from a template GPO"));
+                var host = el("div"); host.appendChild(el("div", "al-loading", "loading GPOs…"));
+                p.appendChild(host);
+                run("gpo-template-list").then(function (r) {
+                    clear(host);
+                    var pk = pickerTable({
+                        columns: [{ key: "display_name", label: "display name" }, { key: "gpo", label: "GUID" }],
+                        rows: r.gpos || [], mode: "multi", rowKey: function (g) { return g.gpo; }, height: 180
+                    });
+                    host.appendChild(pk.node);
+                    var add = el("button", "al-btn secondary", "Add selected GPOs' settings");
+                    var msg = el("span", "hint", "");
+                    add.addEventListener("click", function () {
+                        var sel = pk.selected(); if (!sel.length) { msg.textContent = " pick at least one GPO"; return; }
+                        add.disabled = true; msg.textContent = " reading…";
+                        var chain = Promise.resolve(); var added = 0;
+                        sel.forEach(function (g) {
+                            chain = chain.then(function () {
+                                return run("gpo-registry-list", { gpo: g.gpo }).then(function (rr) {
+                                    (rr.settings || []).forEach(function (s) {
+                                        working.push({ id: nid(), keyname: s.keyname, valuename: s.valuename, class: s.class, type: s.type, data: s.data, origin: "added" });
+                                        added++;
+                                    });
+                                });
+                            });
+                        });
+                        chain.then(function () { add.disabled = false; msg.textContent = " added " + added; drawReg(); })
+                             .catch(function (e) { add.disabled = false; msg.textContent = " " + e; });
+                    });
+                    host.appendChild(add); host.appendChild(msg);
+                }).catch(function (e) { clear(host); host.appendChild(el("div", "al-alert err", String(e))); });
+                return p;
+            }
+            function sourceAdmx() {
+                var p = el("div", "al-card"); p.appendChild(el("h3", null, "Add from an ADMX policy"));
+                var loadBtn = el("button", "al-btn secondary", "Load ADMX to central store");
+                var host = el("div"); var msg = el("span", "hint", "");
+                var statePick = pickerTable({
+                    columns: [{ key: "state", label: "state" }],
+                    rows: [{ state: "Enabled" }, { state: "Disabled" }], mode: "single",
+                    rowKey: function (r) { return r.state; }, selectedKeys: ["Enabled"], height: 90
                 });
-                if (!ent.length) { msg.textContent = " (source has no registry settings)"; return; }
-                msg.textContent = "";
-                layers.push({ kind: "template", label: ent.length + " settings from " + src, entries: ent });
-                redraw();
-            }).catch(function (e) { add.disabled = false; msg.textContent = " " + e; });
-        });
-        p.appendChild(add); p.appendChild(msg);
-        return p;
-    }
-
-    function composeAdmxPanel(layers, redraw) {
-        var p = panel("② Stack an ADMX policy");
-        var loadBtn = el("button", "al-btn secondary", "Load ADMX to central store");
-        var sel = el("select"); sel.appendChild(el("option", null, "load ADMX, then pick a policy…"));
-        var stateSel = el("select");
-        ["Enabled", "Disabled"].forEach(function (s) { var o = el("option", null, s); o.value = s; stateSel.appendChild(o); });
-        var add = el("button", "al-btn secondary", "Add ADMX layer");
-        var msg = el("span", "hint", "");
-        var policies = [];
-        function loadList() {
-            run("gpo-admx-list").then(function (r) {
-                policies = r.policies || [];
-                clear(sel);
-                if (!policies.length) { sel.appendChild(el("option", null, "(no ADMX loaded)")); return; }
-                policies.slice(0, 2000).forEach(function (pol, i) {
-                    var name = pol.display || pol.id;
-                    var o = el("option", null, name + "  [" + pol.class + "]");
-                    o.value = String(i); sel.appendChild(o);
+                var showUnresolved = false;
+                function loadList() {
+                    clear(host); host.appendChild(el("div", "al-loading", "listing…"));
+                    run("gpo-admx-list").then(function (r) {
+                        clear(host);
+                        var pols = r.policies || [];
+                        if (!pols.length) { host.appendChild(el("div", "hint", "no ADMX loaded — click Load above")); return; }
+                        // Policies whose display name never resolved from the ADML
+                        // (raw string.POL_* references) are noise — hide by default.
+                        var unresolvedCount = pols.filter(function (p) { return p.unresolved; }).length;
+                        var toggleRow = el("label", "al-inline-check");
+                        var cb = el("input"); cb.type = "checkbox"; cb.checked = showUnresolved;
+                        toggleRow.appendChild(cb);
+                        toggleRow.appendChild(document.createTextNode(
+                            " show unresolved policy names (" + unresolvedCount + " hidden)"));
+                        cb.addEventListener("change", function () { showUnresolved = cb.checked; loadList(); });
+                        host.appendChild(toggleRow);
+                        var rows = pols.filter(function (p) { return showUnresolved || !p.unresolved; });
+                        var pk = pickerTable({
+                            columns: [{ key: "_name", label: "policy" }, { key: "class", label: "class" },
+                                      { key: "_reg", label: "key\\value" }],
+                            rows: rows.map(function (pol) {
+                                return { _pol: pol, _name: pol.display || pol.id, class: pol.class, _reg: pol.key + "\\" + (pol.valuename || pol.id) };
+                            }),
+                            mode: "multi", rowKey: function (r, i) { return r._pol.id + ":" + i; }, height: 220
+                        });
+                        host.appendChild(pk.node);
+                        host.appendChild(el("label", null, "state")); host.appendChild(statePick.node);
+                        var add = el("button", "al-btn secondary", "Add selected policies");
+                        add.addEventListener("click", function () {
+                            var enabling = (statePick.selected()[0] || { state: "Enabled" }).state === "Enabled";
+                            var sel = pk.selected(); if (!sel.length) { msg.textContent = " pick a policy"; return; }
+                            sel.forEach(function (r) {
+                                var pol = r._pol;
+                                var typ = enabling ? pol.enabled_type : pol.disabled_type;
+                                var data = enabling ? pol.enabled_data : pol.disabled_data;
+                                if (typ == null) { typ = "REG_DWORD"; data = enabling ? 1 : 0; }
+                                var cls = (pol.class || "BOTH").toUpperCase();
+                                if (cls !== "MACHINE" && cls !== "USER") cls = "BOTH";
+                                working.push({ id: nid(), keyname: pol.key, valuename: pol.valuename || pol.id, class: cls, type: typ, data: data, origin: "added" });
+                            });
+                            msg.textContent = " added " + sel.length; drawReg();
+                        });
+                        host.appendChild(add);
+                    }).catch(function (e) { clear(host); host.appendChild(el("div", "al-alert err", String(e))); });
+                }
+                loadBtn.addEventListener("click", function () {
+                    loadBtn.disabled = true; msg.textContent = " loading…";
+                    run("gpo-admxload").then(function () { loadBtn.disabled = false; msg.textContent = " loaded"; loadList(); })
+                        .catch(function (e) { loadBtn.disabled = false; msg.textContent = " " + e; });
                 });
-                msg.textContent = policies.length + " policies";
-            }).catch(function (e) { msg.textContent = " " + e; });
-        }
-        loadBtn.addEventListener("click", function () {
-            loadBtn.disabled = true; msg.textContent = " loading…";
-            run("gpo-admxload").then(function () { loadBtn.disabled = false; msg.textContent = " loaded"; loadList(); })
-                .catch(function (e) { loadBtn.disabled = false; msg.textContent = " " + e; });
+                p.appendChild(loadBtn); p.appendChild(msg); p.appendChild(host);
+                loadList();
+                return p;
+            }
+            function sourceRaw() {
+                var p = el("div", "al-card"); p.appendChild(el("h3", null, "Add a raw registry setting"));
+                var key = el("input"); key.placeholder = "Software\\Policies\\...";
+                var val = el("input"); val.placeholder = "valueName";
+                var clsPick = pickerTable({
+                    columns: [{ key: "class", label: "class" }],
+                    rows: [{ class: "MACHINE" }, { class: "USER" }, { class: "BOTH" }], mode: "single",
+                    rowKey: function (r) { return r.class; }, selectedKeys: ["MACHINE"], height: 110
+                });
+                var ve = valueEditor("REG_SZ", "");
+                p.appendChild(el("label", null, "key")); p.appendChild(key);
+                p.appendChild(el("label", null, "value")); p.appendChild(val);
+                p.appendChild(el("label", null, "class")); p.appendChild(clsPick.node);
+                p.appendChild(ve.node);
+                var add = el("button", "al-btn secondary", "Add setting");
+                var msg = el("span", "hint", "");
+                add.addEventListener("click", function () {
+                    if (!key.value || !val.value) { msg.textContent = " key and value required"; return; }
+                    var v = ve.getValue();
+                    var cls = (clsPick.selected()[0] || { class: "MACHINE" }).class;
+                    working.push({ id: nid(), keyname: key.value, valuename: val.value, class: cls, type: v.type, data: v.data, origin: "added" });
+                    key.value = val.value = ""; msg.textContent = " added"; drawReg();
+                });
+                p.appendChild(add); p.appendChild(msg);
+                return p;
+            }
+            function sourcePref() {
+                var p = el("div", "al-card"); p.appendChild(el("h3", null, "Add a preference (samba CSE)"));
+                var csePick = pickerTable({
+                    columns: [{ key: "cse", label: "CSE" }],
+                    rows: GPO_CSES.map(function (c) { return { cse: c }; }), mode: "single",
+                    rowKey: function (r) { return r.cse; }, selectedKeys: ["smb_conf"], height: 200
+                });
+                var entry = el("input"); entry.placeholder = "entry / setting (blank for motd/issue)";
+                var value = el("input"); value.placeholder = "value (empty unsets)";
+                p.appendChild(el("label", null, "CSE")); p.appendChild(csePick.node);
+                p.appendChild(el("label", null, "entry")); p.appendChild(entry);
+                p.appendChild(el("label", null, "value")); p.appendChild(value);
+                var add = el("button", "al-btn secondary", "Stage preference");
+                add.addEventListener("click", function () {
+                    var cse = (csePick.selected()[0] || { cse: "smb_conf" }).cse;
+                    prefs.push({ cse: cse, entry: entry.value, value: value.value });
+                    entry.value = value.value = ""; drawPrefs();
+                });
+                p.appendChild(add);
+                return p;
+            }
+
+            // auto-load the target GPO's current registry settings
+            run("gpo-registry-list", { gpo: target }).then(function (r) {
+                (r.settings || []).forEach(function (s) {
+                    working.push({ id: nid(), keyname: s.keyname, valuename: s.valuename, class: s.class, type: s.type, data: s.data, origin: "current", dirty: false });
+                });
+                drawReg();
+            }).catch(function (e) { clear(regHost); regHost.appendChild(el("div", "al-alert err", "auto-load failed: " + e)); });
+            drawPrefs();
         });
-        loadList();
-        add.addEventListener("click", function () {
-            var pol = policies[parseInt(sel.value, 10)];
-            if (!pol) { msg.textContent = " pick a policy"; return; }
-            var enabling = stateSel.value === "Enabled";
-            var typ = enabling ? pol.enabled_type : pol.disabled_type;
-            var data = enabling ? pol.enabled_data : pol.disabled_data;
-            if (typ === null || typ === undefined) { typ = "REG_DWORD"; data = enabling ? 1 : 0; }
-            var cls = (pol.class || "BOTH").toUpperCase();
-            if (cls === "MACHINE" || cls === "USER") { /* ok */ } else { cls = "BOTH"; }
-            var ent = [{ keyname: pol.key, valuename: pol.valuename || pol.id, class: cls, type: typ, data: data }];
-            layers.push({ kind: "admx", label: stateSel.value + " " + (pol.display || pol.id), entries: ent });
-            redraw();
-        });
-        p.appendChild(loadBtn);
-        p.appendChild(el("label", null, "policy")); p.appendChild(sel);
-        p.appendChild(el("label", null, "state")); p.appendChild(stateSel);
-        p.appendChild(add); p.appendChild(msg);
-        return p;
     }
 
-    function composeRegistryPanel(layers, redraw) {
-        var p = panel("③ Add a raw registry setting");
-        var key = el("input"); key.placeholder = "Software\\Policies\\...";
-        var val = el("input"); val.placeholder = "valueName";
-        var cls = el("select"); ["MACHINE", "USER", "BOTH"].forEach(function (x) { var o = el("option", null, x); o.value = x; cls.appendChild(o); });
-        var typ = el("select"); ["REG_SZ", "REG_DWORD", "REG_QWORD", "REG_EXPAND_SZ", "REG_MULTI_SZ", "REG_BINARY"].forEach(function (x) { var o = el("option", null, x); o.value = x; typ.appendChild(o); });
-        var data = el("input"); data.placeholder = "data";
-        var add = el("button", "al-btn secondary", "Add registry layer");
-        add.addEventListener("click", function () {
-            if (!key.value || !val.value) return;
-            var d = data.value;
-            if (typ.value === "REG_DWORD" || typ.value === "REG_QWORD") d = parseInt(d || "0", 10);
-            else if (typ.value === "REG_MULTI_SZ") d = d.split("\n");
-            else if (typ.value === "REG_BINARY") d = d.split(/[,\s]+/).filter(Boolean).map(function (n) { return parseInt(n, 10) & 255; });
-            var ent = [{ keyname: key.value, valuename: val.value, class: cls.value, type: typ.value, data: d }];
-            layers.push({ kind: "registry", label: cls.value + " " + key.value + "\\" + val.value, entries: ent });
-            key.value = val.value = data.value = ""; redraw();
-        });
-        [["key", key], ["value", val], ["class", cls], ["type", typ], ["data", data]].forEach(function (pair) {
-            p.appendChild(el("label", null, pair[0])); p.appendChild(pair[1]);
-        });
-        p.appendChild(add);
-        return p;
-    }
-
-    function composePrefPanel(layers, redraw) {
-        var p = panel("④ Add a preference (samba CSE)");
-        var cse = el("select");
-        ["smb_conf", "security", "motd", "issue", "sudoers", "files", "symlink", "openssh", "scripts", "access"]
-            .forEach(function (x) { var o = el("option", null, x); o.value = x; cse.appendChild(o); });
-        var entry = el("input"); entry.placeholder = "entry / setting (per CSE; blank for motd/issue)";
-        var value = el("input"); value.placeholder = "value";
-        var add = el("button", "al-btn secondary", "Add preference layer");
-        add.addEventListener("click", function () {
-            layers.push({ kind: "pref", label: cse.value + " " + (entry.value || "") + "=" + (value.value || ""),
-                          pref: { cse: cse.value, entry: entry.value, value: value.value } });
-            entry.value = value.value = ""; redraw();
-        });
-        p.appendChild(el("label", null, "CSE")); p.appendChild(cse);
-        p.appendChild(el("label", null, "entry")); p.appendChild(entry);
-        p.appendChild(el("label", null, "value")); p.appendChild(value);
-        p.appendChild(add);
-        return p;
-    }
-
-    /* Apply a composed stack: all registry layers merge (in order) into ONE
-     * gpo-settings-apply so later layers override earlier; preference layers
-     * apply individually via gpo-pref-set. */
-    function applyStack(target, layers) {
-        var regEntries = [];
-        var prefLayers = [];
-        layers.forEach(function (L) {
-            if (L.kind === "pref") prefLayers.push(L.pref);
-            else regEntries = regEntries.concat(L.entries || []);
-        });
+    /* Apply the composed changes: adds/edits merge via gpo load, removed
+     * current entries are removed, staged preferences set via gpo manage. */
+    function applyCompose(target, applyList, removeList, prefs) {
+        var results = { applied: null, removed: null, preferences: [] };
         var chain = Promise.resolve();
-        var results = { registry: null, preferences: [] };
-        if (regEntries.length) {
-            chain = chain.then(function () {
-                return run("gpo-settings-apply", { gpo: target, entries: JSON.stringify(regEntries) })
-                    .then(function (r) { results.registry = r; });
-            });
-        }
-        prefLayers.forEach(function (pr) {
+        if (applyList.length) chain = chain.then(function () {
+            return run("gpo-settings-apply", { gpo: target, entries: JSON.stringify(applyList) })
+                .then(function (r) { results.applied = r; });
+        });
+        if (removeList.length) chain = chain.then(function () {
+            return run("gpo-settings-remove", { gpo: target, entries: JSON.stringify(removeList) })
+                .then(function (r) { results.removed = r; });
+        });
+        prefs.forEach(function (pr) {
             chain = chain.then(function () {
                 return run("gpo-pref-set", { gpo: target, cse: pr.cse, entry: pr.entry, value: pr.value })
                     .then(function (r) { results.preferences.push(r); });

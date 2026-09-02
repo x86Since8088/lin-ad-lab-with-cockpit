@@ -49,7 +49,7 @@ LAB_ENV = "/opt/sc/git/samba-ad-lab/source/lab.env"
 RDP_ENV = "/opt/sc/git/samba-ad-lab/source/rdp/rdp.env"
 SYSVOL_REPL = "/opt/sc/git/samba-ad-lab/source/sysvol/sysvol-replicate.sh"
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.0.0.20260901"
+VERSION = "1.0.0"
 
 # --------------------------------------------------------------------------
 # lab configuration (parsed from lab.env; defaults match the deployed lab)
@@ -800,29 +800,64 @@ def v_gpo_admxload(a):
 def _pol_root(dc):
     return "/var/lib/samba/sysvol/%s/Policies" % LAB["DOMAIN_DNS"]
 
+def parse_adml(xml_text):
+    """ADML <string id="X">text</string> -> {X: text}. Used to resolve the
+    $(string.ID) references in ADMX displayName/explainText into real names."""
+    out = {}
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return out
+    for s in root.iter():
+        if _admx_local(s.tag) == "string" and s.get("id"):
+            out[s.get("id")] = "".join(s.itertext()).strip()
+    return out
+
+def _resolve_ref(val, strings):
+    """'string.POL_x' (an unresolved $(string.ID)) -> its ADML text, else val."""
+    if isinstance(val, str) and val.startswith("string."):
+        return strings.get(val[len("string."):], val)
+    return val
+
+def _read_b64(dc, path):
+    rc, b64, _ = podman(dc, ["bash", "-c", "base64 -w0 %s 2>/dev/null" % shq(path)])
+    if rc != 0 or not b64.strip():
+        return None
+    try:
+        return base64.b64decode(b64.strip()).decode("utf-8", "replace")
+    except Exception:
+        return None
+
 def v_gpo_admx_list(a):
-    """List ADMX files in the central store and parse their policies."""
+    """List ADMX files in the central store and parse their policies, with
+    displayName/explainText resolved against the matching ADML (default en-US;
+    override with --lang). Each policy carries `unresolved: true` when its name
+    is still a raw string.POL_* reference (no ADML text found)."""
     d = pdc_emulator()
     root = "%s/PolicyDefinitions" % _pol_root(d)
-    rc, ls, _ = podman(d, ["bash", "-c",
-        "ls %s/*.admx 2>/dev/null" % shq(root)])
+    lang = a.get("lang") or "en-US"
+    rc, ls, _ = podman(d, ["bash", "-c", "ls %s/*.admx 2>/dev/null" % shq(root)])
     files = [x for x in (ls or "").split() if x.endswith(".admx")]
     policies, admx = [], []
     for f in files:
         name = f.rsplit("/", 1)[-1]
         admx.append(name)
-        rc2, b64, _ = podman(d, ["bash", "-c", "base64 -w0 %s" % shq(f)])
-        if rc2 != 0 or not b64.strip():
+        xml = _read_b64(d, f)
+        if xml is None:
             continue
-        try:
-            xml = base64.b64decode(b64.strip()).decode("utf-8", "replace")
-        except Exception:
-            continue
+        adml = _read_b64(d, "%s/%s/%s" % (root, lang, name[:-5] + ".adml"))
+        strings = parse_adml(adml) if adml else {}
         for p in parse_admx(xml):
             p["admx"] = name
+            p["display"] = _resolve_ref(p.get("display", ""), strings) or p.get("id", "")
+            p["explain"] = _resolve_ref(p.get("explain", ""), strings)
+            disp = p["display"]
+            p["unresolved"] = (not disp) or disp.startswith("string.") \
+                or bool(re.match(r'^POL_[0-9A-Fa-f_]+$', disp))
             policies.append(p)
-    return {"on": d, "loaded": bool(files), "admx_files": admx,
-            "policies": policies, "policy_count": len(policies)}
+    return {"on": d, "loaded": bool(files), "admx_files": admx, "lang": lang,
+            "policies": policies, "policy_count": len(policies),
+            "resolved_count": sum(0 if p["unresolved"] else 1 for p in policies)}
 
 # ---- template GPOs: backup / restore / stack ------------------------------
 
@@ -1317,7 +1352,8 @@ VERBS = {
     "gpo-admxload":  {"fn": v_gpo_admxload, "group": "gpo",
                       "help": "Load samba ADMX templates into the SYSVOL central store."},
     "gpo-admx-list": {"fn": v_gpo_admx_list, "group": "gpo",
-                      "help": "List ADMX files in the central store and their policies."},
+                      "help": "List ADMX files in the central store and their policies (names resolved via ADML).",
+                      "args": [arg("lang", required=False, help_="ADML language dir (default en-US)")]},
     "gpo-backup":    {"fn": v_gpo_backup, "group": "gpo",
                       "help": "Snapshot a GPO into the reusable template store.",
                       "args": [arg("gpo", help_="{GUID}"),

@@ -97,51 +97,86 @@ test('opening a modal updates the URL (deep-linkable), closing clears it', async
     await expect(f.locator('.al-modal')).toHaveCount(0);
 });
 
-test('Group Policy compose modal stacks a registry setting and a preference', async ({ page }) => {
+async function openCompose(f, page) {
+    await f.locator('#al-tabs button', { hasText: 'Group Policy' }).click();
+    await expect(f.locator('#al-content')).toContainText(GPO, { timeout: 45000 });
+    await f.locator('table.al tr', { hasText: GPO }).locator('button', { hasText: 'compose' }).click();
+    await expect.poll(() => frameHash(page), { timeout: 15000 }).toContain('modal=gpo-compose');
+    const modal = f.locator('.al-modal');
+    await expect(modal).toContainText('Compose Group Policy', { timeout: 15000 });
+    return modal;
+}
+
+test('compose modal: dropdowns are filterable picker tables, auto-loads current settings', async ({ page }) => {
     test.setTimeout(180000);
     expect(GPO, 'ADLAB_TEST_GPO must be set by the run job').toBeTruthy();
     await login(page);
     const f = await frame(page);
     await expect(f.locator('#al-identity')).toContainText('AD.EDT1.LAB', { timeout: 45000 });
-    await f.locator('#al-tabs button', { hasText: 'Group Policy' }).click();
-    await expect(f.locator('#al-content')).toContainText(GPO, { timeout: 45000 });
+    const modal = await openCompose(f, page);
 
-    // open compose on the scratch GPO's row
-    await f.locator('table.al tr', { hasText: GPO }).locator('button', { hasText: 'compose' }).click();
-    await expect.poll(() => frameHash(page), { timeout: 15000 }).toContain('modal=gpo-compose');
-    const modal = f.locator('.al-modal');
-    await expect(modal).toContainText('Compose Group Policy', { timeout: 15000 });
-    // the four stacking sources are present
-    await expect(modal).toContainText('Stack from a template GPO');
-    await expect(modal).toContainText('Stack an ADMX policy');
-    await expect(modal).toContainText('raw registry setting');
-    await expect(modal).toContainText('preference (samba CSE)');
+    // AUTO-LOAD: the seeded setting is in the current-settings table on open
+    await expect(modal).toContainText('Registry settings (auto-loaded', { timeout: 15000 });
+    await expect(modal).toContainText('Seeded', { timeout: 30000 });   // seeded valuename
 
-    // ③ add a raw registry (Administrative-Template) layer
-    await modal.locator('input[placeholder^="Software"]').fill('Software\\Policies\\Adlab\\E2E');
-    await modal.locator('input[placeholder="valueName"]').fill('Marker');
-    await modal.locator('input[placeholder="data"]').fill('1');
-    // pick REG_DWORD in the ③ panel (the panel whose header mentions "raw registry")
-    const regPanel = modal.locator('.al-card', { hasText: 'raw registry setting' });
-    await regPanel.locator('select').nth(1).selectOption('REG_DWORD');   // type select
-    await regPanel.getByRole('button', { name: 'Add registry layer' }).click();
-    await expect(modal.locator('.al-stack-row')).toHaveCount(1);
+    // the source pickers are TABLES, not <select> dropdowns
+    await expect(modal.locator('select')).toHaveCount(0);
+    await expect(modal).toContainText('Add settings from a template GPO');
+    await expect(modal).toContainText('Add from an ADMX policy');
+    await expect(modal).toContainText('Add a raw registry setting');
+    await expect(modal).toContainText('Add a preference (samba CSE)');
 
-    // ④ add a preference layer (motd)
-    const prefPanel = modal.locator('.al-card', { hasText: 'preference (samba CSE)' });
-    await prefPanel.locator('select').selectOption('motd');
-    await prefPanel.locator('input[placeholder="value"]').fill('AD Lab e2e MOTD');
-    await prefPanel.getByRole('button', { name: 'Add preference layer' }).click();
-    await expect(modal.locator('.al-stack-row')).toHaveCount(2);
+    // ADMX picker: load, then the filter narrows the table and unresolved names
+    // are hidden by default (a toggle is offered)
+    await modal.getByRole('button', { name: 'Load ADMX to central store' }).click();
+    const admxCard = modal.locator('.al-card', { hasText: 'Add from an ADMX policy' });
+    await expect(admxCard).toContainText('show unresolved policy names', { timeout: 30000 });
+    // the policy picker is the FIRST picker in the card (the state picker is second)
+    const polPicker = admxCard.locator('.al-picker').first();
+    await expect(polPicker.locator('.al-picker-table tr')).not.toHaveCount(0, { timeout: 15000 });
+    const before = await polPicker.locator('.al-picker-table tr').count();
+    await polPicker.locator('.al-picker-filter').fill('Disable Printing');
+    await expect.poll(async () => polPicker.locator('.al-picker-table tr').count(),
+        { timeout: 10000 }).toBeLessThan(before);
+});
 
-    // apply the stack
-    await modal.getByRole('button', { name: 'Apply stack to GPO' }).click();
+test('compose modal: value editor has Hex/Text modes for binary; edit + preference apply', async ({ page }) => {
+    test.setTimeout(180000);
+    expect(GPO).toBeTruthy();
+    await login(page);
+    const f = await frame(page);
+    await expect(f.locator('#al-identity')).toContainText('AD.EDT1.LAB', { timeout: 45000 });
+    const modal = await openCompose(f, page);
+    await expect(modal).toContainText('Seeded', { timeout: 30000 });
+
+    // ③ add a raw registry setting via the value editor, type REG_BINARY -> Hex/Text
+    const raw = modal.locator('.al-card', { hasText: 'Add a raw registry setting' });
+    await raw.locator('input[placeholder^="Software"]').fill('Software\\Policies\\Adlab\\E2E');
+    await raw.locator('input[placeholder="valueName"]').fill('Blob');
+    // value editor: pick REG_BINARY in its type picker table
+    await raw.locator('.al-veditor .al-picker-table tr', { hasText: 'REG_BINARY' }).click();
+    await expect(raw.locator('.al-vmode')).toContainText('Hex');
+    await expect(raw.locator('.al-vmode')).toContainText('Text');
+    await raw.locator('.al-vdata textarea').fill('de ad be ef');
+    await raw.getByRole('button', { name: 'Add setting' }).click();
+    // the working table now shows the new row (hex preview)
+    await expect(modal.locator('.al-card', { hasText: 'Registry settings' })).toContainText('Blob', { timeout: 15000 });
+
+    // ④ stage a motd preference via the CSE picker table (single-select)
+    const pref = modal.locator('.al-card', { hasText: 'Add a preference (samba CSE)' });
+    await pref.locator('.al-picker-table tr', { hasText: 'motd' }).click();
+    await pref.locator('input[placeholder^="value"]').fill('AD Lab e2e MOTD');
+    await pref.getByRole('button', { name: 'Stage preference' }).click();
+    await expect(modal.locator('.al-card', { hasText: 'Staged preferences' })).toContainText('motd');
+
+    // apply — surgical: adds/edits merge, preferences set
+    await modal.getByRole('button', { name: 'Apply to GPO' }).click();
     await expect(modal).toContainText('Applied to GPO', { timeout: 60000 });
     await expect(modal).toContainText('"applied"');
     await modal.getByRole('button', { name: 'Close' }).click();
 
-    // the settings tab (gpo-detail) now shows the registry setting we stacked
+    // the settings modal shows the binary value we added
     await f.locator('table.al tr', { hasText: GPO }).locator('button', { hasText: 'settings' }).click();
-    await expect(f.locator('.al-modal')).toContainText('Marker', { timeout: 30000 });
-    await expect(f.locator('.al-modal')).toContainText('Software\\Policies\\Adlab\\E2E');
+    await expect(f.locator('.al-modal')).toContainText('Blob', { timeout: 30000 });
+    await expect(f.locator('.al-modal')).toContainText('REG_BINARY');
 });

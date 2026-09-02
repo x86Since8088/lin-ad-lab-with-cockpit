@@ -115,3 +115,34 @@ kbd.al { background: var(--al-code-bg); border: 1px solid var(--al-border);
     border: 1px solid var(--al-border); border-radius: 4px; background: var(--al-bg);
     color: var(--al-ink); font-size: 0.88rem; }
 .al-modal .al-actions .al-btn { width: auto; }
+
+/* filterable picker tables (replaces dropdowns in the GPO compose modal) */
+.al-picker { margin: 0.35rem 0 0.6rem; }
+.al-picker-filter { width: 100%; box-sizing: border-box; padding: 0.35rem 0.5rem;
+    border: 1px solid var(--al-border); border-radius: 4px; background: var(--al-bg);
+    color: var(--al-ink); font-size: 0.85rem; margin-bottom: 0.3rem; }
+.al-picker-scroll { overflow: auto; border: 1px solid var(--al-border); border-radius: 4px; }
+.al-picker-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+.al-picker-table th { position: sticky; top: 0; background: var(--al-card); z-index: 1;
+    text-align: left; color: var(--al-sub); font-weight: 600; padding: 0.3rem 0.5rem;
+    border-bottom: 1px solid var(--al-border); white-space: nowrap; }
+.al-picker-table td { padding: 0.28rem 0.5rem; border-bottom: 1px solid var(--al-border);
+    vertical-align: top; }
+.al-picker-table tr:hover td { background: var(--al-code-bg); cursor: pointer; }
+.al-picker-table tr.al-pick-sel td { background: var(--al-accent-soft); }
+.al-pick-selcol { width: 1.6rem; text-align: center; }
+/* max column width 420 with wrapping */
+.al-wrapcell { max-width: 420px; white-space: normal; overflow-wrap: anywhere;
+    word-break: break-word; }
+.al-picker-count { color: var(--al-sub); font-size: 0.78rem; margin-top: 0.2rem; }
+.al-inline-check { display: flex; align-items: center; gap: 0.35rem; font-size: 0.82rem;
+    color: var(--al-sub); margin: 0.2rem 0; font-weight: 400; }
+
+/* value editor (hex/text for binary, multi-line for MULTI_SZ) */
+.al-veditor { margin: 0.4rem 0; }
+.al-vdata textarea { width: 100%; box-sizing: border-box; font-family: "JetBrains Mono",
+    ui-monospace, monospace; font-size: 0.82rem; padding: 0.4rem 0.5rem;
+    border: 1px solid var(--al-border); border-radius: 4px; background: var(--al-bg);
+    color: var(--al-ink); }
+.al-vmode { display: flex; gap: 0.4rem; margin: 0.2rem 0; }
+.al-vmode .al-btn { width: auto; padding: 0.2rem 0.7rem; }

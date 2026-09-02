@@ -670,6 +670,30 @@ class TestAdmx(Base):
         self.assertEqual(mod.parse_admx("<not xml"), [])
 
 
+class TestAdml(Base):
+    ADML = ('<policyDefinitionResources><resources><stringTable>'
+            '<string id="POL_Foo">Disable Printing</string>'
+            '<string id="POL_Bar">Whitelisted Accounts</string>'
+            '</stringTable></resources></policyDefinitionResources>')
+
+    def test_parse_adml_strings(self):
+        t = mod.parse_adml(self.ADML)
+        self.assertEqual(t["POL_Foo"], "Disable Printing")
+        self.assertEqual(t["POL_Bar"], "Whitelisted Accounts")
+
+    def test_resolve_ref(self):
+        strings = mod.parse_adml(self.ADML)
+        # a $(string.POL_Foo) displayName arrives as "string.POL_Foo"
+        self.assertEqual(mod._resolve_ref("string.POL_Foo", strings), "Disable Printing")
+        # unknown ref stays as-is (so the UI can flag it unresolved)
+        self.assertEqual(mod._resolve_ref("string.POL_Missing", strings), "string.POL_Missing")
+        # a literal name is untouched
+        self.assertEqual(mod._resolve_ref("Already Text", strings), "Already Text")
+
+    def test_bad_adml_returns_empty(self):
+        self.assertEqual(mod.parse_adml("<broken"), {})
+
+
 class TestGpoVerbs(Base):
     def _mock_sysvol_preg(self, machine_entries):
         """Make base64 reads of Machine/registry.pol return machine_entries."""
