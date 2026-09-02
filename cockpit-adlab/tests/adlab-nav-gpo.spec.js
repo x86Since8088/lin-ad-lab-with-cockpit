@@ -219,8 +219,8 @@ test('stacked modals: edit -> Advanced compose puts BOTH in the URL; Back pops o
     await expect(f.locator('.al-backdrop')).toHaveCount(0);
 });
 
-test('GPO edit modal: two-pane tree (default 500px) + value list', async ({ page }) => {
-    test.setTimeout(150000);
+test('GPO edit modal: faceted tree (default 500px) with setting/os/subsystem filters, auto-populated', async ({ page }) => {
+    test.setTimeout(180000);
     expect(GPO).toBeTruthy();
     await login(page);
     const f = await frame(page);
@@ -233,13 +233,54 @@ test('GPO edit modal: two-pane tree (default 500px) + value list', async ({ page
     await expect(editModal.locator('.al-edit-panes')).toBeVisible({ timeout: 15000 });
     // tree pane default width is 500px
     const treeW = await editModal.locator('.al-edit-tree').evaluate((el) => el.offsetWidth);
-    expect(treeW).toBeGreaterThan(480);
-    expect(treeW).toBeLessThan(520);
+    expect(treeW).toBeGreaterThan(480); expect(treeW).toBeLessThan(520);
 
-    // the seeded MACHINE key is in the tree; drill to it and see the value on the right
-    await expect(editModal.locator('.al-edit-tree')).toContainText('MACHINE', { timeout: 30000 });
-    await editModal.locator('.al-tree-row', { hasText: 'Software' }).click();
-    await editModal.locator('.al-tree-row', { hasText: 'Adlab' }).click();
-    await editModal.locator('.al-tree-row', { hasText: 'Seed' }).click();
-    await expect(editModal.locator('.al-edit-list')).toContainText('Seeded', { timeout: 15000 });
+    // filter bar at the top of the tree: setting text, os facet, subsystem facet
+    await expect(editModal.locator('.al-tree-filter-setting')).toBeVisible({ timeout: 30000 });
+    const facets = editModal.locator('.al-tree-filters');
+    await expect(facets).toContainText('os');
+    await expect(facets).toContainText('subsystem');
+    await expect(facets.locator('.al-chip', { hasText: 'Linux' })).toBeVisible();
+    await expect(facets.locator('.al-chip', { hasText: 'debian' })).toBeVisible();
+
+    // tree auto-populated with OS-type groups (Linux) and subsystem sub-groups
+    const tree = editModal.locator('.al-edit-tree');
+    await expect(tree.locator('.al-tree-row', { hasText: 'Linux' })).toBeVisible({ timeout: 30000 });
+
+    // selecting a subsystem group lists its settings on the right
+    await tree.locator('.al-tree-row.sub', { hasText: 'debian' }).first().click();
+    await expect(editModal.locator('.al-edit-list')).toContainText('smb_conf', { timeout: 15000 });
+
+    // the setting filter narrows the tree/list
+    await editModal.locator('.al-tree-filter-setting').fill('motd');
+    await expect(tree).toContainText('debian');
+});
+
+test('GPO edit modal: editing a setting shows OS/subsystem tag editor and composes into the GPO', async ({ page }) => {
+    test.setTimeout(180000);
+    expect(GPO).toBeTruthy();
+    await login(page);
+    const f = await frame(page);
+    await expect(f.locator('#al-identity')).toContainText('AD.EDT1.LAB', { timeout: 45000 });
+    await f.locator('#al-tabs button', { hasText: 'Group Policy' }).click();
+    await expect(f.locator('#al-content')).toContainText(GPO, { timeout: 45000 });
+    await f.locator('table.al tr', { hasText: GPO }).locator('button', { hasText: 'edit' }).click();
+    const editModal = f.locator('.al-modal', { hasText: 'Edit Group Policy' });
+
+    // filter to gnome (ADMX-backed registry settings) and open that group
+    await editModal.locator('.al-tree-filter-setting').waitFor({ timeout: 30000 });
+    await editModal.locator('.al-tree-filters .al-chip', { hasText: 'gnome' }).click();
+    const tree = editModal.locator('.al-edit-tree');
+    await tree.locator('.al-tree-row.sub', { hasText: 'gnome' }).first().click();
+    const list = editModal.locator('.al-edit-list');
+    await expect(list.locator('table.al tr')).not.toHaveCount(0, { timeout: 20000 });
+
+    // edit/compose the first setting
+    await list.locator('button', { hasText: /compose|edit/ }).first().click();
+    // the OS-type + subsystem tag editor is shown
+    await expect(list).toContainText('OS type & subsystems');
+    await expect(list.locator('.al-facet-row .al-chip', { hasText: 'wayland' })).toBeVisible();
+    // compose the registry value into the GPO
+    await list.getByRole('button', { name: /Compose into GPO|Update in GPO/ }).click();
+    await expect(list).toContainText('composed', { timeout: 30000 });
 });

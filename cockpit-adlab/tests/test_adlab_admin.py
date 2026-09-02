@@ -798,5 +798,62 @@ def _b64(blob):
     return _base64.b64encode(blob).decode()
 
 
+class TestCatalog(Base):
+    def setUp(self):
+        super().setUp()
+        self._cat = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        self._cat.close()
+        os.unlink(self._cat.name)   # start with no file
+        self._old_cat = mod.CATALOG_TAGS_FILE
+        mod.CATALOG_TAGS_FILE = self._cat.name
+
+    def tearDown(self):
+        mod.CATALOG_TAGS_FILE = self._old_cat
+        if os.path.exists(self._cat.name):
+            os.unlink(self._cat.name)
+        super().tearDown()
+
+    def test_derive_tags(self):
+        self.assertEqual(mod._derive_tags("admx", "GNOME_Settings.admx"), ("Linux", ["gnome", "kde", "wayland"]))
+        self.assertEqual(mod._derive_tags("admx", "samba.admx")[0], "Linux")
+        self.assertEqual(mod._derive_tags("admx", "Microsoft.Windows.admx"), ("Windows", ["WinPC", "WinServer"]))
+        self.assertEqual(mod._derive_tags("cse", "sudoers")[0], "Linux")
+
+    def test_catalog_tag_validate_and_persist(self):
+        rc, out = self.call_main(["gpo-catalog-tag", "--id", "admx:x:y",
+                                  "--os_type", "Linux", "--subsystems", "vnc,xfreerdp3"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["subsystems"], ["vnc", "xfreerdp3"])
+        # persisted and merged on next read
+        self.assertEqual(mod._read_catalog_tags()["admx:x:y"]["os_type"], "Linux")
+
+    def test_catalog_tag_rejects_bad_os_and_subsystem(self):
+        rc, out = self.call_main(["gpo-catalog-tag", "--id", "z", "--os_type", "BeOS"])
+        self.assertEqual(rc, 2)   # enum validation at parse time
+        rc, out = self.call_main(["gpo-catalog-tag", "--id", "z", "--subsystems", "gnome,bogus"])
+        self.assertEqual(rc, 1)
+        self.assertIn("unknown subsystem", out["error"])
+
+    def test_catalog_lists_cse_entries_and_facets(self):
+        # no ADMX loaded -> catalog is just the CSE preferences, all Linux
+        self.fake.lab_up()
+        self.fake.on(lambda a: "bash" in a and any("*.admx" in str(x) for x in a), out="")
+        rc, out = self.call_main(["gpo-catalog"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["os_types"], mod.OS_TYPES)
+        self.assertEqual(out["subsystems"], mod.SUBSYSTEMS)
+        cse = [e for e in out["entries"] if e["source"] == "cse"]
+        self.assertEqual(len(cse), len(mod.GPO_CSES))
+        self.assertTrue(all(e["os_type"] == "Linux" for e in cse))
+
+    def test_catalog_applies_saved_override(self):
+        mod._write_catalog_tags({"cse:motd": {"os_type": "Linux", "subsystems": ["kde"]}})
+        self.fake.lab_up()
+        self.fake.on(lambda a: "bash" in a and any("*.admx" in str(x) for x in a), out="")
+        rc, out = self.call_main(["gpo-catalog"])
+        motd = next(e for e in out["entries"] if e.get("cse") == "motd")
+        self.assertEqual(motd["subsystems"], ["kde"])   # override wins over derived
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

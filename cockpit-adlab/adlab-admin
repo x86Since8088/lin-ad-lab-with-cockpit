@@ -698,6 +698,50 @@ REG_CLASSES = ["MACHINE", "USER", "BOTH"]
 GPO_CSES = ["smb_conf", "security", "motd", "issue", "sudoers", "files",
             "symlink", "openssh", "scripts", "access"]
 
+# ---- settings catalog: OS type + subsystem facets -------------------------
+# Every available setting is tagged with an OS type and a set of subsystems so
+# the editor's left pane can browse ALL available settings by facet. Defaults
+# are derived from the setting's source (ADMX file / CSE); the operator can
+# override them, persisted in a host-side tags file.
+OS_TYPES = ["Windows", "Linux"]
+SUBSYSTEMS = ["WinPC", "WinServer", "gnome", "kde", "debian", "redhat",
+              "ubuntu", "wayland", "vnc", "xfreerdp3", "other"]
+CATALOG_TAGS_FILE = "/var/lib/adlab/catalog-tags.json"   # host, root-only
+
+def _derive_tags(source, ref):
+    """Default (os_type, subsystems) for a catalog entry. source is
+    'admx' | 'cse'; ref is the ADMX filename or the CSE name."""
+    r = (ref or "").lower()
+    if source == "admx":
+        if "gnome" in r:  return "Linux", ["gnome", "kde", "wayland"]
+        if "samba" in r:  return "Linux", ["debian", "ubuntu", "redhat"]
+        return "Windows", ["WinPC", "WinServer"]
+    if source == "cse":
+        table = {"smb_conf": ["debian", "ubuntu", "redhat"],
+                 "security": ["debian", "ubuntu", "redhat"],
+                 "sudoers":  ["debian", "redhat", "ubuntu"],
+                 "motd":     ["debian", "ubuntu", "redhat"],
+                 "issue":    ["debian", "ubuntu", "redhat"],
+                 "openssh":  ["debian", "redhat", "ubuntu"],
+                 "files":    ["debian", "ubuntu"], "symlink": ["debian", "ubuntu"],
+                 "scripts":  ["debian", "ubuntu"], "access": ["debian", "ubuntu"]}
+        return "Linux", table.get(r, ["other"])
+    return "Linux", ["other"]
+
+def _read_catalog_tags():
+    try:
+        with open(CATALOG_TAGS_FILE) as f:
+            t = json.load(f)
+            return t if isinstance(t, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _write_catalog_tags(tags):
+    os.makedirs(os.path.dirname(CATALOG_TAGS_FILE), exist_ok=True)
+    with open(CATALOG_TAGS_FILE, "w") as f:
+        json.dump(tags, f, indent=2, sort_keys=True)
+    os.chmod(CATALOG_TAGS_FILE, 0o600)
+
 def _gpo_guid(a, key="gpo"):
     g = a[key].strip()
     if not re.match(r'^\{[0-9A-Fa-f-]{36}\}$', g):
@@ -858,6 +902,76 @@ def v_gpo_admx_list(a):
     return {"on": d, "loaded": bool(files), "admx_files": admx, "lang": lang,
             "policies": policies, "policy_count": len(policies),
             "resolved_count": sum(0 if p["unresolved"] else 1 for p in policies)}
+
+# ---- settings catalog: all available settings, faceted by OS + subsystem --
+
+def v_gpo_catalog(a):
+    """Every AVAILABLE setting the editor can offer, each tagged with an OS
+    type and subsystems (derived defaults + persisted overrides). Sources:
+    ADMX policies in the central store, and the samba CSE preferences. The
+    left pane auto-populates from this. Optional --os_type / --subsystem
+    filter server-side; the UI also filters client-side."""
+    tags = _read_catalog_tags()
+    entries = []
+    admx = v_gpo_admx_list({})
+    for p in admx.get("policies", []):
+        af = p.get("admx", "")
+        eid = "admx:%s:%s" % (af, p.get("id", ""))
+        os_t, subs = _derive_tags("admx", af)
+        ov = tags.get(eid)
+        if ov:
+            os_t = ov.get("os_type", os_t)
+            subs = ov.get("subsystems", subs)
+        cls = (p.get("class") or "BOTH").upper()
+        if cls not in ("MACHINE", "USER"):
+            cls = "BOTH"
+        entries.append({
+            "id": eid, "name": p.get("display") or p.get("id", ""),
+            "source": "admx", "admx": af, "os_type": os_t, "subsystems": subs,
+            "unresolved": p.get("unresolved", False),
+            "keyname": p.get("key", ""), "valuename": p.get("valuename") or p.get("id", ""),
+            "class": cls, "type": p.get("enabled_type") or "REG_DWORD",
+            "enabled_type": p.get("enabled_type"), "enabled_data": p.get("enabled_data"),
+            "disabled_type": p.get("disabled_type"), "disabled_data": p.get("disabled_data")})
+    for cse in GPO_CSES:
+        eid = "cse:%s" % cse
+        os_t, subs = _derive_tags("cse", cse)
+        ov = tags.get(eid)
+        if ov:
+            os_t = ov.get("os_type", os_t)
+            subs = ov.get("subsystems", subs)
+        entries.append({"id": eid, "name": cse + " (preference)", "source": "cse",
+                        "cse": cse, "os_type": os_t, "subsystems": subs})
+    fos = a.get("os_type")
+    fsub = a.get("subsystem")
+    if fos:
+        entries = [e for e in entries if e["os_type"] == fos]
+    if fsub:
+        entries = [e for e in entries if fsub in e["subsystems"]]
+    return {"os_types": OS_TYPES, "subsystems": SUBSYSTEMS,
+            "admx_loaded": admx.get("loaded", False),
+            "entries": entries, "count": len(entries)}
+
+def v_gpo_catalog_tag(a):
+    """Assign the OS type and subsystem array for one catalog setting; persists
+    as an override. subsystems is a comma-separated subset of the known list."""
+    eid = a["id"]
+    os_t = a.get("os_type", "")
+    if os_t and os_t not in OS_TYPES:
+        raise Fail("os_type must be one of: %s" % ", ".join(OS_TYPES))
+    subs = [s.strip() for s in (a.get("subsystems", "") or "").split(",") if s.strip()]
+    bad = [s for s in subs if s not in SUBSYSTEMS]
+    if bad:
+        raise Fail("unknown subsystem(s): %s (valid: %s)"
+                   % (", ".join(bad), ", ".join(SUBSYSTEMS)))
+    tags = _read_catalog_tags()
+    cur = tags.get(eid, {})
+    if os_t:
+        cur["os_type"] = os_t
+    cur["subsystems"] = subs
+    tags[eid] = cur
+    _write_catalog_tags(tags)
+    return {"id": eid, "os_type": cur.get("os_type"), "subsystems": cur.get("subsystems")}
 
 # ---- template GPOs: backup / restore / stack ------------------------------
 
@@ -1354,6 +1468,15 @@ VERBS = {
     "gpo-admx-list": {"fn": v_gpo_admx_list, "group": "gpo",
                       "help": "List ADMX files in the central store and their policies (names resolved via ADML).",
                       "args": [arg("lang", required=False, help_="ADML language dir (default en-US)")]},
+    "gpo-catalog":   {"fn": v_gpo_catalog, "group": "gpo",
+                      "help": "All available settings, tagged with OS type + subsystems (the edit tree's source).",
+                      "args": [arg("os_type", "enum", required=False, choices=OS_TYPES),
+                               arg("subsystem", "enum", required=False, choices=SUBSYSTEMS)]},
+    "gpo-catalog-tag": {"fn": v_gpo_catalog_tag, "group": "gpo",
+                      "help": "Assign a setting's OS type and subsystem array (persisted override).",
+                      "args": [arg("id", help_="catalog entry id"),
+                               arg("os_type", "enum", required=False, choices=OS_TYPES),
+                               arg("subsystems", required=False, help_="comma-separated subsystems")]},
     "gpo-backup":    {"fn": v_gpo_backup, "group": "gpo",
                       "help": "Snapshot a GPO into the reusable template store.",
                       "args": [arg("gpo", help_="{GUID}"),

@@ -1052,31 +1052,16 @@
     /* Build a registry tree {class -> node} from flat entries. A node is
      * {label, fullKey, cls, children:{seg:node}, values:[entry]}; a value
      * attaches to the node for its full key (which may also have children). */
-    function buildRegTree(entries) {
-        var root = {};
-        entries.forEach(function (e) {
-            if (!root[e.class]) root[e.class] = { label: e.class, fullKey: "", cls: e.class, children: {}, values: [], depth: 0 };
-            var node = root[e.class], path = "";
-            e.keyname.split("\\").forEach(function (s) {
-                if (!s) return;
-                path = path ? path + "\\" + s : s;
-                if (!node.children[s]) node.children[s] = { label: s, fullKey: path, cls: e.class, children: {}, values: [], depth: node.depth + 1 };
-                node = node.children[s];
-            });
-            node.values.push(e);
-        });
-        return root;
-    }
-
-    /* The GPO edit modal — a two-pane editor: a registry setting TREE on the
-     * left (default width 500, draggable splitter), the VALUE LIST for the
-     * selected key on the right (the larger pane). Opens as a wide, stacked
-     * modal; its own "Advanced compose" button stacks the compose modal on top
-     * (the URL then carries both modal/target pairs). */
+    /* GPO edit modal — two panes. LEFT: a filter bar (setting / os /
+     * subsystem) above a facet TREE of ALL AVAILABLE settings grouped by
+     * OS type -> subsystem, auto-populated from the catalog. Selecting a
+     * subsystem group lists its settings on the RIGHT; editing a setting
+     * composes it into the GPO. "Advanced compose" stacks the compose modal. */
     function gpoEditModal(target) {
         if (!target) { return; }
-        var working = [], removed = [], seq = 0, selected = null, expanded = {};
-        function nid() { return "e" + (seq++); }
+        var catalog = [], current = [], facets = { os_types: [], subsystems: [] };
+        var fSetting = "", fOs = "", fSubs = {};
+        var expanded = {}, selGroup = null;
 
         modal("Edit Group Policy", function (box) {
             box.appendChild(el("div", "hint", "GPO: ")).appendChild(el("kbd", "al", target));
@@ -1087,142 +1072,226 @@
             panes.appendChild(treePane); panes.appendChild(splitter); panes.appendChild(listPane);
             box.appendChild(panes);
 
-            // draggable splitter — the tree default width is 500px
             splitter.addEventListener("mousedown", function (ev) {
                 ev.preventDefault();
                 var startX = ev.clientX, startW = treePane.offsetWidth;
-                function move(e) {
-                    var w = Math.max(220, Math.min(900, startW + (e.clientX - startX)));
-                    treePane.style.width = w + "px";
-                }
+                function move(e) { treePane.style.width = Math.max(240, Math.min(900, startW + (e.clientX - startX))) + "px"; }
                 function up() { document.removeEventListener("mousemove", move); document.removeEventListener("mouseup", up); }
                 document.addEventListener("mousemove", move); document.addEventListener("mouseup", up);
             });
 
-            function drawTree() {
-                clear(treePane);
-                if (!working.length) { treePane.appendChild(el("div", "hint", "no settings")); return; }
-                var tree = buildRegTree(working);
-                Object.keys(tree).sort().forEach(function (cls) { renderNode(tree[cls]); });
-                function renderNode(node) {
-                    var hasKids = Object.keys(node.children).length > 0;
-                    var row = el("div", "al-tree-row");
-                    row.style.paddingLeft = (node.depth * 14 + 4) + "px";
-                    var isSel = selected && selected.cls === node.cls && selected.fullKey === node.fullKey && node.values.length;
-                    if (isSel) row.className = "al-tree-row sel";
-                    var tog = el("span", "al-tree-tog", hasKids ? (expanded[node.cls + node.fullKey] ? "▾" : "▸") : "");
-                    if (hasKids) tog.addEventListener("click", function (e) {
-                        e.stopPropagation(); expanded[node.cls + node.fullKey] = !expanded[node.cls + node.fullKey]; drawTree();
-                    });
-                    row.appendChild(tog);
-                    var lab = el("span", "al-tree-label", node.label);
-                    row.appendChild(lab);
-                    if (node.values.length) row.appendChild(badge(String(node.values.length), "dim"));
-                    row.addEventListener("click", function () {
-                        if (node.values.length) { selected = { cls: node.cls, fullKey: node.fullKey }; drawTree(); drawList(); }
-                        else if (hasKids) { expanded[node.cls + node.fullKey] = !expanded[node.cls + node.fullKey]; drawTree(); }
-                    });
-                    treePane.appendChild(row);
-                    if (hasKids && expanded[node.cls + node.fullKey])
-                        Object.keys(node.children).sort().forEach(function (k) { renderNode(node.children[k]); });
-                }
+            // ---- filter bar (setting / os / subsystem) --------------------
+            var filterBar = el("div", "al-tree-filters");
+            var setInput = el("input", "al-tree-filter-setting"); setInput.type = "search"; setInput.placeholder = "filter setting…";
+            setInput.addEventListener("input", function () { fSetting = setInput.value; drawTree(); });
+            filterBar.appendChild(setInput);
+            var osRow = el("div", "al-facet-row");
+            var subRow = el("div", "al-facet-row");
+            filterBar.appendChild(osRow); filterBar.appendChild(subRow);
+            treePane.appendChild(filterBar);
+            var treeHost = el("div"); treePane.appendChild(treeHost);
+
+            function osBtn(label, val) {
+                var b = el("button", "al-chip" + (fOs === val ? " on" : ""), label); b.type = "button";
+                b.addEventListener("click", function () { fOs = val; drawFilters(); drawTree(); });
+                return b;
+            }
+            function subChip(s) {
+                var b = el("button", "al-chip" + (fSubs[s] ? " on" : ""), s); b.type = "button";
+                b.addEventListener("click", function () { if (fSubs[s]) delete fSubs[s]; else fSubs[s] = true; drawFilters(); drawTree(); });
+                return b;
+            }
+            function drawFilters() {
+                clear(osRow); osRow.appendChild(el("span", "al-facet-lbl", "os"));
+                osRow.appendChild(osBtn("All", ""));
+                facets.os_types.forEach(function (o) { osRow.appendChild(osBtn(o, o)); });
+                clear(subRow); subRow.appendChild(el("span", "al-facet-lbl", "subsystem"));
+                facets.subsystems.forEach(function (s) { subRow.appendChild(subChip(s)); });
             }
 
-            function valuesFor(sel) {
-                return working.filter(function (e) { return sel && e.class === sel.cls && e.keyname === sel.fullKey; });
+            function passes(e) {
+                if (fOs && e.os_type !== fOs) return false;
+                if (Object.keys(fSubs).length && !e.subsystems.some(function (s) { return fSubs[s]; })) return false;
+                if (fSetting) {
+                    var hay = (e.name + " " + (e.keyname || "") + " " + (e.valuename || "") + " " + (e.cse || "")).toLowerCase();
+                    if (hay.indexOf(fSetting.toLowerCase()) < 0) return false;
+                }
+                return true;
+            }
+            function groups() {
+                var g = {};
+                catalog.filter(passes).forEach(function (e) {
+                    g[e.os_type] = g[e.os_type] || {};
+                    var subs = e.subsystems.length ? e.subsystems : ["other"];
+                    subs.forEach(function (s) {
+                        if (Object.keys(fSubs).length && !fSubs[s]) return;
+                        (g[e.os_type][s] = g[e.os_type][s] || []).push(e);
+                    });
+                });
+                return g;
+            }
+            function drawTree() {
+                clear(treeHost);
+                var g = groups(), osList = Object.keys(g).sort();
+                if (!osList.length) { treeHost.appendChild(el("div", "hint", "no settings match the filters")); return; }
+                osList.forEach(function (os) {
+                    var total = 0; Object.keys(g[os]).forEach(function (s) { total += g[os][s].length; });
+                    var open = expanded["os:" + os] !== false;
+                    var osRowEl = el("div", "al-tree-row");
+                    osRowEl.appendChild(el("span", "al-tree-tog", open ? "▾" : "▸"));
+                    osRowEl.appendChild(el("span", "al-tree-label", os));
+                    osRowEl.appendChild(badge(String(total), "dim"));
+                    osRowEl.addEventListener("click", function () { expanded["os:" + os] = !open; drawTree(); });
+                    treeHost.appendChild(osRowEl);
+                    if (!open) return;
+                    Object.keys(g[os]).sort().forEach(function (sub) {
+                        var isSel = selGroup && selGroup.os === os && selGroup.sub === sub;
+                        var row = el("div", "al-tree-row sub" + (isSel ? " sel" : ""));
+                        row.appendChild(el("span", "al-tree-tog", ""));
+                        row.appendChild(el("span", "al-tree-label", sub));
+                        row.appendChild(badge(String(g[os][sub].length), "ok"));
+                        row.addEventListener("click", function () { selGroup = { os: os, sub: sub }; drawTree(); drawList(); });
+                        treeHost.appendChild(row);
+                    });
+                });
+            }
+
+            // ---- right pane -----------------------------------------------
+            function curFor(e) {
+                if (e.source !== "admx") return null;
+                for (var i = 0; i < current.length; i++) {
+                    var c = current[i];
+                    if (c.class === e.class && c.keyname === e.keyname && c.valuename === e.valuename) return c;
+                }
+                return null;
             }
             function drawList() {
                 clear(listPane);
-                if (!selected) { listPane.appendChild(el("div", "hint", "select a key in the tree to see its values")); return; }
-                listPane.appendChild(el("div", "al-edit-keyhdr"))
-                    .appendChild(el("kbd", "al", selected.cls + "  " + selected.fullKey));
-                var vals = valuesFor(selected);
-                listPane.appendChild(tableOf(["value", "type", "data", ""], vals.map(function (e) {
+                if (!selGroup) { listPane.appendChild(el("div", "hint", "select a subsystem group in the tree to list its settings")); return; }
+                listPane.appendChild(el("div", "al-edit-keyhdr")).appendChild(el("kbd", "al", selGroup.os + " · " + selGroup.sub));
+                var g = groups();
+                var entries = (g[selGroup.os] && g[selGroup.os][selGroup.sub]) || [];
+                listPane.appendChild(tableOf(["setting", "key / cse", "in GPO", ""], entries.map(function (e) {
+                    var cur = curFor(e);
                     var acts = el("div", "al-actions");
-                    var edit = el("button", "al-btn secondary", "edit");
-                    edit.addEventListener("click", function () { editValue(e); });
-                    var rm = el("button", "al-btn danger", "remove");
-                    rm.addEventListener("click", function () {
-                        if (e.origin === "current") removed.push(e);
-                        working = working.filter(function (x) { return x.id !== e.id; });
-                        if (!valuesFor(selected).length) selected = null;
-                        drawTree(); drawList();
-                    });
-                    acts.appendChild(edit); acts.appendChild(rm);
-                    var pv = el("div", "al-wrapcell"); pv.textContent = dataPreview(e.type, e.data);
-                    return [e.valuename, e.type, pv, acts];
+                    var edit = el("button", "al-btn", cur ? "edit" : "compose");
+                    edit.addEventListener("click", function () { editSetting(e); });
+                    acts.appendChild(edit);
+                    var keycell = el("div", "al-wrapcell");
+                    keycell.textContent = e.source === "cse" ? ("CSE: " + e.cse) : (e.class + " " + e.keyname + "\\" + e.valuename);
+                    return [e.name, keycell, cur ? badge(dataPreview(cur.type, cur.data), "ok") : badge("no", "dim"), acts];
                 })));
-                var add = el("button", "al-btn secondary", "Add value to this key");
-                add.addEventListener("click", function () { addValue(); });
-                listPane.appendChild(add);
-            }
-            function editValue(e) {
-                clear(listPane);
-                listPane.appendChild(el("div", "hint", "Editing " + e.class + "  " + e.keyname + "\\" + e.valuename));
-                var ve = valueEditor(e.type, e.data);
-                listPane.appendChild(ve.node);
-                var row = el("div", "row");
-                var save = el("button", "al-btn", "Save value");
-                save.addEventListener("click", function () {
-                    var v = ve.getValue(); e.type = v.type; e.data = v.data;
-                    if (e.origin === "current") e.dirty = true; drawTree(); drawList();
-                });
-                var back = el("button", "al-btn secondary", "Cancel"); back.addEventListener("click", drawList);
-                row.appendChild(save); row.appendChild(back); listPane.appendChild(row);
-            }
-            function addValue() {
-                clear(listPane);
-                listPane.appendChild(el("div", "hint", "New value under " + selected.cls + "  " + selected.fullKey));
-                var vn = el("input"); vn.placeholder = "valueName";
-                listPane.appendChild(el("label", null, "value name")); listPane.appendChild(vn);
-                var ve = valueEditor("REG_SZ", "");
-                listPane.appendChild(ve.node);
-                var row = el("div", "row");
-                var save = el("button", "al-btn", "Add");
-                save.addEventListener("click", function () {
-                    if (!vn.value) return;
-                    var v = ve.getValue();
-                    working.push({ id: nid(), keyname: selected.fullKey, valuename: vn.value, class: selected.cls, type: v.type, data: v.data, origin: "added" });
-                    drawTree(); drawList();
-                });
-                var back = el("button", "al-btn secondary", "Cancel"); back.addEventListener("click", drawList);
-                row.appendChild(save); row.appendChild(back); listPane.appendChild(row);
             }
 
-            var alertBox = el("div", "al-alert err"); box.appendChild(alertBox);
+            function tagEditor(e) {
+                var wrap = el("div", "al-card");
+                wrap.appendChild(el("h3", null, "OS type & subsystems"));
+                var osPick = el("div", "al-facet-row"); osPick.appendChild(el("span", "al-facet-lbl", "os"));
+                var chosenOs = e.os_type;
+                facets.os_types.forEach(function (o) {
+                    var b = el("button", "al-chip" + (chosenOs === o ? " on" : ""), o); b.type = "button";
+                    b.addEventListener("click", function () {
+                        chosenOs = o;
+                        [].forEach.call(osPick.querySelectorAll(".al-chip"), function (c) { c.className = "al-chip" + (c.textContent === o ? " on" : ""); });
+                    });
+                    osPick.appendChild(b);
+                });
+                wrap.appendChild(osPick);
+                var subPick = el("div", "al-facet-row"); subPick.appendChild(el("span", "al-facet-lbl", "subsystems"));
+                var chosen = {}; e.subsystems.forEach(function (s) { chosen[s] = true; });
+                facets.subsystems.forEach(function (s) {
+                    var b = el("button", "al-chip" + (chosen[s] ? " on" : ""), s); b.type = "button";
+                    b.addEventListener("click", function () { if (chosen[s]) delete chosen[s]; else chosen[s] = true; b.className = "al-chip" + (chosen[s] ? " on" : ""); });
+                    subPick.appendChild(b);
+                });
+                wrap.appendChild(subPick);
+                var save = el("button", "al-btn secondary", "Save tags");
+                var msg = el("span", "hint", "");
+                save.addEventListener("click", function () {
+                    var subs = Object.keys(chosen);
+                    run("gpo-catalog-tag", { id: e.id, os_type: chosenOs, subsystems: subs.join(",") }).then(function () {
+                        e.os_type = chosenOs; e.subsystems = subs; msg.textContent = " saved"; drawTree();
+                    }).catch(function (err) { msg.textContent = " " + err; });
+                });
+                wrap.appendChild(save); wrap.appendChild(msg);
+                return wrap;
+            }
+
+            function editSetting(e) {
+                clear(listPane);
+                listPane.appendChild(el("div", "al-edit-keyhdr")).appendChild(el("kbd", "al", e.name));
+                listPane.appendChild(tagEditor(e));
+                var body = el("div", "al-card");
+                if (e.source === "cse") {
+                    body.appendChild(el("h3", null, "Preference (" + e.cse + ")"));
+                    var entry = el("input"); entry.placeholder = "entry / setting (blank for motd/issue)";
+                    var value = el("input"); value.placeholder = "value (empty unsets)";
+                    body.appendChild(el("label", null, "entry")); body.appendChild(entry);
+                    body.appendChild(el("label", null, "value")); body.appendChild(value);
+                    var papply = el("button", "al-btn", "Compose into GPO");
+                    var pmsg = el("span", "hint", "");
+                    papply.addEventListener("click", function () {
+                        papply.disabled = true; pmsg.textContent = " applying…";
+                        run("gpo-pref-set", { gpo: target, cse: e.cse, entry: entry.value, value: value.value })
+                            .then(function () { papply.disabled = false; pmsg.textContent = " composed"; })
+                            .catch(function (err) { papply.disabled = false; pmsg.textContent = " " + err; });
+                    });
+                    body.appendChild(papply); body.appendChild(pmsg);
+                } else {
+                    body.appendChild(el("h3", null, "Registry value"));
+                    body.appendChild(el("div", "hint", e.class + "  " + e.keyname + "\\" + e.valuename));
+                    var cur = curFor(e);
+                    var initType = cur ? cur.type : (e.enabled_type || "REG_DWORD");
+                    var initData = cur ? cur.data : (e.enabled_data !== undefined && e.enabled_data !== null ? e.enabled_data : 1);
+                    var ve = valueEditor(initType, initData);
+                    body.appendChild(ve.node);
+                    var apply = el("button", "al-btn", cur ? "Update in GPO" : "Compose into GPO");
+                    var msg = el("span", "hint", "");
+                    apply.addEventListener("click", function () {
+                        var v = ve.getValue();
+                        var ent = [{ keyname: e.keyname, valuename: e.valuename, class: e.class, type: v.type, data: v.data }];
+                        apply.disabled = true; msg.textContent = " applying…";
+                        run("gpo-settings-apply", { gpo: target, entries: JSON.stringify(ent) }).then(function () {
+                            return run("gpo-registry-list", { gpo: target });
+                        }).then(function (r) { current = r.settings || []; apply.disabled = false; msg.textContent = " composed"; })
+                          .catch(function (err) { apply.disabled = false; msg.textContent = " " + err; });
+                    });
+                    body.appendChild(apply);
+                    if (cur) {
+                        var rm = el("button", "al-btn danger", "Remove from GPO");
+                        rm.addEventListener("click", function () {
+                            rm.disabled = true;
+                            run("gpo-settings-remove", { gpo: target, entries: JSON.stringify([{ keyname: e.keyname, valuename: e.valuename, class: e.class }]) })
+                                .then(function () { return run("gpo-registry-list", { gpo: target }); })
+                                .then(function (r) { current = r.settings || []; msg.textContent = " removed"; })
+                                .catch(function (err) { rm.disabled = false; msg.textContent = " " + err; });
+                        });
+                        body.appendChild(rm);
+                    }
+                    body.appendChild(msg);
+                }
+                var back = el("button", "al-btn secondary", "Back to list");
+                back.addEventListener("click", drawList);
+                body.appendChild(back);
+                listPane.appendChild(body);
+            }
+
             var actions = el("div", "row");
             var adv = el("button", "al-btn secondary", "Advanced compose ▸");
-            adv.addEventListener("click", function () { openModal("gpo-compose", { target: target }); }); // STACKS on top
-            var apply = el("button", "al-btn", "Apply changes");
-            apply.addEventListener("click", function () {
-                alertBox.textContent = "";
-                var applyList = working.filter(function (e) { return e.origin === "added" || e.dirty; })
-                    .map(function (e) { return { keyname: e.keyname, valuename: e.valuename, class: e.class, type: e.type, data: e.data }; });
-                var removeList = removed.map(function (e) { return { keyname: e.keyname, valuename: e.valuename, class: e.class }; });
-                if (!applyList.length && !removeList.length) { alertBox.textContent = "No changes to apply."; return; }
-                apply.disabled = true;
-                applyCompose(target, applyList, removeList, []).then(function (results) {
-                    clear(box); box.appendChild(el("h2", null, "Applied to GPO"));
-                    box.appendChild(el("pre", "al-log", JSON.stringify(results, null, 2)));
-                    var ok = el("button", "al-btn", "Close");
-                    ok.addEventListener("click", function () { closeModal(); refreshTab(); });
-                    box.appendChild(ok);
-                }).catch(function (e) { apply.disabled = false; alertBox.textContent = String(e); });
-            });
-            var cancel = el("button", "al-btn secondary", "Close"); cancel.addEventListener("click", closeModal);
-            actions.appendChild(apply); actions.appendChild(adv); actions.appendChild(cancel);
+            adv.addEventListener("click", function () { openModal("gpo-compose", { target: target }); });
+            var close = el("button", "al-btn secondary", "Close");
+            close.addEventListener("click", closeModal);
+            actions.appendChild(adv); actions.appendChild(close);
             box.appendChild(actions);
 
-            treePane.appendChild(el("div", "al-loading", "loading settings…"));
-            run("gpo-registry-list", { gpo: target }).then(function (r) {
-                (r.settings || []).forEach(function (s) {
-                    working.push({ id: nid(), keyname: s.keyname, valuename: s.valuename, class: s.class, type: s.type, data: s.data, origin: "current", dirty: false });
-                });
-                // expand the class roots by default
-                Object.keys(buildRegTree(working)).forEach(function (cls) { expanded[cls + ""] = true; });
-                drawTree(); drawList();
-            }).catch(function (e) { clear(treePane); treePane.appendChild(el("div", "al-alert err", String(e))); });
-        }, true);   // wide
+            treeHost.appendChild(el("div", "al-loading", "loading available settings…"));
+            Promise.all([run("gpo-catalog"), run("gpo-registry-list", { gpo: target })]).then(function (res) {
+                catalog = res[0].entries || [];
+                facets = { os_types: res[0].os_types || [], subsystems: res[0].subsystems || [] };
+                current = res[1].settings || [];
+                drawFilters(); drawTree(); drawList();
+            }).catch(function (err) { clear(treeHost); treeHost.appendChild(el("div", "al-alert err", String(err))); });
+        }, true);
     }
 
     function gpoAdmxModal() {

@@ -167,3 +167,19 @@ kbd.al { background: var(--al-code-bg); border: 1px solid var(--al-border);
 .al-tree-row.sel { background: var(--al-accent-soft); }
 .al-tree-tog { display: inline-block; width: 1rem; text-align: center; color: var(--al-sub); }
 .al-tree-label { overflow: hidden; text-overflow: ellipsis; }
+
+/* GPO edit tree: filter bar (setting / os / subsystem) + facet chips */
+.al-tree-filters { position: sticky; top: 0; background: var(--al-card); z-index: 2;
+    padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--al-border); }
+.al-tree-filter-setting { width: 100%; box-sizing: border-box; padding: 0.35rem 0.5rem;
+    border: 1px solid var(--al-border); border-radius: 4px; background: var(--al-bg);
+    color: var(--al-ink); font-size: 0.82rem; margin-bottom: 0.35rem; }
+.al-facet-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem;
+    margin: 0.2rem 0; }
+.al-facet-lbl { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--al-sub); margin-right: 0.2rem; min-width: 4.2rem; }
+.al-chip { background: transparent; color: var(--al-ink); border: 1px solid var(--al-border);
+    border-radius: 11px; padding: 0.08rem 0.55rem; font-size: 0.76rem; cursor: pointer; }
+.al-chip:hover { border-color: var(--al-accent); }
+.al-chip.on { background: var(--al-accent); color: #fff; border-color: var(--al-accent); }
+.al-tree-row.sub { padding-left: 1.4rem; }
