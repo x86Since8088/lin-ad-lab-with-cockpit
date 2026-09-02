@@ -30,7 +30,7 @@
                                    // reconciled against the URL modal stack
     var _lastBackdrop = null;      // set by modal() so the reconciler can track it
     // modals rendered wide (two-pane); everything else uses the default width
-    var WIDE_MODALS = { "gpo-edit": true };
+    var WIDE_MODALS = { "gpo-edit": true, "object-edit": true, "object-attrs": true };
 
     // ---------------------------------------------------------------- utils
     function el(tag, cls, text) {
@@ -174,6 +174,8 @@
             case "gpo-templates": gpoTemplatesModal(); break;
             case "gpo-prefs":     gpoPrefsModal(target); break;
             case "gpo-detail":    gpoDetailModal(target); break;
+            case "object-edit":   objectEditModal(target); break;
+            case "object-attrs":  objectAttrsModal(target); break;
             default: /* unknown — leave nothing */ break;
         }
     }
@@ -390,6 +392,7 @@
     // ---------------------------------------------------------------- tabs
     var TABS = [
         ["overview", "Overview"], ["users", "Users & Groups"],
+        ["objects", "Users & Computers"],
         ["gpo", "Group Policy"], ["sites", "Sites & Replication"],
         ["dns", "DNS"], ["dcs", "Domain Controllers"],
         ["clients", "Clients"], ["activity", "Activity"],
@@ -519,6 +522,582 @@
             c.appendChild(tableOf(["account"], r.computers.map(function (x) { return [x]; })));
             grid.appendChild(c);
         }).catch(function (e) { grid.appendChild(failCard("Computers", e)); });
+    }
+
+    // ------------------------------------------- Users & Computers (dsa.msc)
+    // A three-pane object console: a container/OU tree on the left, a
+    // column-selectable object table in the middle, a docked value/preview
+    // pane on the right. Edits open a schema-driven tabbed editor; Advanced
+    // opens the full Attribute Editor grid. All forms are built from the live
+    // AD schema via the object-schema verb — see docs/aduc-schema.md.
+
+    // The object-type toggles, in display order. Base set is always shown;
+    // the "advanced" set appears with Advanced Features (which also reveals
+    // system containers in the tree).
+    var OBJ_TOGGLES = [
+        ["user", "Users"], ["group", "Groups"], ["computer", "Computers"],
+        ["contact", "Contacts"], ["organizationalUnit", "OUs"],
+    ];
+    var OBJ_TOGGLES_ADV = [
+        ["container", "Containers"], ["printQueue", "Printers"],
+        ["volume", "Shared folders"],
+    ];
+    var COMMON_COLUMNS = ["sAMAccountName", "userPrincipalName", "displayName",
+        "mail", "description", "department", "title", "company",
+        "telephoneNumber", "operatingSystem", "dNSHostName", "whenCreated",
+        "lastLogonTimestamp"];
+    // userAccountControl flags the editor exposes as checkboxes.
+    var UAC_FLAGS = [
+        [0x00000002, "Account is disabled"],
+        [0x00000020, "Password not required"],
+        [0x00010000, "Password never expires"],
+        [0x00040000, "Smart card is required for interactive logon"],
+        [0x00080000, "Trusted for delegation"],
+        [0x00100000, "Account is sensitive and cannot be delegated"],
+        [0x00400000, "Do not require Kerberos preauthentication"],
+    ];
+
+    var aduc = {
+        base: null, classes: null, advanced: false, search: "",
+        extraCols: ["description"], selected: null, previewMode: "tabs",
+        treeFilter: "", expanded: {}, treeWidth: 600, nodes: [],
+    };
+    var aducReload = null;      // set by renderObjects; modals call it after a write
+
+    function aducActiveClasses() {
+        return Object.keys(aduc.classes).filter(function (k) { return aduc.classes[k]; });
+    }
+    function dnParent(dn) { return dn.indexOf(",") >= 0 ? dn.slice(dn.indexOf(",") + 1) : ""; }
+    function dnRdn(dn) {
+        var head = dn.split(",")[0];
+        return head.indexOf("=") >= 0 ? head.slice(head.indexOf("=") + 1) : head;
+    }
+
+    function renderObjects() {
+        if (!aduc.classes) {
+            aduc.classes = {};
+            OBJ_TOGGLES.forEach(function (t) { aduc.classes[t[0]] = true; });
+        }
+        var m = content();
+        var wrap = el("div", "al-aduc");
+        var treePane = el("div", "al-aduc-tree"); treePane.style.width = aduc.treeWidth + "px";
+        var split1 = el("div", "al-aduc-split");
+        var objPane = el("div", "al-aduc-objects");
+        var split2 = el("div", "al-aduc-split");
+        var prevPane = el("div", "al-aduc-preview");
+        wrap.appendChild(treePane); wrap.appendChild(split1);
+        wrap.appendChild(objPane); wrap.appendChild(split2);
+        wrap.appendChild(prevPane);
+        m.appendChild(wrap);
+
+        makeSplitter(split1, treePane, 320, 1000, function (w) { aduc.treeWidth = w; });
+        makeSplitter(split2, prevPane, 280, 900, null, true);
+
+        // ---- left: filtered container tree -----------------------------
+        var tf = el("input", "al-tree-filter-setting"); tf.type = "search";
+        tf.placeholder = "filter tree…"; tf.value = aduc.treeFilter;
+        tf.addEventListener("input", function () { aduc.treeFilter = tf.value; drawTree(); });
+        treePane.appendChild(tf);
+        var treeHost = el("div", "al-aduc-treehost"); treePane.appendChild(treeHost);
+
+        function childrenOf(dn) {
+            return aduc.nodes.filter(function (n) { return n.parent === dn; })
+                .sort(function (a, b) { return a.name.toLowerCase() < b.name.toLowerCase() ? -1 : 1; });
+        }
+        function matchDn(dn) {
+            var f = aduc.treeFilter.toLowerCase();
+            if (!f) return true;
+            var node = aduc.byDn[dn];
+            if (node && node.name.toLowerCase().indexOf(f) >= 0) return true;
+            return childrenOf(dn).some(function (c) { return matchDn(c.dn); });
+        }
+        function drawNode(dn, depth) {
+            var node = aduc.byDn[dn];
+            if (!node) return;
+            if (aduc.treeFilter && !matchDn(dn)) return;
+            var kids = childrenOf(dn);
+            var open;
+            if (aduc.treeFilter) open = true;              // filtered nodes stay expanded
+            else if (aduc.expanded[dn] === undefined) open = depth === 0;  // root open by default
+            else open = aduc.expanded[dn];
+            var row = el("div", "al-tree-row" + (aduc.base === dn ? " sel" : ""));
+            row.style.paddingLeft = (depth * 16 + 6) + "px";
+            var tog = el("span", "al-tree-tog", kids.length ? (open ? "▾" : "▸") : "");
+            tog.addEventListener("click", function (ev) {
+                ev.stopPropagation();
+                aduc.expanded[dn] = !open; drawTree();
+            });
+            row.appendChild(tog);
+            var lbl = el("span", "al-tree-label wrap", node.name);
+            if (node.system) lbl.appendChild(badge("sys", "dim"));
+            row.appendChild(lbl);
+            row.addEventListener("click", function () {
+                aduc.base = dn; aduc.selected = null; drawTree(); loadList(); drawPreview();
+            });
+            treeHost.appendChild(row);
+            if (kids.length && open) kids.forEach(function (c) { drawNode(c.dn, depth + 1); });
+        }
+        function drawTree() {
+            clear(treeHost);
+            if (!aduc.nodes.length) { treeHost.appendChild(el("div", "al-loading", "loading tree…")); return; }
+            var roots = aduc.nodes.filter(function (n) { return !aduc.byDn[n.parent]; });
+            roots.forEach(function (r) { drawNode(r.dn, 0); });
+        }
+        function loadTree() {
+            treeHost.appendChild(el("div", "al-loading", "loading tree…"));
+            run("object-tree", { system: aduc.advanced ? "yes" : "" }).then(function (r) {
+                aduc.nodes = r.nodes || [];
+                aduc.byDn = {}; aduc.nodes.forEach(function (n) { aduc.byDn[n.dn] = n; });
+                if (!aduc.base || !aduc.byDn[aduc.base]) aduc.base = r.base;
+                drawTree(); loadList();
+            }).catch(function (e) { clear(treeHost); treeHost.appendChild(el("div", "al-alert err", String(e))); });
+        }
+
+        // ---- middle: toolbar + object table ----------------------------
+        var toolbar = el("div", "al-obj-toolbar");
+        var searchIn = el("input", "al-obj-search"); searchIn.type = "search";
+        searchIn.placeholder = "search this container…"; searchIn.value = aduc.search;
+        var searchT;
+        searchIn.addEventListener("input", function () {
+            aduc.search = searchIn.value; clearTimeout(searchT); searchT = setTimeout(loadList, 250);
+        });
+        toolbar.appendChild(searchIn);
+        var chipRow = el("div", "al-obj-chips");
+        function drawChips() {
+            clear(chipRow);
+            OBJ_TOGGLES.concat(aduc.advanced ? OBJ_TOGGLES_ADV : []).forEach(function (t) {
+                var on = !!aduc.classes[t[0]];
+                var b = el("button", "al-chip" + (on ? " on" : ""), t[1]); b.type = "button";
+                b.addEventListener("click", function () { aduc.classes[t[0]] = !on; loadList(); });
+                chipRow.appendChild(b);
+            });
+            var adv = el("button", "al-chip" + (aduc.advanced ? " on" : ""), "Advanced Features"); adv.type = "button";
+            adv.addEventListener("click", function () {
+                aduc.advanced = !aduc.advanced;
+                if (aduc.advanced) OBJ_TOGGLES_ADV.forEach(function (t) { if (!(t[0] in aduc.classes)) aduc.classes[t[0]] = false; });
+                drawChips(); loadTree();
+            });
+            chipRow.appendChild(adv);
+        }
+        toolbar.appendChild(chipRow);
+        drawChips();
+        var colsBtn = el("button", "al-btn secondary", "Columns…");
+        colsBtn.addEventListener("click", columnPicker);
+        var refreshBtn = el("button", "al-btn secondary", "⟳ Refresh");
+        refreshBtn.addEventListener("click", function () { loadTree(); drawPreview(); });
+        toolbar.appendChild(colsBtn); toolbar.appendChild(refreshBtn);
+        objPane.appendChild(toolbar);
+
+        var tableWrap = el("div", "al-objtable-wrap");
+        var summary = el("div", "al-objtable-summary", "");
+        objPane.appendChild(tableWrap); objPane.appendChild(summary);
+
+        function columns() { return ["name", "class"].concat(aduc.extraCols); }
+        function loadList() {
+            if (!aduc.base) { clear(tableWrap); tableWrap.appendChild(el("div", "hint", "select a container in the tree")); summary.textContent = ""; return; }
+            clear(tableWrap); tableWrap.appendChild(el("div", "al-loading", "listing objects…"));
+            var classes = aducActiveClasses();
+            run("object-list", {
+                base: aduc.base, scope: "one", classes: classes.join(","),
+                search: aduc.search, attrs: aduc.extraCols.join(","),
+            }).then(function (r) {
+                clear(tableWrap);
+                var t = el("table", "al al-objtable");
+                var hr = el("tr");
+                columns().forEach(function (c) { hr.appendChild(el("th", null, c)); });
+                t.appendChild(hr);
+                (r.objects || []).forEach(function (o) {
+                    var tr = el("tr", aduc.selected === o.dn ? "sel" : "");
+                    columns().forEach(function (c) {
+                        var v = c === "name" ? o.name : c === "class" ? o.class : (o.attrs[c] || "");
+                        tr.appendChild(el("td", null, v));
+                    });
+                    tr.addEventListener("click", function () {
+                        aduc.selected = o.dn; aduc.selectedName = o.name; aduc.selectedClass = o.class;
+                        [].forEach.call(t.querySelectorAll("tr.sel"), function (x) { x.className = ""; });
+                        tr.className = "sel"; drawPreview();
+                    });
+                    tr.addEventListener("dblclick", function () { openModal("object-edit", { target: o.dn }); });
+                    t.appendChild(tr);
+                });
+                tableWrap.appendChild(t);
+                summary.textContent = r.count + " object" + (r.count === 1 ? "" : "s") +
+                    (r.truncated ? " (truncated)" : "") + " · " + dnRdn(aduc.base);
+            }).catch(function (e) { clear(tableWrap); tableWrap.appendChild(el("div", "al-alert err", String(e))); });
+        }
+        aducReload = function () { loadList(); drawPreview(); };
+
+        function columnPicker() {
+            transientModal("Columns", function (box, close) {
+                var chosen = {}; aduc.extraCols.forEach(function (c) { chosen[c] = true; });
+                var host = el("div", "al-facet-row"); host.style.flexWrap = "wrap";
+                COMMON_COLUMNS.forEach(function (c) {
+                    var b = el("button", "al-chip" + (chosen[c] ? " on" : ""), c); b.type = "button";
+                    b.addEventListener("click", function () { if (chosen[c]) delete chosen[c]; else chosen[c] = true; b.className = "al-chip" + (chosen[c] ? " on" : ""); });
+                    host.appendChild(b);
+                });
+                box.appendChild(host);
+                var ok = el("button", "al-btn", "Apply");
+                ok.addEventListener("click", function () {
+                    aduc.extraCols = COMMON_COLUMNS.filter(function (c) { return chosen[c]; });
+                    if (!aduc.extraCols.length) aduc.extraCols = ["description"];
+                    close(); loadList();
+                });
+                box.appendChild(ok);
+            });
+        }
+
+        // ---- right: docked preview + actions ---------------------------
+        function drawPreview() {
+            clear(prevPane);
+            var hdr = el("div", "al-prev-hdr");
+            var title = el("div", "al-prev-title", aduc.selected ? aduc.selectedName : "No selection");
+            hdr.appendChild(title);
+            prevPane.appendChild(hdr);
+            var actbar = el("div", "al-prev-actions");
+            function abtn(label, cls, fn, dis) {
+                var b = el("button", "al-btn " + (cls || "secondary"), label);
+                if (dis) b.disabled = true; else b.addEventListener("click", fn);
+                actbar.appendChild(b); return b;
+            }
+            var dn = aduc.selected;
+            abtn("Edit", "", function () { openModal("object-edit", { target: dn }); }, !dn);
+            abtn("Advanced", "secondary", function () { openModal("object-attrs", { target: dn }); }, !dn);
+            abtn("Rename", "secondary", function () { renamePrompt(dn); }, !dn);
+            abtn("Delete", "danger", function () { deletePrompt(dn); }, !dn);
+            abtn("Other ▾", "secondary", function (ev) { otherMenu(dn, ev); }, !dn);
+            abtn("⟳", "secondary", function () { drawPreview(); }, !dn);
+            prevPane.appendChild(actbar);
+
+            var modeRow = el("div", "al-prev-mode");
+            ["tabs", "list"].forEach(function (mode) {
+                var b = el("button", "al-chip" + (aduc.previewMode === mode ? " on" : ""), mode === "tabs" ? "Tabbed" : "List"); b.type = "button";
+                b.addEventListener("click", function () { aduc.previewMode = mode; drawPreview(); });
+                modeRow.appendChild(b);
+            });
+            prevPane.appendChild(modeRow);
+
+            var body = el("div", "al-prev-body"); prevPane.appendChild(body);
+            if (!dn) { body.appendChild(el("div", "hint", "select an object to preview its values")); return; }
+            body.appendChild(el("div", "al-loading", "loading…"));
+            Promise.all([run("object-get", { dn: dn }), run("object-schema", { dn: dn })]).then(function (res) {
+                var obj = res[0], sch = res[1];
+                clear(body);
+                body.appendChild(el("div", "hint", sch.class_label + " · ")).appendChild(el("kbd", "al", dn));
+                if (aduc.previewMode === "tabs") {
+                    sch.tabs.forEach(function (tab) {
+                        var sec = el("div", "al-prev-sec");
+                        sec.appendChild(el("h4", null, tab.label));
+                        var rows = tab.fields.map(function (f) {
+                            return [f.label, formatValue(f, obj.attrs[f.attr] || [])];
+                        });
+                        sec.appendChild(tableOf(["", ""], rows));
+                        body.appendChild(sec);
+                    });
+                } else {
+                    var names = Object.keys(obj.attrs).sort();
+                    body.appendChild(tableOf(["attribute", "value"], names.map(function (n) {
+                        return [n, formatValue({ attr: n, multi: obj.attrs[n].length > 1 }, obj.attrs[n])];
+                    })));
+                }
+            }).catch(function (e) { clear(body); body.appendChild(el("div", "al-alert err", String(e))); });
+        }
+
+        loadTree();
+        drawPreview();
+    }
+
+    function formatValue(field, values) {
+        if (!values || !values.length) return el("span", "hint", "‹not set›");
+        var box = el("div", "al-valcell");
+        values.slice(0, 40).forEach(function (v) {
+            var line = String(v);
+            if (field.type === "dn" || /^(CN|OU|DC)=/.test(line)) box.appendChild(el("div", "al-dnval", line));
+            else box.appendChild(el("div", null, line));
+        });
+        if (values.length > 40) box.appendChild(el("div", "hint", "+" + (values.length - 40) + " more"));
+        return box;
+    }
+
+    // ---- field editors (type-driven, from the schema) ------------------
+    function decodeUac(intVal) {
+        var n = parseInt(intVal, 10) || 0, on = {};
+        UAC_FLAGS.forEach(function (f) { if (n & f[0]) on[f[0]] = true; });
+        return { n: n, on: on };
+    }
+    function fieldEditor(field, values) {
+        var type = field.type || "text";
+        var multi = field.multi;
+        if (field.readonly || type === "binary" || type === "sid" || type === "ntsd") {
+            var ro = el("div", "al-ro"); ro.appendChild(formatValue(field, values));
+            ro.appendChild(el("span", "al-tag", "read-only"));
+            return { node: ro, get: function () { return values; }, readonly: true };
+        }
+        if (field.kind === "uac") {
+            var st = decodeUac(values[0] || "0");
+            var host = el("div", "al-uac");
+            var checks = [];
+            UAC_FLAGS.forEach(function (f) {
+                var id = "uac-" + f[0];
+                var lab = el("label", "al-check");
+                var cb = el("input"); cb.type = "checkbox"; cb.checked = !!st.on[f[0]];
+                lab.appendChild(cb); lab.appendChild(el("span", null, " " + f[1]));
+                host.appendChild(lab); checks.push([f[0], cb]);
+            });
+            return { node: host, get: function () {
+                var n = st.n;
+                checks.forEach(function (c) { if (c[1].checked) n |= c[0]; else n &= ~c[0]; });
+                return [String(n >>> 0)];
+            } };
+        }
+        if (field.kind === "grouptype") {
+            var g = parseInt(values[0] || "0", 10) || 0;
+            var scope = (g & 0x2) ? "Global" : (g & 0x4) ? "Domain local" : (g & 0x8) ? "Universal" : "?";
+            var sec = (g & 0x80000000) ? "Security" : "Distribution";
+            var d = el("div", "al-ro"); d.textContent = sec + " · " + scope + " (" + g + ")";
+            d.appendChild(el("span", "al-tag", "edit raw in Advanced"));
+            return { node: d, get: function () { return values; }, readonly: true };
+        }
+        if (type === "bool") {
+            var sel = el("select");
+            [["", "‹not set›"], ["TRUE", "TRUE"], ["FALSE", "FALSE"]].forEach(function (o) {
+                var op = el("option", null, o[1]); op.value = o[0]; if ((values[0] || "") === o[0]) op.selected = true; sel.appendChild(op);
+            });
+            return { node: sel, get: function () { return sel.value ? [sel.value] : []; } };
+        }
+        if (multi || type === "multitext") {
+            var ta = el("textarea", "al-ta"); ta.rows = Math.min(8, Math.max(2, values.length + 1));
+            ta.value = values.join("\n");
+            ta.placeholder = multi ? "one value per line" : "";
+            return { node: ta, get: function () {
+                return ta.value.split("\n").map(function (s) { return s.replace(/\r$/, ""); })
+                    .filter(function (s) { return s.length; });
+            } };
+        }
+        var inp = el("input", "al-in"); inp.type = "text"; inp.value = values[0] || "";
+        if (type === "int" || type === "int64") inp.inputMode = "numeric";
+        if (field.maxlen) inp.maxLength = field.maxlen;
+        if (type === "time") inp.placeholder = "AD time (raw)";
+        return { node: inp, get: function () { return inp.value.trim() ? [inp.value.trim()] : []; } };
+    }
+
+    function sameVals(a, b) {
+        if (a.length !== b.length) return false;
+        for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+        return true;
+    }
+
+    // ---- schema-driven tabbed object editor ----------------------------
+    function objectEditModal(dn) {
+        if (!dn) { return; }
+        modal("Edit object", function (box) {
+            box.appendChild(el("div", "hint", "")).appendChild(el("kbd", "al", dn));
+            var host = el("div"); box.appendChild(host);
+            host.appendChild(el("div", "al-loading", "loading object + schema…"));
+            Promise.all([run("object-get", { dn: dn }), run("object-schema", { dn: dn })]).then(function (res) {
+                var obj = res[0], sch = res[1];
+                clear(host);
+                host.appendChild(el("h3", null, sch.class_label));
+                var strip = el("div", "al-tabstrip");
+                var panes = el("div", "al-tabpanes");
+                host.appendChild(strip); host.appendChild(panes);
+                var editors = {};      // attr -> {orig, get}
+                var paneEls = {};
+                sch.tabs.forEach(function (tab, ti) {
+                    var tb = el("button", "al-tab" + (ti === 0 ? " on" : ""), tab.label); tb.type = "button";
+                    var pane = el("div", "al-tabpane" + (ti === 0 ? " on" : ""));
+                    tb.addEventListener("click", function () {
+                        [].forEach.call(strip.children, function (c) { c.className = "al-tab"; });
+                        [].forEach.call(panes.children, function (c) { c.className = "al-tabpane"; });
+                        tb.className = "al-tab on"; pane.className = "al-tabpane on";
+                    });
+                    strip.appendChild(tb); panes.appendChild(pane); paneEls[tab.id] = pane;
+                    tab.fields.forEach(function (f) {
+                        var orig = obj.attrs[f.attr] || [];
+                        var ed = fieldEditor(f, orig);
+                        var row = el("div", "al-formrow");
+                        var lab = el("label", null, f.label + (f.mandatory ? " *" : ""));
+                        row.appendChild(lab); row.appendChild(ed.node);
+                        pane.appendChild(row);
+                        if (!ed.readonly) editors[f.attr] = { orig: orig, get: ed.get };
+                    });
+                });
+                var bar = el("div", "row al-modal-actions");
+                var msg = el("span", "hint", "");
+                var save = el("button", "al-btn", "Save");
+                save.addEventListener("click", function () {
+                    var changes = [];
+                    Object.keys(editors).forEach(function (attr) {
+                        var nv = editors[attr].get();
+                        if (!sameVals(nv, editors[attr].orig)) changes.push({ attr: attr, op: "replace", values: nv });
+                    });
+                    if (!changes.length) { msg.textContent = " no changes"; return; }
+                    save.disabled = true; msg.textContent = " saving " + changes.length + " change(s)…";
+                    run("object-modify", { dn: dn, changes: JSON.stringify(changes) }).then(function (r) {
+                        msg.textContent = " saved " + r.changes + " change(s) on " + r.on;
+                        save.disabled = false;
+                        if (aducReload) aducReload();
+                    }).catch(function (e) { save.disabled = false; msg.textContent = " " + e; });
+                });
+                var advBtn = el("button", "al-btn secondary", "Attribute Editor ▸");
+                advBtn.addEventListener("click", function () { openModal("object-attrs", { target: dn }); });
+                var close = el("button", "al-btn secondary", "Close");
+                close.addEventListener("click", closeModal);
+                bar.appendChild(save); bar.appendChild(advBtn); bar.appendChild(close); bar.appendChild(msg);
+                host.appendChild(bar);
+            }).catch(function (e) { clear(host); host.appendChild(el("div", "al-alert err", String(e))); });
+        }, true);
+    }
+
+    // ---- Advanced: filterable grid of ALL attributes -------------------
+    function objectAttrsModal(dn) {
+        if (!dn) { return; }
+        modal("Attribute Editor", function (box) {
+            box.appendChild(el("div", "hint", "")).appendChild(el("kbd", "al", dn));
+            var filt = el("input", "al-tree-filter-setting"); filt.type = "search"; filt.placeholder = "filter attributes…";
+            box.appendChild(filt);
+            var showSet = el("label", "al-check");
+            var onlySet = el("input"); onlySet.type = "checkbox";
+            showSet.appendChild(onlySet); showSet.appendChild(el("span", null, " only attributes with a value"));
+            box.appendChild(showSet);
+            var host = el("div", "al-attrgrid"); box.appendChild(host);
+            host.appendChild(el("div", "al-loading", "loading schema + values…"));
+            var obj = null, sch = null, byAttr = {};
+            function attrEditable(a) {
+                if (a.readonly) return false;
+                if (a.type === "binary" || a.type === "sid" || a.type === "ntsd") return false;
+                var b = obj.b64 && obj.b64[a.attr];   // value came back as raw binary
+                if (b && b.some(function (x) { return x; })) return false;
+                return true;
+            }
+            function draw() {
+                clear(host);
+                var f = filt.value.toLowerCase();
+                var rows = sch.attributes.filter(function (a) {
+                    var cur = obj.attrs[a.attr] || [];
+                    if (onlySet.checked && !cur.length) return false;
+                    if (f && (a.attr + " " + a.label).toLowerCase().indexOf(f) < 0) return false;
+                    return true;
+                });
+                var t = el("table", "al al-attrtable");
+                var hr = el("tr"); ["attribute", "syntax", "value", ""].forEach(function (h) { hr.appendChild(el("th", null, h)); });
+                t.appendChild(hr);
+                rows.slice(0, 400).forEach(function (a) {
+                    var cur = obj.attrs[a.attr] || [];
+                    var tr = el("tr");
+                    var nameCell = el("td"); nameCell.appendChild(el("span", "al-attrname", a.attr + (a.mandatory ? " *" : "")));
+                    tr.appendChild(nameCell);
+                    tr.appendChild(el("td", "al-attrtype", a.type + (a.multi ? "[]" : "")));
+                    var valCell = el("td", "al-wrapcell"); valCell.appendChild(formatValue(a, cur)); tr.appendChild(valCell);
+                    var actCell = el("td");
+                    if (attrEditable(a)) {
+                        var eb = el("button", "al-btn", "edit");
+                        eb.addEventListener("click", function () { editAttr(a, cur, valCell, actCell); });
+                        actCell.appendChild(eb);
+                    }
+                    tr.appendChild(actCell);
+                    t.appendChild(tr);
+                });
+                host.appendChild(t);
+                host.appendChild(el("div", "hint", rows.length + " attribute(s)" + (rows.length > 400 ? " (showing 400)" : "")));
+            }
+            function editAttr(a, cur, valCell, actCell) {
+                clear(valCell); clear(actCell);
+                var ed = fieldEditor(a, cur);
+                valCell.appendChild(ed.node);
+                var set = el("button", "al-btn", "Set");
+                var msg = el("span", "hint", "");
+                set.addEventListener("click", function () {
+                    var nv = ed.get();
+                    set.disabled = true; msg.textContent = " …";
+                    run("object-modify", { dn: dn, changes: JSON.stringify([{ attr: a.attr, op: "replace", values: nv }]) })
+                        .then(function () { return run("object-get", { dn: dn }); })
+                        .then(function (o) { obj = o; if (aducReload) aducReload(); draw(); })
+                        .catch(function (e) { set.disabled = false; msg.textContent = " " + e; });
+                });
+                var cancel = el("button", "al-btn secondary", "cancel");
+                cancel.addEventListener("click", draw);
+                actCell.appendChild(set); actCell.appendChild(cancel); actCell.appendChild(msg);
+            }
+            filt.addEventListener("input", function () { if (sch) draw(); });
+            onlySet.addEventListener("change", function () { if (sch) draw(); });
+            Promise.all([run("object-get", { dn: dn }), run("object-schema", { dn: dn })]).then(function (res) {
+                obj = res[0]; sch = res[1];
+                sch.attributes.forEach(function (a) { byAttr[a.attr] = a; });
+                draw();
+            }).catch(function (e) { clear(host); host.appendChild(el("div", "al-alert err", String(e))); });
+            var bar = el("div", "row al-modal-actions");
+            var close = el("button", "al-btn secondary", "Close"); close.addEventListener("click", closeModal);
+            bar.appendChild(close); box.appendChild(bar);
+        }, true);
+    }
+
+    // ---- rename / delete / other menu ----------------------------------
+    function renamePrompt(dn) {
+        transientModal("Rename / move", function (box, close) {
+            box.appendChild(el("div", "hint", "current: ")).appendChild(el("kbd", "al", dn));
+            box.appendChild(el("label", null, "new DN"));
+            var inp = el("input", "al-in"); inp.type = "text"; inp.value = dn; box.appendChild(inp);
+            box.appendChild(el("div", "hint", "change the RDN to rename, or the parent to move."));
+            var msg = el("span", "hint", "");
+            var ok = el("button", "al-btn", "Rename");
+            ok.addEventListener("click", function () {
+                var nd = inp.value.trim();
+                if (!nd || nd === dn) { msg.textContent = " unchanged"; return; }
+                ok.disabled = true; msg.textContent = " …";
+                run("object-rename", { dn: dn, new_dn: nd }).then(function () {
+                    aduc.selected = nd; close(); if (aducReload) aducReload();
+                }).catch(function (e) { ok.disabled = false; msg.textContent = " " + e; });
+            });
+            box.appendChild(ok); box.appendChild(msg);
+        });
+    }
+    function deletePrompt(dn) {
+        transientModal("Delete object", function (box, close) {
+            box.appendChild(el("div", "al-alert warn", "Delete this object? Type its name to confirm."));
+            box.appendChild(el("kbd", "al", dn));
+            var name = dnRdn(dn);
+            var inp = el("input", "al-in"); inp.type = "text"; inp.placeholder = name; box.appendChild(inp);
+            var rec = el("label", "al-check"); var recb = el("input"); recb.type = "checkbox";
+            rec.appendChild(recb); rec.appendChild(el("span", null, " recursive (delete a container subtree)")); box.appendChild(rec);
+            var msg = el("span", "hint", "");
+            var ok = el("button", "al-btn danger", "Delete");
+            ok.addEventListener("click", function () {
+                if (inp.value !== name) { msg.textContent = " name does not match"; return; }
+                ok.disabled = true; msg.textContent = " …";
+                run("object-delete", { dn: dn, recursive: recb.checked ? "yes" : "" }).then(function () {
+                    aduc.selected = null; close(); if (aducReload) aducReload();
+                }).catch(function (e) { ok.disabled = false; msg.textContent = " " + e; });
+            });
+            box.appendChild(ok); box.appendChild(msg);
+        });
+    }
+    function otherMenu(dn) {
+        transientModal("Other actions", function (box, close) {
+            box.appendChild(el("kbd", "al", dn));
+            var name = aduc.selectedName || dnRdn(dn);
+            function act(label, fn) { var b = el("button", "al-btn secondary", label); b.style.display = "block"; b.style.margin = "0.3rem 0"; b.addEventListener("click", fn); box.appendChild(b); }
+            var msg = el("div", "hint", "");
+            act("Enable account", function () { run("user-enable", { name: name }).then(function () { msg.textContent = "enabled"; if (aducReload) aducReload(); }).catch(function (e) { msg.textContent = String(e); }); });
+            act("Disable account", function () { run("user-disable", { name: name }).then(function () { msg.textContent = "disabled"; if (aducReload) aducReload(); }).catch(function (e) { msg.textContent = String(e); }); });
+            act("Reset password…", function () { close(); openModal("user-setpassword", { name: name }); });
+            act("Move…", function () { close(); renamePrompt(dn); });
+            box.appendChild(msg);
+        });
+    }
+
+    function makeSplitter(splitEl, pane, min, max, onWidth, right) {
+        splitEl.addEventListener("mousedown", function (ev) {
+            ev.preventDefault();
+            var startX = ev.clientX, startW = pane.offsetWidth;
+            function move(e) {
+                var d = right ? (startX - e.clientX) : (e.clientX - startX);
+                var w = Math.max(min, Math.min(max, startW + d));
+                pane.style.width = w + "px"; if (onWidth) onWidth(w);
+            }
+            function up() { document.removeEventListener("mousemove", move); document.removeEventListener("mouseup", up); }
+            document.addEventListener("mousemove", move); document.addEventListener("mouseup", up);
+        });
     }
 
     // ----------------------------------------------------------------- gpo
@@ -1539,7 +2118,8 @@
     }
 
     // ---------------------------------------------------------------- boot
-    var RENDER = { overview: renderOverview, users: renderUsers, gpo: renderGpo,
+    var RENDER = { overview: renderOverview, users: renderUsers,
+                   objects: renderObjects, gpo: renderGpo,
                    sites: renderSites, dns: renderDns, dcs: renderDcs,
                    clients: renderClients, activity: renderActivity };
 

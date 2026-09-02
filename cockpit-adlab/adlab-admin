@@ -233,6 +233,54 @@ def parse_ldif_entries(text):
         cur.setdefault(m.group(1), []).append(m.group(2))
     return [e for e in entries if e]
 
+def parse_ldif_full(text):
+    """ldbsearch LDIF -> [{"dn":str, "attrs":{name:[str]}, "b64":{name:[bool]}}].
+    Handles line folding (continuation lines begin with a space) and base64
+    (attr:: value): a base64 value that decodes to printable UTF-8 is returned
+    as that text, otherwise as an uppercase hex string with the b64 flag set.
+    Only records that begin with a `dn:` line become entries, so ldbsearch's
+    referral (`# Referral` / `ref:`) blocks are skipped. Pure — unit-tested."""
+    lines = []
+    for raw in text.splitlines():
+        if raw[:1] == " " and lines:        # folded continuation
+            lines[-1] += raw[1:]
+        else:
+            lines.append(raw)
+    entries, cur = [], None
+    for raw in lines:
+        if not raw.strip():
+            cur = None
+            continue
+        if raw.startswith("#"):
+            continue
+        m = re.match(r'^([A-Za-z][\w;.-]*)(::?) ?(.*)$', raw)
+        if not m:
+            continue
+        name, sep, val = m.group(1), m.group(2), m.group(3)
+        b64 = False
+        if sep == "::":
+            try:
+                data = base64.b64decode(val)
+                dec = data.decode("utf-8")
+                if any(ord(c) < 32 and c not in "\t\n\r" for c in dec):
+                    raise ValueError("control chars")
+                val = dec
+            except Exception:
+                try:
+                    val = base64.b64decode(val).hex().upper()
+                except Exception:
+                    pass
+                b64 = True
+        if name == "dn":
+            cur = {"dn": val, "attrs": {}, "b64": {}}
+            entries.append(cur)
+            continue
+        if cur is None:
+            continue
+        cur["attrs"].setdefault(name, []).append(val)
+        cur["b64"].setdefault(name, []).append(b64)
+    return entries
+
 def parse_name_list(text):
     return sorted(l.strip() for l in text.splitlines() if l.strip())
 
@@ -642,6 +690,497 @@ def v_ou_delete(a):
     if rc != 0:
         raise Fail(err.strip() or out.strip())
     return {"deleted": a["dn"]}
+
+# ---- generic AD objects + schema (dsa.msc object editor) ------------------
+# Reads go straight to the DC's sam.ldb via ldbsearch (no credentials — we are
+# root inside the container); writes go to the PDC emulator via ldbmodify /
+# ldbrename / ldbdel. The forest is single-domain, so the Configuration and
+# Schema naming contexts are derived, not queried.
+
+def config_dn(): return "CN=Configuration," + domain_dn()
+def schema_dn(): return "CN=Schema,CN=Configuration," + domain_dn()
+
+# attributeSyntax OID -> the control the UI should render. This is the same
+# mapping ADUC's Attribute Editor makes from the schema; oMSyntax refines a
+# couple of cases but the syntax OID carries the essential type.
+AD_SYNTAX = {
+    "2.5.5.8":  "bool",     # Boolean
+    "2.5.5.9":  "int",      # Integer / Enumeration
+    "2.5.5.16": "int64",    # LargeInteger / Interval (Int64; times live here too)
+    "2.5.5.11": "time",     # UTC / Generalized time
+    "2.5.5.1":  "dn",       # Object(DS-DN)
+    "2.5.5.7":  "dn",       # Object(DN-Binary)
+    "2.5.5.14": "dn",       # Object(DN-String / Access-Point)
+    "2.5.5.13": "text",     # Object(Presentation-Address)
+    "2.5.5.10": "binary",   # Octet string / Replica-Link
+    "2.5.5.17": "sid",      # SID
+    "2.5.5.15": "ntsd",     # NT Security Descriptor
+    "2.5.5.6":  "text",     # Numeric string
+    "2.5.5.5":  "text",     # Printable / IA5 string
+    "2.5.5.4":  "text",     # Case-insensitive string (Teletex)
+    "2.5.5.3":  "text",     # Case-sensitive string
+    "2.5.5.12": "text",     # Unicode string
+    "2.5.5.2":  "text",     # OID
+}
+
+# Containers hidden from the tree unless Advanced Features (system=yes) — the
+# same infrastructure that ADUC hides by default. Matched on any RDN component.
+SYSTEM_RDNS = {
+    "System", "LostAndFound", "Program Data", "NTDS Quotas", "Infrastructure",
+    "ForeignSecurityPrincipals", "TPM Devices", "Keys", "Deleted Objects",
+    "Managed Service Accounts",
+}
+
+# One LDAP predicate per object-type toggle. `user` excludes computers (a
+# computer IS-A user in the schema), matching how ADUC separates the two.
+OBJECT_CLASS_FILTERS = {
+    "user":     "(&(objectClass=user)(!(objectClass=computer)))",
+    "computer": "(objectClass=computer)",
+    "group":    "(objectClass=group)",
+    "organizationalUnit": "(objectClass=organizationalUnit)",
+    "contact":  "(objectClass=contact)",
+    "container": "(objectClass=container)",
+    "printQueue": "(objectClass=printQueue)",
+    "volume":   "(objectClass=volume)",
+}
+DEFAULT_LIST_CLASSES = ["user", "computer", "group", "organizationalUnit", "contact"]
+DEFAULT_COLUMNS = ["name", "class", "description"]
+
+# The friendly tabbed forms. MS's schema does NOT describe these — in real
+# ADUC the tab layouts live in property-page COM extensions (referenced by
+# adminPropertyPages on each class's displaySpecifier). This catalog is that
+# missing layer: per structural class, an ordered list of tabs, each naming
+# the attributes it shows (a {"attr","kind"} form flags a composite control).
+# Every field is validated against the live schema at request time and the
+# label/type/multi/maxlen come from attributeSchema + attributeDisplayNames,
+# so this stays a LAYOUT map, never a second copy of the schema. Fields whose
+# attribute is not in the class's resolved may/must set are dropped.
+OBJECT_FORMS = {
+    "user": [
+        {"id": "general", "label": "General",
+         "fields": ["givenName", "initials", "sn", "displayName", "description",
+                    "physicalDeliveryOfficeName", "telephoneNumber", "mail",
+                    "wWWHomePage"]},
+        {"id": "address", "label": "Address",
+         "fields": ["streetAddress", "postOfficeBox", "l", "st", "postalCode",
+                    "co", "c"]},
+        {"id": "account", "label": "Account",
+         "fields": ["sAMAccountName", "userPrincipalName",
+                    {"attr": "userAccountControl", "kind": "uac"},
+                    "accountExpires"]},
+        {"id": "profile", "label": "Profile",
+         "fields": ["profilePath", "scriptPath", "homeDirectory", "homeDrive"]},
+        {"id": "telephones", "label": "Telephones",
+         "fields": ["homePhone", "pager", "mobile", "facsimileTelephoneNumber",
+                    "ipPhone", "info"]},
+        {"id": "organization", "label": "Organization",
+         "fields": ["title", "department", "company", "manager"]},
+        {"id": "memberof", "label": "Member Of", "fields": ["memberOf"]},
+    ],
+    "computer": [
+        {"id": "general", "label": "General",
+         "fields": ["cn", "description", "dNSHostName",
+                    {"attr": "userAccountControl", "kind": "uac"}]},
+        {"id": "os", "label": "Operating System",
+         "fields": ["operatingSystem", "operatingSystemVersion",
+                    "operatingSystemServicePack"]},
+        {"id": "delegation", "label": "Delegation",
+         "fields": ["servicePrincipalName"]},
+        {"id": "location", "label": "Location",
+         "fields": ["location", "managedBy"]},
+        {"id": "memberof", "label": "Member Of", "fields": ["memberOf"]},
+    ],
+    "group": [
+        {"id": "general", "label": "General",
+         "fields": ["sAMAccountName", "description",
+                    {"attr": "groupType", "kind": "grouptype"}, "mail", "info"]},
+        {"id": "members", "label": "Members", "fields": ["member"]},
+        {"id": "memberof", "label": "Member Of", "fields": ["memberOf"]},
+        {"id": "managedby", "label": "Managed By", "fields": ["managedBy"]},
+    ],
+    "organizationalUnit": [
+        {"id": "general", "label": "General",
+         "fields": ["ou", "description", "street", "l", "st", "postalCode", "c"]},
+        {"id": "managedby", "label": "Managed By", "fields": ["managedBy"]},
+    ],
+    "contact": [
+        {"id": "general", "label": "General",
+         "fields": ["givenName", "initials", "sn", "displayName", "description",
+                    "telephoneNumber", "mail"]},
+        {"id": "organization", "label": "Organization",
+         "fields": ["title", "department", "company", "manager"]},
+    ],
+    "default": [
+        {"id": "general", "label": "General",
+         "fields": ["cn", "name", "displayName", "description"]},
+    ],
+}
+
+def _rdn(dn):
+    head = dn.split(",", 1)[0]
+    return head.split("=", 1)[1] if "=" in head else head
+
+def _parent_dn(dn):
+    return dn.split(",", 1)[1] if "," in dn else ""
+
+def _structural(classes):
+    """The most-derived structural class = last objectClass value (AD orders
+    the list top-down: top, person, organizationalPerson, user, computer)."""
+    return classes[-1] if classes else ""
+
+def _ldap_escape(s):
+    for ch, rep in (("\\", "\\5c"), ("(", "\\28"), (")", "\\29"),
+                    ("*", "\\2a"), ("\x00", "\\00")):
+        s = s.replace(ch, rep)
+    return s
+
+def _search_filter(s):
+    s = _ldap_escape(s)
+    fields = ["cn", "name", "sAMAccountName", "displayName", "description", "mail"]
+    return "(|%s)" % "".join("(%s=*%s*)" % (f, s) for f in fields)
+
+def _ldb(dc, base, scope, filt="(objectClass=*)", attrs=None):
+    if scope not in ("base", "one", "sub"):
+        scope = "one"
+    argv = ["ldbsearch", "-H", SAM, "-b", base, "-s", scope, filt]
+    if attrs:
+        argv += attrs
+    rc, out, err = podman(dc, argv)
+    if rc != 0:
+        raise Fail(err.strip() or out.strip() or "ldbsearch failed")
+    return parse_ldif_full(out)
+
+def _class_entry(dc, ldap_name):
+    ents = _ldb(dc, schema_dn(), "one",
+                "(&(objectClass=classSchema)(lDAPDisplayName=%s))" % _ldap_escape(ldap_name),
+                ["lDAPDisplayName", "subClassOf", "auxiliaryClass",
+                 "systemAuxiliaryClass", "mustContain", "systemMustContain",
+                 "mayContain", "systemMayContain", "rDNAttID"])
+    return ents[0]["attrs"] if ents else None
+
+def _resolve_class_attrs(dc, ldap_name):
+    """Walk the subClassOf chain to `top` plus every auxiliary class (and their
+    chains); union must/may. This is the object's full allowed attribute set —
+    exactly what the Attribute Editor enumerates. Pure schema, no extra data."""
+    mandatory, optional, chain = set(), set(), []
+    seen, stack = set(), [ldap_name]
+    while stack:
+        cn = stack.pop()
+        if not cn or cn in seen:
+            continue
+        seen.add(cn)
+        a = _class_entry(dc, cn)
+        if a is None:
+            continue
+        chain.append(cn)
+        for k in ("mustContain", "systemMustContain"):
+            mandatory.update(a.get(k, []))
+        for k in ("mayContain", "systemMayContain"):
+            optional.update(a.get(k, []))
+        for k in ("auxiliaryClass", "systemAuxiliaryClass"):
+            stack.extend(a.get(k, []))
+        sub = (a.get("subClassOf") or [None])[0]
+        if sub and sub != cn:          # top.subClassOf == top -> terminate
+            stack.append(sub)
+    optional -= mandatory
+    return {"mandatory": mandatory, "optional": optional, "chain": chain}
+
+def _attr_meta(dc, names):
+    """Per-attribute schema metadata for a list of lDAPDisplayNames."""
+    names = sorted({n for n in names if n})
+    if not names:
+        return {}
+    ors = "".join("(lDAPDisplayName=%s)" % _ldap_escape(n) for n in names)
+    ents = _ldb(dc, schema_dn(), "one",
+                "(&(objectClass=attributeSchema)(|%s))" % ors,
+                ["lDAPDisplayName", "attributeSyntax", "oMSyntax",
+                 "isSingleValued", "systemOnly", "rangeUpper", "searchFlags",
+                 "systemFlags", "linkID", "adminDisplayName"])
+    meta = {}
+    for e in ents:
+        a = e["attrs"]
+        ln = (a.get("lDAPDisplayName") or [""])[0]
+        if not ln:
+            continue
+        syn = (a.get("attributeSyntax") or [""])[0]
+        single = (a.get("isSingleValued") or ["FALSE"])[0].upper() == "TRUE"
+        system_only = (a.get("systemOnly") or ["FALSE"])[0].upper() == "TRUE"
+        try:
+            sysflags = int((a.get("systemFlags") or ["0"])[0] or 0)
+        except ValueError:
+            sysflags = 0
+        constructed = bool(sysflags & 0x00000004)   # FLAG_ATTR_IS_CONSTRUCTED
+        try:
+            link = int((a.get("linkID") or ["0"])[0] or 0)
+        except ValueError:
+            link = 0
+        backlink = link != 0 and link % 2 == 1       # odd linkID = computed back-link
+        typ = AD_SYNTAX.get(syn, "text")
+        try:
+            maxlen = int((a.get("rangeUpper") or [""])[0])
+        except ValueError:
+            maxlen = None
+        if typ == "text" and maxlen and maxlen > 256:
+            typ = "multitext"
+        meta[ln] = {"attr": ln, "syntax": syn,
+                    "omsyntax": (a.get("oMSyntax") or [""])[0],
+                    "type": typ, "multi": not single,
+                    # back-links (odd linkID) are server-computed and reject
+                    # direct writes even when the schema leaves systemOnly FALSE
+                    "readonly": system_only or constructed or backlink,
+                    "maxlen": maxlen,
+                    "label": (a.get("adminDisplayName") or [ln])[0]}
+    return meta
+
+def _display_names(dc, ldap_class):
+    """The class's en-US (409) displaySpecifier: friendly attribute labels,
+    the friendly class name, and the ordered property-page GUID list."""
+    dn = "CN=%s-Display,CN=409,CN=DisplaySpecifiers,%s" % (ldap_class, config_dn())
+    try:
+        ents = _ldb(dc, dn, "base", "(objectClass=*)",
+                    ["attributeDisplayNames", "classDisplayName",
+                     "adminPropertyPages"])
+    except Fail:
+        ents = []
+    labels, pages, class_label = {}, [], ""
+    if ents:
+        a = ents[0]["attrs"]
+        class_label = (a.get("classDisplayName") or [""])[0]
+        for pair in a.get("attributeDisplayNames", []):
+            if "," in pair:
+                k, v = pair.split(",", 1)
+                labels.setdefault(k, v)
+        pages = a.get("adminPropertyPages", [])
+    return {"labels": labels, "class_label": class_label, "pages": pages}
+
+def _ldif_value_line(attr, val):
+    """One LDIF value line, base64-encoded unless the value is an LDIF
+    SAFE-STRING. This is what stops a value that contains a newline from
+    injecting extra modify operations into the change record."""
+    s = "" if val is None else str(val)
+    safe = bool(s) and s[0] not in (" ", ":", "<") and \
+        all(32 <= ord(c) <= 126 for c in s)
+    if safe:
+        return "%s: %s" % (attr, s)
+    b = base64.b64encode(s.encode("utf-8")).decode("ascii")
+    return "%s:: %s" % (attr, b)
+
+def _norm_dn(dn):
+    return ",".join(p.strip() for p in str(dn).split(",")).lower()
+
+def _critical_dns():
+    """DNs the helper refuses to delete or rename — the naming-context heads,
+    the default containers, and the well-known critical principals. A denylist,
+    because the UI's typed-confirmation is bypassable by a direct helper call."""
+    d = domain_dn()
+    heads = {_norm_dn(domain_dn()), _norm_dn(config_dn()), _norm_dn(schema_dn())}
+    for rdn in ("CN=Users", "CN=Builtin", "CN=Computers", "CN=System",
+                "OU=Domain Controllers", "CN=Managed Service Accounts",
+                "CN=ForeignSecurityPrincipals", "CN=Program Data",
+                "CN=LostAndFound", "CN=Infrastructure"):
+        heads.add(_norm_dn("%s,%s" % (rdn, d)))
+    for cn in ("Administrator", "Guest", "krbtgt", "Domain Admins",
+               "Enterprise Admins", "Schema Admins", "Domain Users",
+               "Domain Controllers", "Group Policy Creator Owners",
+               "Cert Publishers", "Read-only Domain Controllers"):
+        heads.add(_norm_dn("CN=%s,CN=Users,%s" % (cn, d)))
+    heads.add(_norm_dn("CN=Administrators,CN=Builtin,%s" % d))
+    return heads
+
+def _guard_critical(dn, action):
+    if _norm_dn(dn) in _critical_dns():
+        raise Fail("refusing to %s a critical directory object: %s" % (action, dn))
+
+def v_object_tree(a):
+    d = first_up_dc()
+    system = (a.get("system") or "").lower() in ("1", "yes", "true")
+    base = domain_dn()
+    filt = ("(|(objectClass=organizationalUnit)(objectClass=container)"
+            "(objectClass=builtinDomain)(objectClass=domainDNS)"
+            "(objectClass=lostAndFound)(objectClass=msDS-QuotaContainer))")
+    ents = _ldb(d, base, "sub", filt, ["name", "cn", "ou", "objectClass"])
+    nodes = []
+    for e in ents:
+        dn, at = e["dn"], e["attrs"]
+        rdn_names = [p.split("=", 1)[-1] for p in dn.split(",")]
+        is_sys = dn != base and any(n in SYSTEM_RDNS for n in rdn_names)
+        if is_sys and not system:
+            continue
+        nodes.append({
+            "dn": dn,
+            "name": (at.get("ou") or at.get("name") or at.get("cn") or [_rdn(dn)])[0],
+            "class": _structural(at.get("objectClass", [])),
+            "system": is_sys,
+            "parent": _parent_dn(dn),
+        })
+    nodes.sort(key=lambda n: n["dn"].lower())
+    return {"base": base, "count": len(nodes), "nodes": nodes}
+
+def v_object_list(a):
+    d = first_up_dc()
+    base = a["base"]
+    scope = a.get("scope", "one")
+    classes = [c for c in (a.get("classes", "") or "").split(",") if c]
+    search = (a.get("search") or "").strip()
+    extra = [x for x in (a.get("attrs", "") or "").split(",") if x]
+    try:
+        limit = int(a.get("limit") or 2000)
+    except ValueError:
+        limit = 2000
+    use = classes or DEFAULT_LIST_CLASSES
+    parts = [OBJECT_CLASS_FILTERS.get(c, "(objectClass=%s)" % _ldap_escape(c)) for c in use]
+    clsf = "(|%s)" % "".join(parts) if len(parts) > 1 else parts[0]
+    conds = [clsf]
+    if search:
+        conds.append(_search_filter(search))
+    filt = "(&%s)" % "".join(conds) if len(conds) > 1 else conds[0]
+    want = ["objectClass", "name", "cn", "sAMAccountName", "displayName",
+            "description"]
+    for x in extra:
+        if x not in want:
+            want.append(x)
+    ents = _ldb(d, base, scope, filt, want)
+    rows = []
+    for e in ents:
+        if e["dn"] == base:
+            continue
+        at = e["attrs"]
+        row_attrs = {}
+        for k in want:
+            if k == "objectClass":
+                continue
+            vs = at.get(k)
+            if vs:
+                row_attrs[k] = vs[0]
+        rows.append({
+            "dn": e["dn"],
+            "name": (at.get("name") or at.get("cn") or [_rdn(e["dn"])])[0],
+            "class": _structural(at.get("objectClass", [])),
+            "attrs": row_attrs,
+        })
+        if len(rows) >= limit:
+            break
+    return {"base": base, "count": len(rows),
+            "truncated": len(ents) > len(rows),
+            "columns": extra or DEFAULT_COLUMNS, "objects": rows}
+
+def v_object_get(a):
+    d = first_up_dc()
+    dn = a["dn"]
+    want = ["*", "memberOf"]
+    if (a.get("acl") or "").lower() in ("1", "yes", "true"):
+        want.append("nTSecurityDescriptor")
+    ents = _ldb(d, dn, "base", "(objectClass=*)", want)
+    if not ents:
+        raise Fail("object not found: %s" % dn)
+    e = ents[0]
+    at = e["attrs"]
+    cls = at.get("objectClass", [])
+    return {"dn": e["dn"],
+            "name": (at.get("name") or at.get("cn") or [_rdn(dn)])[0],
+            "classes": cls, "structural_class": _structural(cls),
+            "attrs": at, "b64": e["b64"]}
+
+def v_object_schema(a):
+    d = first_up_dc()
+    cls = a.get("class")
+    if not cls:
+        dn = a.get("dn")
+        if not dn:
+            raise Fail("need --class or --dn")
+        ents = _ldb(d, dn, "base", "(objectClass=*)", ["objectClass"])
+        if not ents:
+            raise Fail("object not found: %s" % dn)
+        cls = _structural(ents[0]["attrs"].get("objectClass", []))
+    res = _resolve_class_attrs(d, cls)
+    allowed = sorted(res["mandatory"] | res["optional"])
+    meta = _attr_meta(d, allowed)
+    disp = _display_names(d, cls)
+    labels = disp["labels"]
+
+    def enrich(attr, kind=None):
+        m = dict(meta.get(attr, {"attr": attr, "type": "text", "multi": False,
+                                 "readonly": False, "maxlen": None}))
+        m["attr"] = attr
+        m["label"] = labels.get(attr) or m.get("label") or attr
+        m["mandatory"] = attr in res["mandatory"]
+        if kind:
+            m["kind"] = kind
+        return m
+
+    attributes = [enrich(x) for x in allowed]
+    allowed_set = set(allowed)
+    tabs = []
+    for tab in OBJECT_FORMS.get(cls, OBJECT_FORMS["default"]):
+        fields = []
+        for f in tab["fields"]:
+            attr = f if isinstance(f, str) else f["attr"]
+            kind = None if isinstance(f, str) else f.get("kind")
+            if attr not in allowed_set:      # self-heal against the live schema
+                continue
+            fields.append(enrich(attr, kind))
+        if fields:
+            tabs.append({"id": tab["id"], "label": tab["label"], "fields": fields})
+    return {"structural_class": cls,
+            "class_label": disp.get("class_label") or cls,
+            "tabs": tabs, "attributes": attributes,
+            "mandatory": sorted(res["mandatory"]),
+            "chain": res["chain"], "pages": disp.get("pages", [])}
+
+def v_object_modify(a):
+    dn = a["dn"]
+    try:
+        changes = json.loads(a["changes"])
+    except Exception as e:
+        raise Fail("changes must be JSON: %s" % e)
+    if not isinstance(changes, list) or not changes:
+        raise Fail("changes must be a non-empty JSON array")
+    lines = ["dn: " + dn, "changetype: modify"]
+    for ch in changes:
+        if not isinstance(ch, dict):
+            raise Fail("each change must be an object {attr, op, values}")
+        attr = ch.get("attr")
+        op = ch.get("op", "replace")
+        if not attr:
+            raise Fail("each change needs an attr")
+        if op not in ("replace", "add", "delete"):
+            raise Fail("bad op %r (replace|add|delete)" % op)
+        b64 = bool(ch.get("b64"))
+        lines.append("%s: %s" % (op, attr))
+        for v in (ch.get("values") or []):
+            if v is None or v == "":
+                continue
+            # b64 = caller-supplied base64 (binary); otherwise auto-encode any
+            # value that is not an LDIF SAFE-STRING — this closes the newline
+            # injection where a value could smuggle in extra modify ops.
+            lines.append("%s:: %s" % (attr, v) if b64 else _ldif_value_line(attr, v))
+        lines.append("-")
+    ldif = "\n".join(lines) + "\n"
+    d = pdc_emulator()
+    rc, out, err = podman(d, ["ldbmodify", "-H", SAM], stdin=ldif)
+    if rc != 0:
+        raise Fail(err.strip() or out.strip() or "ldbmodify failed")
+    return {"modified": dn, "on": d, "changes": len(changes)}
+
+def v_object_rename(a):
+    _guard_critical(a["dn"], "rename")
+    d = pdc_emulator()
+    rc, out, err = podman(d, ["ldbrename", "-H", SAM, a["dn"], a["new_dn"]])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip() or "ldbrename failed")
+    return {"renamed": a["dn"], "to": a["new_dn"], "on": d}
+
+def v_object_delete(a):
+    _guard_critical(a["dn"], "delete")
+    d = pdc_emulator()
+    argv = ["ldbdel", "-H", SAM]
+    if (a.get("recursive") or "").lower() in ("1", "yes", "true"):
+        argv.append("--recursive")
+    argv.append(a["dn"])
+    rc, out, err = podman(d, argv)
+    if rc != 0:
+        raise Fail(err.strip() or out.strip() or "ldbdel failed")
+    return {"deleted": a["dn"], "on": d}
 
 # ---- GPO (gpmc.msc) — ALWAYS the PDC emulator -----------------------------
 
@@ -1438,6 +1977,36 @@ VERBS = {
                       "args": [arg("dn", help_="e.g. OU=Workstations")]},
     "ou-delete":     {"fn": v_ou_delete, "group": "users", "danger": True,
                       "help": "Delete an OU by DN.", "args": [arg("dn")]},
+
+    "object-tree":   {"fn": v_object_tree, "group": "objects",
+                      "help": "The container/OU tree (Advanced Features reveals system containers).",
+                      "args": [arg("system", required=False, help_="yes = include system containers")]},
+    "object-list":   {"fn": v_object_list, "group": "objects",
+                      "help": "Objects under a container, by type/search, with chosen columns.",
+                      "args": [arg("base", help_="container DN"),
+                               arg("scope", "enum", required=False, choices=["one", "sub", "base"], default="one"),
+                               arg("classes", required=False, help_="comma list: user,computer,group,organizationalUnit,contact,container,printQueue,volume"),
+                               arg("search", required=False, help_="substring over name/sAM/displayName/description"),
+                               arg("attrs", required=False, help_="comma list of extra column attributes"),
+                               arg("limit", "int", required=False)]},
+    "object-get":    {"fn": v_object_get, "group": "objects",
+                      "help": "One object's full attribute set (drives the preview + Attribute Editor).",
+                      "args": [arg("dn"), arg("acl", required=False, help_="yes = include nTSecurityDescriptor")]},
+    "object-schema": {"fn": v_object_schema, "group": "objects",
+                      "help": "Schema-driven tabbed form layout + full allowed-attribute catalog for a class/object.",
+                      "args": [arg("class", required=False, help_="lDAPDisplayName of the class"),
+                               arg("dn", required=False, help_="resolve the class from this object")]},
+    "object-modify": {"fn": v_object_modify, "group": "objects", "danger": True,
+                      "help": "Apply attribute changes (ldbmodify on the PDC emulator).",
+                      "args": [arg("dn"),
+                               arg("changes", help_="JSON array of {attr,op:replace|add|delete,values,[b64]}")]},
+    "object-rename": {"fn": v_object_rename, "group": "objects", "danger": True,
+                      "help": "Rename or move an object (ldbrename on the PDC emulator).",
+                      "args": [arg("dn"), arg("new_dn", help_="new full DN")]},
+    "object-delete": {"fn": v_object_delete, "group": "objects", "danger": True,
+                      "help": "Delete an object (ldbdel on the PDC emulator).",
+                      "args": [arg("dn"), arg("recursive", required=False, help_="yes = delete a subtree")]},
+
     "gpo-list":      {"fn": v_gpo_list, "group": "gpo", "help": "All GPOs (queried on the PDC emulator)."},
     "gpo-create":    {"fn": v_gpo_create, "group": "gpo",
                       "help": "Create a GPO on the PDC emulator.", "args": [arg("name")]},

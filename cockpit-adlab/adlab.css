@@ -7,7 +7,7 @@
     --al-ok: #1e7d34;       --al-ok-bg: #e6f4ea;
     --al-warn: #92610f;     --al-warn-bg: #fdf3d9;
     --al-err: #b0261c;      --al-err-bg: #fbe9e7;
-    --al-code-bg: #f0f0f0;
+    --al-code-bg: #f0f0f0;   --al-accent-soft: #dcebfb;
 }
 @media (prefers-color-scheme: dark) {
     :root {
@@ -16,7 +16,7 @@
         --al-ok: #6ec684;   --al-ok-bg: #1c2f22;
         --al-warn: #e8c268; --al-warn-bg: #33290f;
         --al-err: #f0705f;  --al-err-bg: #3a1f1c;
-        --al-code-bg: #2b2d33;
+        --al-code-bg: #2b2d33;   --al-accent-soft: #223851;
     }
 }
 
@@ -183,3 +183,75 @@ kbd.al { background: var(--al-code-bg); border: 1px solid var(--al-border);
 .al-chip:hover { border-color: var(--al-accent); }
 .al-chip.on { background: var(--al-accent); color: #fff; border-color: var(--al-accent); }
 .al-tree-row.sub { padding-left: 1.4rem; }
+
+/* ---- Users & Computers (dsa.msc) three-pane object console -------------- */
+.al-aduc { display: flex; height: 74vh; min-height: 460px; align-items: stretch;
+    border: 1px solid var(--al-border); border-radius: 6px;
+    overflow-x: auto; overflow-y: hidden; }
+.al-aduc-split { flex: 0 0 6px; cursor: col-resize; background: var(--al-border); }
+.al-aduc-split:hover { background: var(--al-accent); }
+.al-aduc-tree { flex: 0 0 auto; overflow: auto; box-sizing: border-box;
+    padding: 0.4rem; border-right: 1px solid var(--al-border); }
+.al-aduc-treehost { overflow: auto; }
+.al-tree-label.wrap { white-space: normal; overflow: visible; text-overflow: clip;
+    word-break: break-word; display: inline-block; vertical-align: top; }
+.al-aduc-objects { flex: 1 1 420px; min-width: 380px; display: flex; flex-direction: column; }
+.al-obj-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
+    padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--al-border); }
+.al-obj-search { flex: 1 1 200px; min-width: 140px; box-sizing: border-box;
+    padding: 0.35rem 0.5rem; border: 1px solid var(--al-border); border-radius: 4px;
+    background: var(--al-bg); color: var(--al-ink); font-size: 0.82rem; }
+.al-obj-chips { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.al-objtable-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; }
+table.al-objtable { border-collapse: collapse; width: max-content; min-width: 100%; }
+table.al-objtable th { position: sticky; top: 0; background: var(--al-card); z-index: 1;
+    white-space: nowrap; }
+table.al-objtable td { white-space: nowrap; max-width: 340px; overflow: hidden;
+    text-overflow: ellipsis; }
+table.al-objtable tr.sel { background: var(--al-accent-soft); }
+table.al-objtable tbody tr:hover, table.al-objtable tr:hover { background: var(--al-code-bg); cursor: default; }
+.al-objtable-summary { flex: 0 0 auto; text-align: right; font-size: 0.75rem;
+    color: var(--al-sub); padding: 0.25rem 0.6rem; border-top: 1px solid var(--al-border); }
+.al-aduc-preview { flex: 0 0 auto; width: 380px; box-sizing: border-box; overflow: auto;
+    border-left: 1px solid var(--al-border); padding: 0.5rem; }
+.al-prev-hdr { display: flex; align-items: center; }
+.al-prev-title { font-weight: 600; font-size: 0.95rem; overflow: hidden; text-overflow: ellipsis; }
+.al-prev-actions { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.4rem 0; }
+.al-prev-mode { display: flex; gap: 0.25rem; margin-bottom: 0.4rem; }
+.al-prev-body { overflow: auto; }
+.al-prev-sec { margin-bottom: 0.6rem; }
+.al-prev-sec h4 { margin: 0.3rem 0 0.2rem; font-size: 0.82rem; color: var(--al-sub);
+    text-transform: uppercase; letter-spacing: 0.04em; }
+.al-valcell { display: flex; flex-direction: column; gap: 0.1rem; }
+.al-dnval { font-family: var(--al-mono, monospace); font-size: 0.76rem; word-break: break-all; }
+
+/* form primitives */
+.al-in, .al-ta { width: 100%; box-sizing: border-box; padding: 0.35rem 0.5rem;
+    border: 1px solid var(--al-border); border-radius: 4px; background: var(--al-bg);
+    color: var(--al-ink); font-size: 0.82rem; font-family: inherit; }
+.al-ta { resize: vertical; }
+.al-check { display: flex; align-items: center; gap: 0.35rem; font-size: 0.82rem; margin: 0.15rem 0; }
+.al-uac { display: flex; flex-direction: column; gap: 0.1rem; }
+.al-ro { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.al-tag { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--al-sub); border: 1px solid var(--al-border); border-radius: 3px; padding: 0 0.3rem; }
+
+/* tabbed object editor */
+.al-tabstrip { display: flex; flex-wrap: wrap; gap: 0.15rem; border-bottom: 1px solid var(--al-border); margin-bottom: 0.6rem; }
+.al-tab { background: transparent; border: none; border-bottom: 2px solid transparent;
+    padding: 0.35rem 0.7rem; cursor: pointer; color: var(--al-sub); font-size: 0.85rem; }
+.al-tab:hover { color: var(--al-ink); }
+.al-tab.on { color: var(--al-ink); border-bottom-color: var(--al-accent); font-weight: 600; }
+.al-tabpane { display: none; }
+.al-tabpane.on { display: block; }
+.al-formrow { display: grid; grid-template-columns: 220px 1fr; gap: 0.6rem;
+    align-items: start; margin: 0.35rem 0; }
+.al-formrow > label { color: var(--al-sub); font-size: 0.82rem; padding-top: 0.35rem; }
+.al-modal-actions { margin-top: 0.8rem; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+
+/* advanced attribute grid */
+.al-attrgrid { max-height: 60vh; overflow: auto; }
+table.al-attrtable { border-collapse: collapse; width: 100%; }
+table.al-attrtable th { position: sticky; top: 0; background: var(--al-card); z-index: 1; text-align: left; }
+.al-attrname { font-family: var(--al-mono, monospace); font-size: 0.8rem; }
+.al-attrtype { color: var(--al-sub); font-size: 0.74rem; white-space: nowrap; }

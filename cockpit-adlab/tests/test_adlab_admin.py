@@ -215,7 +215,7 @@ class Base(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 KNOWN_TYPES = {"str", "int", "bool", "enum", "password-stdin"}
-KNOWN_GROUPS = {"meta", "overview", "fsmo", "users", "groups", "gpo",
+KNOWN_GROUPS = {"meta", "overview", "fsmo", "users", "groups", "gpo", "objects",
                 "sites", "dns", "dcs", "clients", "activity"}
 DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "ou-delete", "gpo-delete", "gpo-unlink", "gpo-settings-remove",
@@ -853,6 +853,265 @@ class TestCatalog(Base):
         rc, out = self.call_main(["gpo-catalog"])
         motd = next(e for e in out["entries"] if e.get("cse") == "motd")
         self.assertEqual(motd["subsystems"], ["kde"])   # override wins over derived
+
+
+# ---------------------------------------------------------------------------
+# AD objects + schema (dsa.msc object editor)
+# ---------------------------------------------------------------------------
+
+# Three classSchema entries forming a tiny inheritance chain user->person->top
+# plus the attributeSchema and displaySpecifier the schema verb consults.
+CLS_USER = """dn: CN=User,CN=Schema,CN=Configuration,DC=ad,DC=edt1,DC=lab
+lDAPDisplayName: user
+subClassOf: person
+mustContain: cn
+mayContain: sn
+mayContain: givenName
+mayContain: description
+mayContain: memberOf
+mayContain: userAccountControl
+mayContain: sAMAccountName
+mayContain: userPrincipalName
+"""
+CLS_PERSON = """dn: CN=Person,CN=Schema,CN=Configuration,DC=ad,DC=edt1,DC=lab
+lDAPDisplayName: person
+subClassOf: top
+mayContain: telephoneNumber
+"""
+CLS_TOP = """dn: CN=Top,CN=Schema,CN=Configuration,DC=ad,DC=edt1,DC=lab
+lDAPDisplayName: top
+subClassOf: top
+"""
+
+def _attrschema(ln, syn, single="TRUE", rng="64", sysonly="FALSE", sysflags="0"):
+    return ("dn: CN=%s,CN=Schema,CN=Configuration,DC=ad,DC=edt1,DC=lab\n"
+            "lDAPDisplayName: %s\nattributeSyntax: %s\noMSyntax: 64\n"
+            "isSingleValued: %s\nrangeUpper: %s\nsystemOnly: %s\nsystemFlags: %s\n"
+            % (ln, ln, syn, single, rng, sysonly, sysflags))
+
+ATTRS_LDIF = "\n".join([
+    _attrschema("cn", "2.5.5.12"),
+    _attrschema("sn", "2.5.5.12"),
+    _attrschema("givenName", "2.5.5.12"),
+    _attrschema("description", "2.5.5.12", single="FALSE", rng="1024"),   # -> multitext, multi
+    _attrschema("telephoneNumber", "2.5.5.12"),
+    _attrschema("memberOf", "2.5.5.1", single="FALSE", sysonly="TRUE"),   # dn, read-only
+    _attrschema("userAccountControl", "2.5.5.9"),                        # int
+    _attrschema("sAMAccountName", "2.5.5.12"),
+    _attrschema("userPrincipalName", "2.5.5.12"),
+])
+
+USER_DISPLAY = """dn: CN=user-Display,CN=409,CN=DisplaySpecifiers,CN=Configuration,DC=ad,DC=edt1,DC=lab
+classDisplayName: User
+attributeDisplayNames: givenName,First name
+attributeDisplayNames: sn,Last name
+adminPropertyPages: 1,{6dfe6485-a212-11d0-bcd5-00c04fd8d5b6}
+"""
+
+def _schema_lab(fake):
+    """Wire a FakeRunner to answer the schema/display queries for the chain."""
+    fake.lab_up()
+    fake.on(lambda a: any("lDAPDisplayName=user)" in str(x) for x in a), out=CLS_USER)
+    fake.on(lambda a: any("lDAPDisplayName=person)" in str(x) for x in a), out=CLS_PERSON)
+    fake.on(lambda a: any("lDAPDisplayName=top)" in str(x) for x in a), out=CLS_TOP)
+    fake.on(lambda a: any(str(x).startswith("(&(objectClass=attributeSchema)") for x in a), out=ATTRS_LDIF)
+    fake.on(lambda a: any("user-Display" in str(x) for x in a), out=USER_DISPLAY)
+    return fake
+
+
+class TestLdifParse(Base):
+    def test_folding_and_base64_text(self):
+        text = ("dn: CN=X,DC=ad,DC=edt1,DC=lab\n"
+                "cn:: %s\n"
+                "description: line one\n line two\n"
+                "\n" % _b64(b"Hello"))
+        ents = mod.parse_ldif_full(text)
+        self.assertEqual(len(ents), 1)
+        self.assertEqual(ents[0]["dn"], "CN=X,DC=ad,DC=edt1,DC=lab")
+        self.assertEqual(ents[0]["attrs"]["cn"], ["Hello"])          # base64 decoded to text
+        self.assertFalse(ents[0]["b64"]["cn"][0])
+        self.assertEqual(ents[0]["attrs"]["description"], ["line oneline two"])  # folded
+
+    def test_binary_base64_becomes_hex(self):
+        text = ("dn: CN=Y,DC=ad,DC=edt1,DC=lab\n"
+                "blob:: %s\n\n" % _b64(b"\x00\x01\x02"))
+        ents = mod.parse_ldif_full(text)
+        self.assertEqual(ents[0]["attrs"]["blob"], ["000102"])
+        self.assertTrue(ents[0]["b64"]["blob"][0])
+
+    def test_referral_blocks_skipped(self):
+        text = ("dn: CN=Z,DC=ad,DC=edt1,DC=lab\ncn: Z\n\n"
+                "# Referral\nref: ldap://ad.edt1.lab/CN=Configuration\n\n")
+        ents = mod.parse_ldif_full(text)
+        self.assertEqual([e["dn"] for e in ents], ["CN=Z,DC=ad,DC=edt1,DC=lab"])
+
+
+class TestSchemaResolution(Base):
+    def test_control_type_map(self):
+        self.assertEqual(mod.AD_SYNTAX["2.5.5.8"], "bool")
+        self.assertEqual(mod.AD_SYNTAX["2.5.5.9"], "int")
+        self.assertEqual(mod.AD_SYNTAX["2.5.5.1"], "dn")
+        self.assertEqual(mod.AD_SYNTAX["2.5.5.12"], "text")
+
+    def test_resolve_class_walks_chain_and_terminates(self):
+        _schema_lab(self.fake)
+        res = mod._resolve_class_attrs("dc1", "user")
+        self.assertEqual(res["mandatory"], {"cn"})
+        self.assertIn("telephoneNumber", res["optional"])   # inherited from person
+        self.assertIn("sn", res["optional"])
+        self.assertEqual(res["chain"], ["user", "person", "top"])   # stops at top
+
+    def test_attr_meta_types(self):
+        _schema_lab(self.fake)
+        meta = mod._attr_meta("dc1", ["cn", "description", "memberOf", "userAccountControl"])
+        self.assertEqual(meta["cn"]["type"], "text")
+        self.assertEqual(meta["description"]["type"], "multitext")   # rangeUpper > 256
+        self.assertTrue(meta["description"]["multi"])
+        self.assertEqual(meta["userAccountControl"]["type"], "int")
+        self.assertTrue(meta["memberOf"]["readonly"])               # systemOnly
+
+
+class TestObjectSchemaVerb(Base):
+    def test_tabs_built_and_validated_against_schema(self):
+        _schema_lab(self.fake)
+        rc, out = self.call_main(["object-schema", "--class", "user"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["structural_class"], "user")
+        self.assertEqual(out["class_label"], "User")
+        tabs = {t["id"]: t for t in out["tabs"]}
+        # address/profile/telephones/organization drop out — none of their
+        # attributes are in this reduced schema; general/account/memberof stay
+        self.assertEqual(set(tabs), {"general", "account", "memberof"})
+        gen = [f["attr"] for f in tabs["general"]["fields"]]
+        self.assertEqual(gen, ["givenName", "sn", "description", "telephoneNumber"])
+        # friendly label came from the displaySpecifier
+        gn = next(f for f in tabs["general"]["fields"] if f["attr"] == "givenName")
+        self.assertEqual(gn["label"], "First name")
+        # composite kind survives
+        uac = next(f for f in tabs["account"]["fields"] if f["attr"] == "userAccountControl")
+        self.assertEqual(uac["kind"], "uac")
+        # full allowed-attribute catalog powers the Attribute Editor
+        self.assertEqual(len(out["attributes"]), 9)
+        self.assertEqual(sorted(out["mandatory"]), ["cn"])
+
+
+class TestObjectVerbs(Base):
+    def test_list_builds_class_and_search_filter(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a,
+                     out="dn: CN=Bob,CN=Users,DC=ad,DC=edt1,DC=lab\n"
+                         "objectClass: top\nobjectClass: person\nobjectClass: user\n"
+                         "cn: Bob\nsAMAccountName: bob\n\n")
+        rc, out = self.call_main(["object-list", "--base", "CN=Users,DC=ad,DC=edt1,DC=lab",
+                                  "--classes", "user,group", "--search", "bob"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["count"], 1)
+        self.assertEqual(out["objects"][0]["class"], "user")
+        f = " ".join(self.fake.argv_containing("ldbsearch")[0])
+        self.assertIn("(!(objectClass=computer))", f)     # user excludes computers
+        self.assertIn("(objectClass=group)", f)
+        self.assertIn("sAMAccountName=*bob*", f)
+
+    def test_list_excludes_the_base_object(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a,
+                     out="dn: CN=Users,DC=ad,DC=edt1,DC=lab\nobjectClass: container\n\n"
+                         "dn: CN=Bob,CN=Users,DC=ad,DC=edt1,DC=lab\nobjectClass: user\ncn: Bob\n\n")
+        rc, out = self.call_main(["object-list", "--base", "CN=Users,DC=ad,DC=edt1,DC=lab",
+                                  "--classes", "user"])
+        self.assertEqual([o["name"] for o in out["objects"]], ["Bob"])
+
+    def test_tree_hides_system_unless_requested(self):
+        tree = ("dn: DC=ad,DC=edt1,DC=lab\nobjectClass: domainDNS\n\n"
+                "dn: CN=Users,DC=ad,DC=edt1,DC=lab\nobjectClass: container\ncn: Users\n\n"
+                "dn: CN=System,DC=ad,DC=edt1,DC=lab\nobjectClass: container\ncn: System\n\n")
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=tree)
+        rc, out = self.call_main(["object-tree"])
+        names = [n["name"] for n in out["nodes"]]
+        self.assertIn("Users", names)
+        self.assertNotIn("System", names)          # hidden by default
+        rc, out = self.call_main(["object-tree", "--system", "yes"])
+        self.assertIn("System", [n["name"] for n in out["nodes"]])
+
+    def test_modify_builds_ldif_changetype(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbmodify" in a, out="Modified 1 record\n")
+        changes = json.dumps([{"attr": "sn", "op": "replace", "values": ["Smith"]},
+                              {"attr": "description", "op": "delete", "values": []}])
+        rc, out = self.call_main(["object-modify", "--dn", "CN=Bob,CN=Users,DC=ad,DC=edt1,DC=lab",
+                                  "--changes", changes])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["changes"], 2)
+        call = next((argv, stdin) for argv, stdin in self.fake.calls if "ldbmodify" in argv)
+        ldif = call[1]
+        self.assertIn("changetype: modify", ldif)
+        self.assertIn("replace: sn", ldif)
+        self.assertIn("sn: Smith", ldif)
+        self.assertIn("delete: description", ldif)
+
+    def test_modify_rejects_bad_op(self):
+        self.fake.lab_up()
+        rc, out = self.call_main(["object-modify", "--dn", "CN=Bob,DC=ad,DC=edt1,DC=lab",
+                                  "--changes", json.dumps([{"attr": "sn", "op": "frobnicate"}])])
+        self.assertEqual(rc, 1)
+        self.assertIn("bad op", out["error"])
+
+    def test_rename_and_delete_build_ldb_commands(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbrename" in a, out="")
+        self.fake.on(lambda a: "ldbdel" in a, out="")
+        rc, out = self.call_main(["object-rename", "--dn", "CN=Bob,CN=Users,DC=ad,DC=edt1,DC=lab",
+                                  "--new_dn", "CN=Bobby,CN=Users,DC=ad,DC=edt1,DC=lab"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.fake.argv_containing("ldbrename", "CN=Bobby,CN=Users,DC=ad,DC=edt1,DC=lab"))
+        rc, out = self.call_main(["object-delete", "--dn", "OU=Old,DC=ad,DC=edt1,DC=lab",
+                                  "--recursive", "yes"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.fake.argv_containing("ldbdel", "--recursive"))
+
+    def test_modify_escapes_ldif_injection(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbmodify" in a, out="Modified 1 record\n")
+        evil = "inj\nreplace: displayName\ndisplayName: PWNED\n-"
+        rc, out = self.call_main(["object-modify", "--dn", "CN=Bob,CN=Users,DC=ad,DC=edt1,DC=lab",
+                                  "--changes", json.dumps([{"attr": "description", "op": "replace", "values": [evil]}])])
+        self.assertEqual(rc, 0)
+        ldif = next(stdin for argv, stdin in self.fake.calls if "ldbmodify" in argv)
+        # the value is base64-wrapped, so the injected ops never appear as LDIF
+        self.assertIn("description:: ", ldif)
+        self.assertNotIn("displayName", ldif)
+        self.assertNotIn("PWNED", ldif)          # it is inside the base64, not plaintext
+        self.assertEqual(ldif.count("replace: "), 1)
+
+    def test_modify_rejects_non_dict_change(self):
+        self.fake.lab_up()
+        rc, out = self.call_main(["object-modify", "--dn", "CN=Bob,DC=ad,DC=edt1,DC=lab",
+                                  "--changes", json.dumps(["notadict"])])
+        self.assertEqual(rc, 1)          # clean Fail, not an internal exit-3
+        self.assertIn("must be an object", out["error"])
+
+    def test_delete_and_rename_guard_critical_objects(self):
+        # no lab needed — the guard raises before any DC work
+        for dn in ("DC=ad,DC=edt1,DC=lab",
+                   "CN=Administrator,CN=Users,DC=ad,DC=edt1,DC=lab",
+                   "OU=Domain Controllers,DC=ad,DC=edt1,DC=lab"):
+            rc, out = self.call_main(["object-delete", "--dn", dn])
+            self.assertEqual(rc, 1, dn)
+            self.assertIn("critical", out["error"])
+            rc, out = self.call_main(["object-rename", "--dn", dn, "--new_dn", "CN=X,DC=ad,DC=edt1,DC=lab"])
+            self.assertEqual(rc, 1, dn)
+            self.assertIn("critical", out["error"])
+
+    def test_attr_meta_flags_backlink_readonly(self):
+        self.fake.lab_up()
+        # a back-link (odd linkID) with systemOnly FALSE and no constructed bit
+        self.fake.on(lambda a: any(str(x).startswith("(&(objectClass=attributeSchema)") for x in a),
+                     out=("dn: CN=Is-Member-Of-DL,CN=Schema,CN=Configuration,DC=ad,DC=edt1,DC=lab\n"
+                          "lDAPDisplayName: memberOf\nattributeSyntax: 2.5.5.1\noMSyntax: 127\n"
+                          "isSingleValued: FALSE\nsystemOnly: FALSE\nsystemFlags: 0\nlinkID: 3\n"))
+        meta = mod._attr_meta("dc1", ["memberOf"])
+        self.assertTrue(meta["memberOf"]["readonly"])   # odd linkID -> read-only
 
 
 if __name__ == "__main__":
