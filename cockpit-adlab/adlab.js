@@ -26,7 +26,11 @@
     var IDENT = null;
     var currentTab = "overview";
     var lastRenderedTab = null;
-    var shownModalKey = null;      // JSON of the options that opened the modal
+    var shownStack = [];           // [{sig, back}] — the open modal backdrops,
+                                   // reconciled against the URL modal stack
+    var _lastBackdrop = null;      // set by modal() so the reconciler can track it
+    // modals rendered wide (two-pane); everything else uses the default width
+    var WIDE_MODALS = { "gpo-edit": true };
 
     // ---------------------------------------------------------------- utils
     function el(tag, cls, text) {
@@ -83,22 +87,43 @@
         cockpit.location.go(path, options || {});
     }
     function goTab(tab) { nav([tab]); }
-    /* Open a modal = navigate to the current tab with modal options. */
+
+    /* The modal STACK lives in the URL as parallel arrays: each open modal is
+     * a (modal, target) pair, so the URL reads
+     *   #/gpo?modal=gpo-edit&target={GUID}&modal=gpo-compose&target={GUID}
+     * and Back/Forward walk the stack one level at a time. `target` carries a
+     * special modal's single argument (a GPO GUID); for a generic verb modal
+     * it carries the JSON of its presets. */
+    function readStack() {
+        var o = (cockpit.location && cockpit.location.options) || {};
+        var mods = o.modal ? (Array.isArray(o.modal) ? o.modal : [o.modal]) : [];
+        var tgts = o.target ? (Array.isArray(o.target) ? o.target : [o.target]) : [];
+        return mods.map(function (m, i) { return { modal: m, target: tgts[i] === undefined ? "" : tgts[i] }; });
+    }
+    function writeStack(stack) {
+        if (!stack.length) { nav([currentTab], {}); return; }
+        nav([currentTab], { modal: stack.map(function (s) { return s.modal; }),
+                            target: stack.map(function (s) { return s.target; }) });
+    }
+    /* Push a modal onto the stack (navigates; the router opens it). */
     function openModal(key, extra) {
-        var opts = { modal: key };
-        Object.keys(extra || {}).forEach(function (k) { opts[k] = extra[k]; });
-        nav([currentTab], opts);
+        extra = extra || {};
+        var target = (SCHEMA && SCHEMA.verbs && SCHEMA.verbs[key])
+            ? JSON.stringify(extra)                       // verb presets
+            : (extra.target !== undefined ? extra.target : "");
+        writeStack(readStack().concat([{ modal: key, target: String(target) }]));
     }
-    /* Close a modal = navigate back to the bare tab (clears options). */
-    function closeModal() { nav([currentTab]); }
-
-    function closeModalDom() {
-        clear(document.getElementById("al-modal-host"));
+    /* Close the TOP modal = pop one level. */
+    function closeModal() {
+        var s = readStack(); s.pop(); writeStack(s);
     }
 
-    /* The router. Renders the tab body only when the tab actually changes
-     * (so opening/closing a modal never tears down the tab), then opens or
-     * closes the modal to match the options. */
+    function sigOf(d) { return d.modal + "|" + (d.target || ""); }
+
+    /* The router. Renders the tab body only when the tab changes, then
+     * reconciles the visible modal backdrops against the URL stack: shared
+     * lower modals are left untouched (their state survives a push on top),
+     * only the differing top is closed/opened. */
     function route() {
         var loc = cockpit.location;
         var tab = (loc.path && loc.path[0]) || "overview";
@@ -109,12 +134,23 @@
             renderTabs();
             RENDER[tab]();
         }
-        var opts = loc.options || {};
-        var key = opts.modal ? JSON.stringify(opts) : null;
-        if (key === shownModalKey) return;
-        shownModalKey = key;
-        if (!key) { closeModalDom(); return; }
-        dispatchModal(opts.modal, opts);
+        reconcileModals(readStack());
+    }
+
+    function reconcileModals(urlStack) {
+        var c = 0;
+        while (c < shownStack.length && c < urlStack.length &&
+               shownStack[c].sig === sigOf(urlStack[c])) c++;
+        for (var i = shownStack.length - 1; i >= c; i--) {
+            var b = shownStack[i].back;
+            if (b && b.parentNode) b.parentNode.removeChild(b);
+            shownStack.pop();
+        }
+        for (var j = c; j < urlStack.length; j++) {
+            _lastBackdrop = null;
+            dispatchModal(urlStack[j]);
+            shownStack.push({ sig: sigOf(urlStack[j]), back: _lastBackdrop });
+        }
     }
 
     function refreshTab() {
@@ -122,44 +158,59 @@
         route();
     }
 
-    /* Map an options object to the right modal builder. Generic verbs render
-     * from the schema; the gpo-* views are hand-built. */
-    function dispatchModal(key, opts) {
-        var presets = {};
-        Object.keys(opts).forEach(function (k) {
-            if (k !== "modal") presets[k] = opts[k];
-        });
+    /* Build the modal named by one stack descriptor. */
+    function dispatchModal(desc) {
+        var key = desc.modal, target = desc.target;
         if (SCHEMA && SCHEMA.verbs && SCHEMA.verbs[key]) {
+            var presets = {};
+            try { presets = JSON.parse(target || "{}"); } catch (e) { presets = {}; }
             verbForm(key, presets);
             return;
         }
         switch (key) {
-            case "gpo-compose":   gpoComposeModal(opts.target); break;
+            case "gpo-compose":   gpoComposeModal(target); break;
+            case "gpo-edit":      gpoEditModal(target); break;
             case "gpo-admx":      gpoAdmxModal(); break;
             case "gpo-templates": gpoTemplatesModal(); break;
-            case "gpo-prefs":     gpoPrefsModal(opts.gpo); break;
-            case "gpo-detail":    gpoDetailModal(opts.gpo); break;
-            default: closeModalDom();
+            case "gpo-prefs":     gpoPrefsModal(target); break;
+            case "gpo-detail":    gpoDetailModal(target); break;
+            default: /* unknown — leave nothing */ break;
         }
     }
 
     // ------------------------------------------------------------- modal DOM
-    /* Build a modal shell into #al-modal-host and hand `box` to the builder.
-     * Backdrop click and Escape both navigate the modal closed (URL-aware). */
-    function modal(title, bodyBuilder) {
+    /* Append a modal backdrop onto the stack host (does NOT clear — modals
+     * layer). Backdrop click / Escape pop the TOP modal via the URL. */
+    function modal(title, bodyBuilder, wide) {
         var host = document.getElementById("al-modal-host");
-        clear(host);
         var back = el("div", "al-backdrop");
-        var box = el("div", "al-modal");
+        back.style.zIndex = String(50 + host.children.length * 2);
+        var box = el("div", "al-modal" + (wide ? " wide" : ""));
         box.appendChild(el("h2", null, title));
-        back.addEventListener("click", function (ev) {
-            if (ev.target === back) closeModal();
-        });
+        back.addEventListener("click", function (ev) { if (ev.target === back) closeModal(); });
         back.appendChild(box);
         host.appendChild(back);
+        _lastBackdrop = back;
         bodyBuilder(box);
         return box;
     }
+
+    /* A self-closing overlay NOT tied to the URL stack — for transient result
+     * / error popups (e.g. an immediate no-arg verb run). */
+    function transientModal(title, bodyBuilder) {
+        var host = document.getElementById("al-modal-host");
+        var back = el("div", "al-backdrop");
+        back.style.zIndex = String(400 + host.children.length * 2);
+        var box = el("div", "al-modal");
+        box.appendChild(el("h2", null, title));
+        function close() { if (back.parentNode) back.parentNode.removeChild(back); }
+        back.addEventListener("click", function (ev) { if (ev.target === back) close(); });
+        back.appendChild(box); host.appendChild(back);
+        bodyBuilder(box, close);
+        return { close: close };
+    }
+
+    function closeModalDom() { clear(document.getElementById("al-modal-host")); }
 
     /* Render a verb result INTO an existing modal box (in place), so a form
      * modal becomes its own result view without a second navigation. */
@@ -182,7 +233,7 @@
      * pre-fill/hide fields. On success it swaps to the result in place. */
     function verbForm(verb, presets) {
         var spec = SCHEMA.verbs[verb];
-        if (!spec) { closeModalDom(); return; }
+        if (!spec) { return; }
         presets = presets || {};
         modal(spec.help.replace(/\.$/, ""), function (box) {
             if (spec.danger)
@@ -278,13 +329,23 @@
                 b.disabled = true;
                 run(verb, presets || {}).then(function (res) {
                     b.disabled = false;
-                    modal(verb, function (box) { fillResult(box, verb, res); });
+                    transientModal(verb, function (box, close) {
+                        if (res && res.password) {
+                            var w = el("div", "al-alert warn");
+                            w.textContent = "Generated password (shown once): ";
+                            w.appendChild(el("kbd", "al", res.password)); box.appendChild(w);
+                        }
+                        box.appendChild(el("pre", "al-log", JSON.stringify(res, null, 2)));
+                        var ok = el("button", "al-btn", "Close");
+                        ok.addEventListener("click", function () { close(); refreshTab(); });
+                        box.appendChild(ok);
+                    });
                 }).catch(function (e) {
                     b.disabled = false;
-                    modal(verb + " failed", function (box) {
+                    transientModal(verb + " failed", function (box, close) {
                         box.appendChild(el("div", "al-alert err", String(e)));
                         var ok = el("button", "al-btn", "Close");
-                        ok.addEventListener("click", closeModalDom);
+                        ok.addEventListener("click", close);
                         box.appendChild(ok);
                     });
                 });
@@ -482,19 +543,24 @@
             var c = card("Group Policy objects (on " + r.pdc_emulator + ")", true);
             c.appendChild(tableOf(["GPO", "display name", "ver", "actions"], r.gpos.map(function (g) {
                 var box = el("div", "al-actions");
-                var compose = el("button", "al-btn", "compose");
+                var edit = el("button", "al-btn", "edit");
+                edit.addEventListener("click", function () {
+                    openModal("gpo-edit", { target: g.gpo });
+                });
+                box.appendChild(edit);
+                var compose = el("button", "al-btn secondary", "compose");
                 compose.addEventListener("click", function () {
                     openModal("gpo-compose", { target: g.gpo });
                 });
                 box.appendChild(compose);
                 var detail = el("button", "al-btn secondary", "settings");
                 detail.addEventListener("click", function () {
-                    openModal("gpo-detail", { gpo: g.gpo });
+                    openModal("gpo-detail", { target: g.gpo });
                 });
                 box.appendChild(detail);
                 var prefs = el("button", "al-btn secondary", "preferences");
                 prefs.addEventListener("click", function () {
-                    openModal("gpo-prefs", { gpo: g.gpo });
+                    openModal("gpo-prefs", { target: g.gpo });
                 });
                 box.appendChild(prefs);
                 box.appendChild(actionButton("backup", "gpo-backup", { gpo: g.gpo }));
@@ -687,7 +753,7 @@
      * add rows; Apply is surgical (adds/edits merge via gpo load, removed
      * current entries are removed, preferences set via gpo manage). */
     function gpoComposeModal(target) {
-        if (!target) { closeModalDom(); return; }
+        if (!target) { return; }
         var working = [];          // {id, keyname, valuename, class, type, data, origin, dirty}
         var removed = [];          // current entries the user removed
         var prefs = [];            // staged preference ops
@@ -983,6 +1049,182 @@
         return chain.then(function () { return results; });
     }
 
+    /* Build a registry tree {class -> node} from flat entries. A node is
+     * {label, fullKey, cls, children:{seg:node}, values:[entry]}; a value
+     * attaches to the node for its full key (which may also have children). */
+    function buildRegTree(entries) {
+        var root = {};
+        entries.forEach(function (e) {
+            if (!root[e.class]) root[e.class] = { label: e.class, fullKey: "", cls: e.class, children: {}, values: [], depth: 0 };
+            var node = root[e.class], path = "";
+            e.keyname.split("\\").forEach(function (s) {
+                if (!s) return;
+                path = path ? path + "\\" + s : s;
+                if (!node.children[s]) node.children[s] = { label: s, fullKey: path, cls: e.class, children: {}, values: [], depth: node.depth + 1 };
+                node = node.children[s];
+            });
+            node.values.push(e);
+        });
+        return root;
+    }
+
+    /* The GPO edit modal — a two-pane editor: a registry setting TREE on the
+     * left (default width 500, draggable splitter), the VALUE LIST for the
+     * selected key on the right (the larger pane). Opens as a wide, stacked
+     * modal; its own "Advanced compose" button stacks the compose modal on top
+     * (the URL then carries both modal/target pairs). */
+    function gpoEditModal(target) {
+        if (!target) { return; }
+        var working = [], removed = [], seq = 0, selected = null, expanded = {};
+        function nid() { return "e" + (seq++); }
+
+        modal("Edit Group Policy", function (box) {
+            box.appendChild(el("div", "hint", "GPO: ")).appendChild(el("kbd", "al", target));
+            var panes = el("div", "al-edit-panes");
+            var treePane = el("div", "al-edit-tree"); treePane.style.width = "500px";
+            var splitter = el("div", "al-edit-splitter");
+            var listPane = el("div", "al-edit-list");
+            panes.appendChild(treePane); panes.appendChild(splitter); panes.appendChild(listPane);
+            box.appendChild(panes);
+
+            // draggable splitter — the tree default width is 500px
+            splitter.addEventListener("mousedown", function (ev) {
+                ev.preventDefault();
+                var startX = ev.clientX, startW = treePane.offsetWidth;
+                function move(e) {
+                    var w = Math.max(220, Math.min(900, startW + (e.clientX - startX)));
+                    treePane.style.width = w + "px";
+                }
+                function up() { document.removeEventListener("mousemove", move); document.removeEventListener("mouseup", up); }
+                document.addEventListener("mousemove", move); document.addEventListener("mouseup", up);
+            });
+
+            function drawTree() {
+                clear(treePane);
+                if (!working.length) { treePane.appendChild(el("div", "hint", "no settings")); return; }
+                var tree = buildRegTree(working);
+                Object.keys(tree).sort().forEach(function (cls) { renderNode(tree[cls]); });
+                function renderNode(node) {
+                    var hasKids = Object.keys(node.children).length > 0;
+                    var row = el("div", "al-tree-row");
+                    row.style.paddingLeft = (node.depth * 14 + 4) + "px";
+                    var isSel = selected && selected.cls === node.cls && selected.fullKey === node.fullKey && node.values.length;
+                    if (isSel) row.className = "al-tree-row sel";
+                    var tog = el("span", "al-tree-tog", hasKids ? (expanded[node.cls + node.fullKey] ? "▾" : "▸") : "");
+                    if (hasKids) tog.addEventListener("click", function (e) {
+                        e.stopPropagation(); expanded[node.cls + node.fullKey] = !expanded[node.cls + node.fullKey]; drawTree();
+                    });
+                    row.appendChild(tog);
+                    var lab = el("span", "al-tree-label", node.label);
+                    row.appendChild(lab);
+                    if (node.values.length) row.appendChild(badge(String(node.values.length), "dim"));
+                    row.addEventListener("click", function () {
+                        if (node.values.length) { selected = { cls: node.cls, fullKey: node.fullKey }; drawTree(); drawList(); }
+                        else if (hasKids) { expanded[node.cls + node.fullKey] = !expanded[node.cls + node.fullKey]; drawTree(); }
+                    });
+                    treePane.appendChild(row);
+                    if (hasKids && expanded[node.cls + node.fullKey])
+                        Object.keys(node.children).sort().forEach(function (k) { renderNode(node.children[k]); });
+                }
+            }
+
+            function valuesFor(sel) {
+                return working.filter(function (e) { return sel && e.class === sel.cls && e.keyname === sel.fullKey; });
+            }
+            function drawList() {
+                clear(listPane);
+                if (!selected) { listPane.appendChild(el("div", "hint", "select a key in the tree to see its values")); return; }
+                listPane.appendChild(el("div", "al-edit-keyhdr"))
+                    .appendChild(el("kbd", "al", selected.cls + "  " + selected.fullKey));
+                var vals = valuesFor(selected);
+                listPane.appendChild(tableOf(["value", "type", "data", ""], vals.map(function (e) {
+                    var acts = el("div", "al-actions");
+                    var edit = el("button", "al-btn secondary", "edit");
+                    edit.addEventListener("click", function () { editValue(e); });
+                    var rm = el("button", "al-btn danger", "remove");
+                    rm.addEventListener("click", function () {
+                        if (e.origin === "current") removed.push(e);
+                        working = working.filter(function (x) { return x.id !== e.id; });
+                        if (!valuesFor(selected).length) selected = null;
+                        drawTree(); drawList();
+                    });
+                    acts.appendChild(edit); acts.appendChild(rm);
+                    var pv = el("div", "al-wrapcell"); pv.textContent = dataPreview(e.type, e.data);
+                    return [e.valuename, e.type, pv, acts];
+                })));
+                var add = el("button", "al-btn secondary", "Add value to this key");
+                add.addEventListener("click", function () { addValue(); });
+                listPane.appendChild(add);
+            }
+            function editValue(e) {
+                clear(listPane);
+                listPane.appendChild(el("div", "hint", "Editing " + e.class + "  " + e.keyname + "\\" + e.valuename));
+                var ve = valueEditor(e.type, e.data);
+                listPane.appendChild(ve.node);
+                var row = el("div", "row");
+                var save = el("button", "al-btn", "Save value");
+                save.addEventListener("click", function () {
+                    var v = ve.getValue(); e.type = v.type; e.data = v.data;
+                    if (e.origin === "current") e.dirty = true; drawTree(); drawList();
+                });
+                var back = el("button", "al-btn secondary", "Cancel"); back.addEventListener("click", drawList);
+                row.appendChild(save); row.appendChild(back); listPane.appendChild(row);
+            }
+            function addValue() {
+                clear(listPane);
+                listPane.appendChild(el("div", "hint", "New value under " + selected.cls + "  " + selected.fullKey));
+                var vn = el("input"); vn.placeholder = "valueName";
+                listPane.appendChild(el("label", null, "value name")); listPane.appendChild(vn);
+                var ve = valueEditor("REG_SZ", "");
+                listPane.appendChild(ve.node);
+                var row = el("div", "row");
+                var save = el("button", "al-btn", "Add");
+                save.addEventListener("click", function () {
+                    if (!vn.value) return;
+                    var v = ve.getValue();
+                    working.push({ id: nid(), keyname: selected.fullKey, valuename: vn.value, class: selected.cls, type: v.type, data: v.data, origin: "added" });
+                    drawTree(); drawList();
+                });
+                var back = el("button", "al-btn secondary", "Cancel"); back.addEventListener("click", drawList);
+                row.appendChild(save); row.appendChild(back); listPane.appendChild(row);
+            }
+
+            var alertBox = el("div", "al-alert err"); box.appendChild(alertBox);
+            var actions = el("div", "row");
+            var adv = el("button", "al-btn secondary", "Advanced compose ▸");
+            adv.addEventListener("click", function () { openModal("gpo-compose", { target: target }); }); // STACKS on top
+            var apply = el("button", "al-btn", "Apply changes");
+            apply.addEventListener("click", function () {
+                alertBox.textContent = "";
+                var applyList = working.filter(function (e) { return e.origin === "added" || e.dirty; })
+                    .map(function (e) { return { keyname: e.keyname, valuename: e.valuename, class: e.class, type: e.type, data: e.data }; });
+                var removeList = removed.map(function (e) { return { keyname: e.keyname, valuename: e.valuename, class: e.class }; });
+                if (!applyList.length && !removeList.length) { alertBox.textContent = "No changes to apply."; return; }
+                apply.disabled = true;
+                applyCompose(target, applyList, removeList, []).then(function (results) {
+                    clear(box); box.appendChild(el("h2", null, "Applied to GPO"));
+                    box.appendChild(el("pre", "al-log", JSON.stringify(results, null, 2)));
+                    var ok = el("button", "al-btn", "Close");
+                    ok.addEventListener("click", function () { closeModal(); refreshTab(); });
+                    box.appendChild(ok);
+                }).catch(function (e) { apply.disabled = false; alertBox.textContent = String(e); });
+            });
+            var cancel = el("button", "al-btn secondary", "Close"); cancel.addEventListener("click", closeModal);
+            actions.appendChild(apply); actions.appendChild(adv); actions.appendChild(cancel);
+            box.appendChild(actions);
+
+            treePane.appendChild(el("div", "al-loading", "loading settings…"));
+            run("gpo-registry-list", { gpo: target }).then(function (r) {
+                (r.settings || []).forEach(function (s) {
+                    working.push({ id: nid(), keyname: s.keyname, valuename: s.valuename, class: s.class, type: s.type, data: s.data, origin: "current", dirty: false });
+                });
+                // expand the class roots by default
+                Object.keys(buildRegTree(working)).forEach(function (cls) { expanded[cls + ""] = true; });
+                drawTree(); drawList();
+            }).catch(function (e) { clear(treePane); treePane.appendChild(el("div", "al-alert err", String(e))); });
+        }, true);   // wide
+    }
+
     function gpoAdmxModal() {
         modal("ADMX central store", function (box) {
             var loadBtn = el("button", "al-btn", "Load samba ADMX into SYSVOL");
@@ -1038,7 +1280,7 @@
     }
 
     function gpoPrefsModal(gpo) {
-        if (!gpo) { closeModalDom(); return; }
+        if (!gpo) { return; }
         modal("GPO preferences (CSEs)", function (box) {
             box.appendChild(el("div", "hint", "GPO: ")).appendChild(el("kbd", "al", gpo));
             var cse = el("select");
@@ -1077,7 +1319,7 @@
     }
 
     function gpoDetailModal(gpo) {
-        if (!gpo) { closeModalDom(); return; }
+        if (!gpo) { return; }
         modal("GPO settings", function (box) {
             box.appendChild(el("div", "hint", "GPO: ")).appendChild(el("kbd", "al", gpo));
             var out = el("div"); out.appendChild(el("div", "al-loading", "loading…"));
@@ -1242,6 +1484,9 @@
             document.getElementById("al-identity").textContent =
                 v.realm + " — " + v.domain + " (helper v" + v.version + ")";
             cockpit.addEventListener("locationchanged", route);
+            document.addEventListener("keydown", function (e) {
+                if (e.key === "Escape" && shownStack.length) closeModal();   // pop the top modal
+            });
             route();     // render whatever the URL says (deep-link friendly)
         }).catch(function (e) {
             var m = content();

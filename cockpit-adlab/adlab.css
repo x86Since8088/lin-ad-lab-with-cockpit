@@ -146,3 +146,24 @@ kbd.al { background: var(--al-code-bg); border: 1px solid var(--al-border);
     color: var(--al-ink); }
 .al-vmode { display: flex; gap: 0.4rem; margin: 0.2rem 0; }
 .al-vmode .al-btn { width: auto; padding: 0.2rem 0.7rem; }
+
+/* wide modal (two-pane GPO editor) */
+.al-modal.wide { width: min(1120px, 95vw); }
+
+/* GPO edit modal — tree (left, default 500px, resizable) + value list (right) */
+.al-edit-panes { display: flex; align-items: stretch; gap: 0; height: 60vh;
+    border: 1px solid var(--al-border); border-radius: 6px; overflow: hidden; margin: 0.5rem 0; }
+.al-edit-tree { width: 500px; min-width: 220px; max-width: 900px; overflow: auto;
+    background: var(--al-card); padding: 0.4rem 0; flex-shrink: 0; }
+.al-edit-splitter { width: 6px; cursor: col-resize; background: var(--al-border);
+    flex-shrink: 0; }
+.al-edit-splitter:hover { background: var(--al-accent); }
+.al-edit-list { flex: 1 1 auto; overflow: auto; padding: 0.6rem 0.8rem; min-width: 0; }
+.al-edit-keyhdr { margin-bottom: 0.4rem; }
+
+.al-tree-row { display: flex; align-items: center; gap: 0.35rem; padding: 0.18rem 0.4rem;
+    font-size: 0.85rem; cursor: pointer; white-space: nowrap; }
+.al-tree-row:hover { background: var(--al-code-bg); }
+.al-tree-row.sel { background: var(--al-accent-soft); }
+.al-tree-tog { display: inline-block; width: 1rem; text-align: center; color: var(--al-sub); }
+.al-tree-label { overflow: hidden; text-overflow: ellipsis; }

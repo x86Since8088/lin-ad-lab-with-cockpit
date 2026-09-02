@@ -180,3 +180,66 @@ test('compose modal: value editor has Hex/Text modes for binary; edit + preferen
     await expect(f.locator('.al-modal')).toContainText('Blob', { timeout: 30000 });
     await expect(f.locator('.al-modal')).toContainText('REG_BINARY');
 });
+
+function modalCount(hash) { return (hash.match(/modal=/g) || []).length; }
+
+test('stacked modals: edit -> Advanced compose puts BOTH in the URL; Back pops one level', async ({ page }) => {
+    test.setTimeout(150000);
+    expect(GPO).toBeTruthy();
+    await login(page);
+    const f = await frame(page);
+    await expect(f.locator('#al-identity')).toContainText('AD.EDT1.LAB', { timeout: 45000 });
+    await f.locator('#al-tabs button', { hasText: 'Group Policy' }).click();
+    await expect(f.locator('#al-content')).toContainText(GPO, { timeout: 45000 });
+
+    // open the two-pane edit modal
+    await f.locator('table.al tr', { hasText: GPO }).locator('button', { hasText: 'edit' }).click();
+    await expect.poll(() => frameHash(page), { timeout: 15000 }).toContain('modal=gpo-edit');
+    await expect(f.locator('.al-modal', { hasText: 'Edit Group Policy' })).toBeVisible({ timeout: 15000 });
+    await expect(f.locator('.al-backdrop')).toHaveCount(1);
+
+    // stack the compose modal on TOP
+    await f.locator('.al-modal button', { hasText: 'Advanced compose' }).click();
+    await expect(f.locator('.al-modal', { hasText: 'Compose Group Policy' })).toBeVisible({ timeout: 15000 });
+    // URL now carries TWO modal params (gpo-edit + gpo-compose), and two backdrops stack
+    await expect.poll(() => frameHash(page).then(modalCount), { timeout: 15000 }).toBe(2);
+    expect(await frameHash(page)).toContain('gpo-edit');
+    expect(await frameHash(page)).toContain('gpo-compose');
+    await expect(f.locator('.al-backdrop')).toHaveCount(2);
+
+    // Back pops the TOP (compose) only — edit remains, one modal in the URL
+    await page.goBack();
+    await expect.poll(() => frameHash(page).then(modalCount), { timeout: 15000 }).toBe(1);
+    await expect(f.locator('.al-backdrop')).toHaveCount(1);
+    await expect(f.locator('.al-modal', { hasText: 'Edit Group Policy' })).toBeVisible();
+
+    // Back again closes edit
+    await page.goBack();
+    await expect.poll(() => frameHash(page).then(modalCount), { timeout: 15000 }).toBe(0);
+    await expect(f.locator('.al-backdrop')).toHaveCount(0);
+});
+
+test('GPO edit modal: two-pane tree (default 500px) + value list', async ({ page }) => {
+    test.setTimeout(150000);
+    expect(GPO).toBeTruthy();
+    await login(page);
+    const f = await frame(page);
+    await expect(f.locator('#al-identity')).toContainText('AD.EDT1.LAB', { timeout: 45000 });
+    await f.locator('#al-tabs button', { hasText: 'Group Policy' }).click();
+    await expect(f.locator('#al-content')).toContainText(GPO, { timeout: 45000 });
+    await f.locator('table.al tr', { hasText: GPO }).locator('button', { hasText: 'edit' }).click();
+
+    const editModal = f.locator('.al-modal', { hasText: 'Edit Group Policy' });
+    await expect(editModal.locator('.al-edit-panes')).toBeVisible({ timeout: 15000 });
+    // tree pane default width is 500px
+    const treeW = await editModal.locator('.al-edit-tree').evaluate((el) => el.offsetWidth);
+    expect(treeW).toBeGreaterThan(480);
+    expect(treeW).toBeLessThan(520);
+
+    // the seeded MACHINE key is in the tree; drill to it and see the value on the right
+    await expect(editModal.locator('.al-edit-tree')).toContainText('MACHINE', { timeout: 30000 });
+    await editModal.locator('.al-tree-row', { hasText: 'Software' }).click();
+    await editModal.locator('.al-tree-row', { hasText: 'Adlab' }).click();
+    await editModal.locator('.al-tree-row', { hasText: 'Seed' }).click();
+    await expect(editModal.locator('.al-edit-list')).toContainText('Seeded', { timeout: 15000 });
+});
