@@ -37,7 +37,7 @@ wait_for_dc() {   # $1 = ip, $2 = label
 echo "== DC 1 (provision) =="
 n=$(dc_name 1); ip=$(dc_ip 1)
 podman rm -f "$n" >/dev/null 2>&1 || true
-podman run -d --name "$n" --hostname "$n" \
+podman run -d --init --name "$n" --hostname "$n" \
     --network "$NET" --ip "$ip" \
     --cap-add SYS_ADMIN,NET_ADMIN,SYS_TIME --security-opt seccomp=unconfined \
     -v "$PASS_MOUNT" $(dc_state_args 1) \
@@ -52,7 +52,7 @@ for i in $(seq 2 "$DC_COUNT"); do
     n=$(dc_name $i); ip=$(dc_ip $i)
     echo "== DC $i (join as replication partner) =="
     podman rm -f "$n" >/dev/null 2>&1 || true
-    podman run -d --name "$n" --hostname "$n" \
+    podman run -d --init --name "$n" --hostname "$n" \
         --network "$NET" --ip "$ip" \
         --cap-add SYS_ADMIN,NET_ADMIN,SYS_TIME --security-opt seccomp=unconfined \
         -v "$PASS_MOUNT" $(dc_state_args "$i") \
@@ -68,7 +68,7 @@ echo "== clients =="
 for i in $(seq 1 "$CLIENT_COUNT"); do
     n=$(client_name $i); ip=$(client_ip $i)
     podman rm -f "$n" >/dev/null 2>&1 || true
-    podman run -d --name "$n" --hostname "$n" \
+    podman run -d --init --name "$n" --hostname "$n" \
         --network "$NET" --ip "$ip" \
         --cap-add SYS_ADMIN --security-opt seccomp=unconfined \
         -v "$PASS_MOUNT" $(client_state_args "$i") \

@@ -49,6 +49,11 @@ rsyncd_start() {
     local src="$1" ip i err
     ip="$(dc_ip_of "$src")"
 
+    # Persistent daemon (see rsyncd_stop): reuse it if already running.
+    if podman exec "$src" pgrep -f 'rsync --daemon' >/dev/null 2>&1; then
+        return 0
+    fi
+
     # Write the config from the host. Do NOT nest a heredoc inside a heredoc
     # fed to `bash -s`: the inner one competes with the outer for stdin and the
     # file silently never appears.
@@ -80,10 +85,10 @@ CONF
 }
 
 rsyncd_stop() {
-    local src="$1"
-    podman exec "$src" bash -c \
-        "[ -s '$RSYNC_PIDFILE' ] && kill \"\$(cat '$RSYNC_PIDFILE')\" 2>/dev/null;
-         rm -f '$RSYNC_PIDFILE' '$RSYNC_CONF'; exit 0" >/dev/null 2>&1
+    # The rsync daemon is now PERSISTENT: it reaps its own per-connection
+    # children, so leaving it running avoids orphaning a zombie under PID-1
+    # samba every cycle (samba does not reap orphans). Read-only and
+    # subnet-restricted; it dies with the container.
     return 0
 }
 
