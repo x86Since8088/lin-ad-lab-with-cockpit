@@ -425,7 +425,11 @@ class TestHandlers(Base):
         argv = self.fake.argv_containing("gpo create")[0]
         joined = " ".join(argv)
         self.assertIn("/run/adminpass", joined)      # password read in-container
-        self.assertIn("rm -f /run/adlab.auth", joined)  # authfile cleaned up
+        # authfile is UNIQUE per invocation (mktemp) — no shared-path race —
+        # and is cleaned up via the per-call variable, not a fixed path.
+        self.assertIn("mktemp /run/adlab.auth.XXXXXX", joined)
+        self.assertIn('rm -f "$af"', joined)
+        self.assertNotIn("rm -f /run/adlab.auth ", joined)  # not the old fixed path
         self.assertNotIn(mod.LAB["ADMIN_PASS_FILE"], joined)
 
     def test_dns_add_targets_pdc(self):

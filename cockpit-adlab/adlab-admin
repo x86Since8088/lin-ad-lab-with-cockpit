@@ -152,11 +152,16 @@ class Fail(Exception):
 # Run a samba-tool command that needs domain credentials. The password moves
 # via a mode-600 authfile created and removed INSIDE the container in one
 # bash -c; the host-side admin password file is mounted at /run/adminpass.
+# The authfile path is UNIQUE per invocation (mktemp) so that two concurrent
+# credentialed verbs against the same DC can never have one's trailing `rm -f`
+# delete the file the other's samba-tool is still reading — a latent race a
+# stress probe surfaced (unreached in practice because podman-exec overhead
+# serialises the critical section, but eliminated here at zero cost).
 AUTH_WRAP = (
-    "umask 077; "
+    "umask 077; af=$(mktemp /run/adlab.auth.XXXXXX); "
     'printf "username=Administrator\\npassword=%s\\ndomain={nb}\\n" '
-    '"$(cat /run/adminpass)" > /run/adlab.auth; '
-    "{cmd} -A /run/adlab.auth; rc=$?; rm -f /run/adlab.auth; exit $rc"
+    '"$(cat /run/adminpass)" > "$af"; '
+    '{cmd} -A "$af"; rc=$?; rm -f "$af"; exit $rc'
 )
 
 def podman_auth(ctr, cmd_str, timeout=120, stdin=None):
