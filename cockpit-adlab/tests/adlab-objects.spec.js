@@ -163,6 +163,7 @@ test('context menus expose tree and object actions (New / Rename / Delete)', asy
     await expect(f.locator('.al-ctxmenu')).toContainText('New');
     await expect(f.locator('.al-ctxmenu')).toContainText('Delete');
     await expect(f.locator('.al-ctxmenu')).toContainText('Properties');
+    await expect(f.locator('.al-ctxmenu')).toContainText('Link a GPO');   // GPMC integration
 
     // hover "New" -> submenu of object classes; open the New OU flow, then cancel
     await f.locator('.al-ctxitem.has-sub', { hasText: 'New' }).hover();

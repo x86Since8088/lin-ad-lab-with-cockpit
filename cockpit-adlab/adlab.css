@@ -290,3 +290,7 @@ table.al-objtable th.al-kebhdr { width: 1%; }
 .al-ctxmenu.sub-left .al-ctxsub { left: auto; right: 100%; }
 .al-ctxitem:focus { background: var(--al-accent-soft); outline: none; }
 .al-ctxitem.danger:focus { background: var(--al-err-bg); }
+
+/* clickable DN values (jump to the referenced object) */
+.al-dnlink { color: var(--al-accent); text-decoration: none; cursor: pointer; }
+.al-dnlink:hover { text-decoration: underline; }

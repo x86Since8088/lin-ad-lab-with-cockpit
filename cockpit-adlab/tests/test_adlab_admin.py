@@ -1272,6 +1272,20 @@ class TestObjectVerbs(Base):
         self.assertIn("protected", out["error"])
         self.assertFalse(self.fake.argv_containing("ldbdel"))      # never deleted
 
+    def test_object_get_protection_is_opt_in(self):
+        # object-get must not spend a dsacl subprocess unless asked (perf)
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a and "base" in a,
+                     out="dn: OU=x,DC=ad,DC=edt1,DC=lab\nobjectClass: top\nobjectClass: organizationalUnit\nou: x\n")
+        self.fake.on(lambda a: "dsacl" in a and "get" in a, out=self._PROTECTED_SDDL)
+        rc, out = self.call_main(["object-get", "--dn", "OU=x,DC=ad,DC=edt1,DC=lab"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("protected", out)                        # not computed by default
+        self.assertFalse(self.fake.argv_containing("dsacl", "get"))
+        rc, out = self.call_main(["object-get", "--dn", "OU=x,DC=ad,DC=edt1,DC=lab", "--protected", "yes"])
+        self.assertTrue(out["protected"])
+        self.assertTrue(self.fake.argv_containing("dsacl", "get"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

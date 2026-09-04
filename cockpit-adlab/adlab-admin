@@ -1076,11 +1076,14 @@ def v_object_get(a):
     e = ents[0]
     at = e["attrs"]
     cls = at.get("objectClass", [])
-    return {"dn": e["dn"],
-            "name": (at.get("name") or at.get("cn") or [_rdn(dn)])[0],
-            "classes": cls, "structural_class": _structural(cls),
-            "protected": _is_protected(d, e["dn"]),
-            "attrs": at, "b64": e["b64"]}
+    result = {"dn": e["dn"],
+              "name": (at.get("name") or at.get("cn") or [_rdn(dn)])[0],
+              "classes": cls, "structural_class": _structural(cls),
+              "attrs": at, "b64": e["b64"]}
+    # the protection lookup is an extra dsacl subprocess — only when asked for
+    if (a.get("protected") or "").lower() in ("1", "yes", "true"):
+        result["protected"] = _is_protected(d, e["dn"])
+    return result
 
 def v_object_schema(a):
     d = first_up_dc()
@@ -2193,7 +2196,8 @@ VERBS = {
                                arg("limit", "int", required=False)]},
     "object-get":    {"fn": v_object_get, "group": "objects",
                       "help": "One object's full attribute set (drives the preview + Attribute Editor).",
-                      "args": [arg("dn"), arg("acl", required=False, help_="yes = include nTSecurityDescriptor")]},
+                      "args": [arg("dn"), arg("acl", required=False, help_="yes = include nTSecurityDescriptor"),
+                               arg("protected", required=False, help_="yes = also report the accidental-deletion flag")]},
     "object-schema": {"fn": v_object_schema, "group": "objects",
                       "help": "Schema-driven tabbed form layout + full allowed-attribute catalog for a class/object.",
                       "args": [arg("class", required=False, help_="lDAPDisplayName of the class"),

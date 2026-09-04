@@ -29,8 +29,6 @@
     var shownStack = [];           // [{sig, back}] — the open modal backdrops,
                                    // reconciled against the URL modal stack
     var _lastBackdrop = null;      // set by modal() so the reconciler can track it
-    // modals rendered wide (two-pane); everything else uses the default width
-    var WIDE_MODALS = { "gpo-edit": true, "object-edit": true, "object-attrs": true };
 
     // ---------------------------------------------------------------- utils
     function el(tag, cls, text) {
@@ -144,6 +142,7 @@
         for (var i = shownStack.length - 1; i >= c; i--) {
             var b = shownStack[i].back;
             if (b && b.parentNode) b.parentNode.removeChild(b);
+            if (b && b._restore) b._restore();   // return focus to the trigger / parent modal
             shownStack.pop();
         }
         for (var j = c; j < urlStack.length; j++) {
@@ -181,6 +180,35 @@
     }
 
     // ------------------------------------------------------------- modal DOM
+    /* Dialog a11y for a modal: role/aria, focus into the dialog, Tab-trap, and
+     * (for transient modals) Escape-to-close + focus restore. Returns a restore
+     * function. closeFn is null for URL-stack modals (Escape is the router's). */
+    var _modalTitleSeq = 0;
+    function _wireModalA11y(back, box, h2, closeFn) {
+        box.setAttribute("role", "dialog");
+        box.setAttribute("aria-modal", "true");
+        h2.id = "al-mtitle-" + (++_modalTitleSeq);
+        box.setAttribute("aria-labelledby", h2.id);
+        box.tabIndex = -1;
+        var prev = document.activeElement;
+        function focusables() {
+            return [].slice.call(box.querySelectorAll(
+                'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),' +
+                'textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'))
+                .filter(function (n) { return n.offsetParent !== null; });
+        }
+        setTimeout(function () { var f = focusables(); (f[0] || box).focus(); }, 0);
+        back.addEventListener("keydown", function (ev) {
+            if (ev.key === "Tab") {
+                var f = focusables(); if (!f.length) { ev.preventDefault(); box.focus(); return; }
+                var first = f[0], last = f[f.length - 1], a = document.activeElement;
+                if (ev.shiftKey && (a === first || a === box)) { ev.preventDefault(); last.focus(); }
+                else if (!ev.shiftKey && a === last) { ev.preventDefault(); first.focus(); }
+            } else if (ev.key === "Escape" && closeFn) { ev.preventDefault(); ev.stopPropagation(); closeFn(); }
+        });
+        return function () { if (prev && prev.focus) { try { prev.focus(); } catch (e) { /* gone */ } } };
+    }
+
     /* Append a modal backdrop onto the stack host (does NOT clear — modals
      * layer). Backdrop click / Escape pop the TOP modal via the URL. */
     function modal(title, bodyBuilder, wide) {
@@ -188,12 +216,13 @@
         var back = el("div", "al-backdrop");
         back.style.zIndex = String(50 + host.children.length * 2);
         var box = el("div", "al-modal" + (wide ? " wide" : ""));
-        box.appendChild(el("h2", null, title));
+        var h2 = el("h2", null, title); box.appendChild(h2);
         back.addEventListener("click", function (ev) { if (ev.target === back) closeModal(); });
         back.appendChild(box);
         host.appendChild(back);
         _lastBackdrop = back;
         bodyBuilder(box);
+        back._restore = _wireModalA11y(back, box, h2, null);   // Escape handled by router; restore on teardown
         return box;
     }
 
@@ -204,11 +233,13 @@
         var back = el("div", "al-backdrop");
         back.style.zIndex = String(400 + host.children.length * 2);
         var box = el("div", "al-modal");
-        box.appendChild(el("h2", null, title));
-        function close() { if (back.parentNode) back.parentNode.removeChild(back); }
+        var h2 = el("h2", null, title); box.appendChild(h2);
+        var restore = null;
+        function close() { if (back.parentNode) back.parentNode.removeChild(back); if (restore) restore(); }
         back.addEventListener("click", function (ev) { if (ev.target === back) close(); });
         back.appendChild(box); host.appendChild(back);
         bodyBuilder(box, close);
+        restore = _wireModalA11y(back, box, h2, close);   // Escape closes transients
         return { close: close };
     }
 
@@ -321,6 +352,9 @@
     /* A button that opens a routed modal for a verb (URL-reflected). For a
      * no-argument, non-danger verb it runs immediately and shows the result. */
     function actionButton(label, verb, presets, cls) {
+        // destructive verbs get the danger (red) style automatically from the
+        // schema, so 'delete'/'unlink'/'demote'/'remove' never look benign.
+        if (!cls && SCHEMA && SCHEMA.verbs[verb] && SCHEMA.verbs[verb].danger) cls = "danger";
         var b = el("button", "al-btn " + (cls || "secondary"), label);
         b.addEventListener("click", function () {
             var spec = SCHEMA.verbs[verb];
@@ -388,6 +422,23 @@
         c.appendChild(el("div", "al-alert err", String(err)));
         return c;
     }
+    /* Reserve a titled card with a loading body at a fixed grid position, then
+     * fill its body in place when the data lands — no blank flash, no reflow,
+     * deterministic order regardless of which run() resolves first. */
+    function slotCard(grid, title, wide) {
+        var c = card(title, wide);
+        var h3 = c.querySelector("h3");
+        var body = el("div"); body.appendChild(el("div", "al-loading", "loading…"));
+        c.appendChild(body); grid.appendChild(c);
+        // fill(node, newTitle?) — newTitle updates the header (for count-bearing cards)
+        return function (node, newTitle) {
+            if (newTitle && h3) h3.textContent = newTitle;
+            clear(body); if (node) body.appendChild(node);
+        };
+    }
+    function emptyOr(rows, headers, cells, emptyText) {
+        return rows.length ? tableOf(headers, rows.map(cells)) : el("div", "hint", emptyText);
+    }
 
     // ---------------------------------------------------------------- tabs
     var TABS = [
@@ -417,51 +468,48 @@
     // ------------------------------------------------------------ overview
     function renderOverview() {
         var m = content();
-        var grid = el("div", "al-grid");
-        m.appendChild(grid);
+        var grid = el("div", "al-grid"); m.appendChild(grid);
+        var fDomain = slotCard(grid, "Domain");
+        var fFsmo = slotCard(grid, "FSMO roles");
+        var fHealth = slotCard(grid, "Replication health", true);
+        var fSysvol = slotCard(grid, "SYSVOL");
+        var fContainers = slotCard(grid, "Containers", true);
+        function errNode(e) { return el("div", "al-alert err", String(e)); }
         run("domain-info").then(function (r) {
-            var c = card("Domain");
             var info = r.info || {};
             var rows = ["forest", "domain", "netbios_domain", "dc_name", "server_site"]
                 .filter(function (k) { return info[k]; })
                 .map(function (k) { return [k.replace(/_/g, " "), info[k]]; });
             if (info.levels && info.levels.forest_function_level)
                 rows.push(["forest level", info.levels.forest_function_level]);
-            c.appendChild(tableOf(["", ""], rows));
-            grid.insertBefore(c, grid.firstChild);
-        }).catch(function (e) { grid.appendChild(failCard("Domain", e)); });
+            fDomain(tableOf(["", ""], rows));
+        }).catch(function (e) { fDomain(errNode(e)); });
         run("fsmo-show").then(function (r) {
-            var c = card("FSMO roles");
-            c.appendChild(tableOf(["role", "holder"], Object.keys(r.roles).sort().map(function (k) {
+            fFsmo(tableOf(["role", "holder"], Object.keys(r.roles).sort().map(function (k) {
                 return [k.replace("MasterRole", ""), badge(r.roles[k], "ok")];
             })));
-            grid.appendChild(c);
-        }).catch(function (e) { grid.appendChild(failCard("FSMO roles", e)); });
+        }).catch(function (e) { fFsmo(errNode(e)); });
         run("health").then(function (r) {
-            var c = card("Replication health", true);
-            c.appendChild(tableOf(["DC", "state", "links", "failing links"], r.dcs.map(function (d) {
+            fHealth(tableOf(["DC", "state", "links", "failing links"], r.dcs.map(function (d) {
                 return [d.dc, badge(d.state, d.state === "running" ? "ok" : "err"), d.links,
                         d.replication_ok === null ? badge("n/a") :
                             badge(String(d.failures), d.failures === 0 ? "ok" : "err")];
             })));
-            grid.appendChild(c);
-        }).catch(function (e) { grid.appendChild(failCard("Replication health", e)); });
+        }).catch(function (e) { fHealth(errNode(e)); });
         run("sysvol-status").then(function (r) {
-            var c = card("SYSVOL");
-            c.appendChild(r.identical
+            var box = el("div");
+            box.appendChild(r.identical
                 ? el("div", "al-alert ok", "SYSVOL is byte-identical on every DC.")
                 : el("div", "al-alert err", "SYSVOL DIFFERS between DCs — run a sync."));
-            c.appendChild(tableOf(["DC", "files", "content hash"],
+            box.appendChild(tableOf(["DC", "files", "content hash"],
                 r.dcs.map(function (d) { return [d.dc, d.files, d.hash || d.error]; })));
-            grid.appendChild(c);
-        }).catch(function (e) { grid.appendChild(failCard("SYSVOL", e)); });
+            fSysvol(box);
+        }).catch(function (e) { fSysvol(errNode(e)); });
         run("status").then(function (r) {
-            var c = card("Containers", true);
-            c.appendChild(tableOf(["name", "kind", "ip", "state"], r.containers.map(function (x) {
+            fContainers(tableOf(["name", "kind", "ip", "state"], r.containers.map(function (x) {
                 return [x.name, x.kind, x.ip, badge(x.state, x.state === "running" ? "ok" : "err")];
             })));
-            grid.appendChild(c);
-        }).catch(function (e) { grid.appendChild(failCard("Containers", e)); });
+        }).catch(function (e) { fContainers(errNode(e)); });
     }
 
     // ------------------------------------------------------ users & groups
@@ -473,55 +521,55 @@
         acts.appendChild(actionButton("Create OU", "ou-create", {}));
         m.appendChild(acts);
         var grid = el("div", "al-grid"); m.appendChild(grid);
+        var fUsers = slotCard(grid, "Users", true);
+        var fGroups = slotCard(grid, "Groups", true);
+        var fOus = slotCard(grid, "Organizational units");
+        var fComputers = slotCard(grid, "Computers");
+        function errNode(e) { return el("div", "al-alert err", String(e)); }
         run("user-list").then(function (r) {
-            var c = card("Users (" + r.count + ")", true);
+            var box = el("div");
             var filter = el("input"); filter.type = "search"; filter.placeholder = "filter…";
-            filter.style.marginBottom = "0.5rem"; c.appendChild(filter);
-            var holder = el("div"); c.appendChild(holder);
+            filter.style.marginBottom = "0.5rem"; box.appendChild(filter);
+            var holder = el("div"); box.appendChild(holder);
             function draw() {
                 clear(holder);
                 var f = filter.value.toLowerCase();
                 var names = r.users.filter(function (u) { return !f || u.toLowerCase().indexOf(f) >= 0; }).slice(0, 200);
-                holder.appendChild(tableOf(["user", "actions"], names.map(function (u) {
-                    var box = el("div", "al-actions");
+                holder.appendChild(emptyOr(names, ["user", "actions"], function (u) {
+                    var b = el("div", "al-actions");
                     [["show", "user-show"], ["set password", "user-setpassword"],
                      ["disable", "user-disable"], ["enable", "user-enable"],
                      ["delete", "user-delete"]].forEach(function (p) {
-                        box.appendChild(actionButton(p[0], p[1], { name: u }));
+                        b.appendChild(actionButton(p[0], p[1], { name: u }));
                     });
-                    return [u, box];
-                })));
+                    return [u, b];
+                }, f ? "no users match the filter" : "no users"));
             }
             filter.addEventListener("input", draw); draw();
-            grid.appendChild(c);
-        }).catch(function (e) { grid.appendChild(failCard("Users", e)); });
+            fUsers(box, "Users (" + r.count + ")");
+        }).catch(function (e) { fUsers(errNode(e)); });
         run("group-list").then(function (r) {
-            var c = card("Groups (" + r.groups.length + ")", true);
-            c.appendChild(tableOf(["group", "actions"], r.groups.slice(0, 150).map(function (g) {
-                var box = el("div", "al-actions");
+            fGroups(emptyOr(r.groups.slice(0, 150), ["group", "actions"], function (g) {
+                var b = el("div", "al-actions");
                 [["members", "group-show"], ["add member", "group-add-member"],
                  ["remove member", "group-remove-member"], ["delete", "group-delete"]].forEach(function (p) {
                     var preset = p[1] === "group-show" ? { name: g } : { group: g };
-                    box.appendChild(actionButton(p[0], p[1], preset));
+                    b.appendChild(actionButton(p[0], p[1], preset));
                 });
-                return [g, box];
-            })));
-            grid.appendChild(c);
-        }).catch(function (e) { grid.appendChild(failCard("Groups", e)); });
+                return [g, b];
+            }, "no groups"), "Groups (" + r.groups.length + ")");
+        }).catch(function (e) { fGroups(errNode(e)); });
         run("ou-list").then(function (r) {
-            var c = card("Organizational units");
-            c.appendChild(tableOf(["OU", ""], r.ous.map(function (o) {
-                var box = el("div", "al-actions");
-                box.appendChild(actionButton("delete", "ou-delete", { dn: o }));
-                return [o, box];
-            })));
-            grid.appendChild(c);
-        }).catch(function (e) { grid.appendChild(failCard("OUs", e)); });
+            fOus(emptyOr(r.ous, ["OU", ""], function (o) {
+                var b = el("div", "al-actions");
+                b.appendChild(actionButton("delete", "ou-delete", { dn: o }));
+                return [o, b];
+            }, "no organizational units"));
+        }).catch(function (e) { fOus(errNode(e)); });
         run("computer-list").then(function (r) {
-            var c = card("Computers (" + r.computers.length + ")");
-            c.appendChild(tableOf(["account"], r.computers.map(function (x) { return [x]; })));
-            grid.appendChild(c);
-        }).catch(function (e) { grid.appendChild(failCard("Computers", e)); });
+            fComputers(emptyOr(r.computers, ["account"], function (x) { return [x]; }, "no computers"),
+                       "Computers (" + r.computers.length + ")");
+        }).catch(function (e) { fComputers(errNode(e)); });
     }
 
     // ------------------------------------------- Users & Computers (dsa.msc)
@@ -560,9 +608,27 @@
     var aduc = {
         base: null, classes: null, advanced: false, search: "",
         extraCols: ["description"], selected: null, previewMode: "tabs",
-        treeFilter: "", expanded: {}, treeWidth: 600, nodes: [],
+        treeFilter: "", expanded: {}, treeWidth: 600, nodes: [], schemaCache: {},
     };
     var aducReload = null;      // set by renderObjects; modals call it after a write
+
+    /* object-schema is ~2.4s (walks the class chain + all attrs + displaySpecs)
+     * but a class's schema is invariant, so cache it by structural class — this
+     * turns every repeat selection/editor-open from ~2.4s into instant. */
+    function getSchema(cls) {
+        if (aduc.schemaCache[cls]) return Promise.resolve(aduc.schemaCache[cls]);
+        return run("object-schema", { class: cls }).then(function (s) {
+            aduc.schemaCache[cls] = s; return s;
+        });
+    }
+    /* object-get (fast) then the cached schema for its class -> [obj, sch]. */
+    function getObjectAndSchema(dn, wantProtected) {
+        var args = { dn: dn };
+        if (wantProtected) args.protected = "yes";
+        return run("object-get", args).then(function (obj) {
+            return getSchema(obj.structural_class).then(function (sch) { return [obj, sch]; });
+        });
+    }
 
     function aducActiveClasses() {
         return Object.keys(aduc.classes).filter(function (k) { return aduc.classes[k]; });
@@ -743,6 +809,9 @@
             }).catch(function (e) { clear(tableWrap); tableWrap.appendChild(el("div", "al-alert err", String(e))); });
         }
         aducReload = function () { loadList(); drawPreview(); };
+        aducSelect = function (dn) {   // jump the preview to a referenced object
+            aduc.selected = dn; aduc.selectedName = dnRdn(dn); aduc.selectedSam = null; drawPreview();
+        };
 
         // ---- context-menu actions (tree nodes + object rows) ----------
         var NEW_CLASSES = [["organizationalUnit", "Organizational Unit"], ["user", "User"],
@@ -798,6 +867,7 @@
                 { label: "Delete…", danger: true, disabled: isRoot, onClick: function () { deletePrompt(dn); } },
                 { label: "Deletion protection…", disabled: isRoot, onClick: function () { protectPrompt(dn); } },
                 { sep: true },
+                { label: "Link a GPO…", onClick: function () { gpoLinkPrompt(dn); } },
                 { label: "Refresh", onClick: function () { loadTree(); } },
                 { label: "Properties…", onClick: function () { openModal("object-edit", { target: dn }); } },
             ]);
@@ -815,6 +885,7 @@
             if (o.class === "user") {
                 var sam = (o.attrs && o.attrs.sAMAccountName) || o.name;
                 items.push({ sep: true });
+                items.push({ label: "Add to a group…", onClick: function () { addToGroupPrompt(sam); } });
                 items.push({ label: "Enable account", onClick: function () { actRun("user-enable", { name: sam }); } });
                 items.push({ label: "Disable account", onClick: function () { actRun("user-disable", { name: sam }); } });
                 items.push({ label: "Reset password…", onClick: function () { openModal("user-setpassword", { name: sam }); } });
@@ -876,7 +947,7 @@
             var body = el("div", "al-prev-body"); prevPane.appendChild(body);
             if (!dn) { body.appendChild(el("div", "hint", "select an object to preview its values")); return; }
             body.appendChild(el("div", "al-loading", "loading…"));
-            Promise.all([run("object-get", { dn: dn }), run("object-schema", { dn: dn })]).then(function (res) {
+            getObjectAndSchema(dn, true).then(function (res) {
                 var obj = res[0], sch = res[1];
                 clear(body);
                 var hl = el("div", "hint", sch.class_label + " · "); hl.appendChild(el("kbd", "al", dn));
@@ -910,8 +981,15 @@
         var box = el("div", "al-valcell");
         values.slice(0, 40).forEach(function (v) {
             var line = String(v);
-            if (field.type === "dn" || /^(CN|OU|DC)=/.test(line)) box.appendChild(el("div", "al-dnval", line));
-            else box.appendChild(el("div", null, line));
+            if (field.type === "dn" || /^(CN|OU|DC)=/.test(line)) {
+                // clickable: jump to the referenced object (group, manager, member…)
+                var a = el("a", "al-dnval al-dnlink", line); a.href = "#"; a.title = "open " + line;
+                a.addEventListener("click", function (ev) {
+                    ev.preventDefault();
+                    if (aducSelect) aducSelect(line); else openModal("object-edit", { target: line });
+                });
+                box.appendChild(a);
+            } else { box.appendChild(el("div", null, line)); }
         });
         if (values.length > 40) box.appendChild(el("div", "hint", "+" + (values.length - 40) + " more"));
         return box;
@@ -992,7 +1070,7 @@
             box.appendChild(el("div", "hint", "")).appendChild(el("kbd", "al", dn));
             var host = el("div"); box.appendChild(host);
             host.appendChild(el("div", "al-loading", "loading object + schema…"));
-            Promise.all([run("object-get", { dn: dn }), run("object-schema", { dn: dn })]).then(function (res) {
+            getObjectAndSchema(dn, false).then(function (res) {
                 var obj = res[0], sch = res[1];
                 clear(host);
                 host.appendChild(el("h3", null, sch.class_label));
@@ -1125,7 +1203,7 @@
             }
             filt.addEventListener("input", function () { if (sch) draw(); });
             onlySet.addEventListener("change", function () { if (sch) draw(); });
-            Promise.all([run("object-get", { dn: dn }), run("object-schema", { dn: dn })]).then(function (res) {
+            getObjectAndSchema(dn, false).then(function (res) {
                 obj = res[0]; sch = res[1];
                 sch.attributes.forEach(function (a) { byAttr[a.attr] = a; });
                 draw();
@@ -1200,7 +1278,7 @@
             var offBtn = el("button", "al-btn secondary", "Remove protection");
             var msg = el("span", "hint", "");
             function refresh() {
-                run("object-get", { dn: dn }).then(function (o) {
+                run("object-get", { dn: dn, protected: "yes" }).then(function (o) {
                     status.className = "al-alert " + (o.protected ? "warn" : "ok");
                     status.textContent = o.protected
                         ? "🔒 Protected from accidental deletion."
@@ -1221,6 +1299,72 @@
             refresh();
         });
     }
+
+    // Link / unlink a GPO to a container (OU/domain) — the GPMC workflow, from
+    // the tree, using the existing gpo-list + gpo-link/gpo-unlink verbs.
+    function gpoLinkPrompt(dn) {
+        transientModal("Link Group Policy", function (box) {
+            box.appendChild(el("div", "hint", "container: ")).appendChild(el("kbd", "al", dn));
+            var host = el("div"); host.appendChild(el("div", "al-loading", "loading GPOs…")); box.appendChild(host);
+            var msg = el("span", "hint", ""); var chosen = null;
+            run("gpo-list").then(function (r) {
+                clear(host);
+                var pk = pickerTable({
+                    columns: [{ key: "display_name", label: "GPO" }, { key: "gpo", label: "GUID" }],
+                    rows: r.gpos || [], mode: "single", height: 240,
+                    rowKey: function (g) { return g.gpo; },
+                    onChange: function (sel) { chosen = sel[0] || null; },
+                });
+                host.appendChild(pk.node);
+                function act(verb) {
+                    if (!chosen) { msg.textContent = " pick a GPO first"; return; }
+                    msg.textContent = " …";
+                    run(verb, { container_dn: dn, gpo: chosen.gpo }).then(function () {
+                        msg.textContent = verb === "gpo-link" ? " linked" : " unlinked";
+                    }).catch(function (e) { msg.textContent = " " + e; });
+                }
+                var link = el("button", "al-btn", "Link");
+                link.addEventListener("click", function () { act("gpo-link"); });
+                var unlink = el("button", "al-btn danger", "Unlink");
+                unlink.addEventListener("click", function () { act("gpo-unlink"); });
+                var row = el("div", "row"); row.appendChild(link); row.appendChild(unlink); row.appendChild(msg);
+                box.appendChild(row);
+            }).catch(function (e) { clear(host); host.appendChild(el("div", "al-alert err", String(e))); });
+        });
+    }
+
+    // Add a user to a group — the ADUC 'Add to a group' workflow, backed by the
+    // existing group-add-member verb (memberOf is read-only on the object).
+    function addToGroupPrompt(sam) {
+        transientModal("Add to a group", function (box) {
+            box.appendChild(el("div", "hint", "member: ")).appendChild(el("kbd", "al", sam));
+            var host = el("div"); host.appendChild(el("div", "al-loading", "loading groups…")); box.appendChild(host);
+            var msg = el("span", "hint", ""); var chosen = null;
+            run("group-list").then(function (r) {
+                clear(host);
+                var rows = (r.groups || []).map(function (g) { return { group: g }; });
+                var pk = pickerTable({
+                    columns: [{ key: "group", label: "group" }],
+                    rows: rows, mode: "single", height: 240,
+                    rowKey: function (g) { return g.group; },
+                    onChange: function (sel) { chosen = sel[0] || null; },
+                });
+                host.appendChild(pk.node);
+                var add = el("button", "al-btn", "Add to group");
+                add.addEventListener("click", function () {
+                    if (!chosen) { msg.textContent = " pick a group first"; return; }
+                    msg.textContent = " …";
+                    run("group-add-member", { group: chosen.group, member: sam }).then(function () {
+                        msg.textContent = " added to " + chosen.group; if (aducReload) aducReload();
+                    }).catch(function (e) { msg.textContent = " " + e; });
+                });
+                var row = el("div", "row"); row.appendChild(add); row.appendChild(msg);
+                box.appendChild(row);
+            }).catch(function (e) { clear(host); host.appendChild(el("div", "al-alert err", String(e))); });
+        });
+    }
+
+    var aducSelect = null;   // set by renderObjects: select+preview a DN in the console
 
     // A floating right-click / kebab context menu. items are
     // {label, onClick, danger?, disabled?, submenu:[…]} or {sep:true}.
@@ -1326,38 +1470,29 @@
             "Template settings become registry.pol via `gpo load`; preferences use " +
             "samba CSEs (`gpo manage`); SYSVOL replicates within 5 minutes."));
         var holder = el("div", "al-grid"); m.appendChild(holder);
+        var fGpo = slotCard(holder, "Group Policy objects", true);
         run("gpo-list").then(function (r) {
-            var c = card("Group Policy objects (on " + r.pdc_emulator + ")", true);
-            c.appendChild(tableOf(["GPO", "display name", "ver", "actions"], r.gpos.map(function (g) {
+            fGpo(emptyOr(r.gpos, ["GPO", "display name", "ver", "actions"], function (g) {
                 var box = el("div", "al-actions");
                 var edit = el("button", "al-btn", "edit");
-                edit.addEventListener("click", function () {
-                    openModal("gpo-edit", { target: g.gpo });
-                });
+                edit.addEventListener("click", function () { openModal("gpo-edit", { target: g.gpo }); });
                 box.appendChild(edit);
                 var compose = el("button", "al-btn secondary", "compose");
-                compose.addEventListener("click", function () {
-                    openModal("gpo-compose", { target: g.gpo });
-                });
+                compose.addEventListener("click", function () { openModal("gpo-compose", { target: g.gpo }); });
                 box.appendChild(compose);
                 var detail = el("button", "al-btn secondary", "settings");
-                detail.addEventListener("click", function () {
-                    openModal("gpo-detail", { target: g.gpo });
-                });
+                detail.addEventListener("click", function () { openModal("gpo-detail", { target: g.gpo }); });
                 box.appendChild(detail);
                 var prefs = el("button", "al-btn secondary", "preferences");
-                prefs.addEventListener("click", function () {
-                    openModal("gpo-prefs", { target: g.gpo });
-                });
+                prefs.addEventListener("click", function () { openModal("gpo-prefs", { target: g.gpo }); });
                 box.appendChild(prefs);
                 box.appendChild(actionButton("backup", "gpo-backup", { gpo: g.gpo }));
                 box.appendChild(actionButton("link", "gpo-link", { gpo: g.gpo }));
                 box.appendChild(actionButton("unlink", "gpo-unlink", { gpo: g.gpo }));
                 box.appendChild(actionButton("delete", "gpo-delete", { gpo: g.gpo }));
                 return [el("kbd", "al", g.gpo), g.display_name, g.version, box];
-            })));
-            holder.appendChild(c);
-        }).catch(function (e) { holder.appendChild(failCard("GPOs", e)); });
+            }, "no GPOs"), "Group Policy objects (on " + r.pdc_emulator + ")");
+        }).catch(function (e) { fGpo(el("div", "al-alert err", String(e))); });
     }
 
     // -------- GPO compose modal: STACK template / ADMX / preference layers
@@ -1548,6 +1683,7 @@
         function nid() { return "e" + (seq++); }
 
         modal("Compose Group Policy", function (box) {
+            box.classList.add("wide");   // 4-panel registry.pol editor needs room
             box.appendChild(el("div", "hint", "Target GPO: ")).appendChild(el("kbd", "al", target));
 
             var regCard = el("div", "al-card");
