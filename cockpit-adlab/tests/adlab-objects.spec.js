@@ -181,6 +181,11 @@ test('context menus expose tree and object actions (New / Rename / Delete)', asy
     await expect(f.locator('.al-ctxmenu')).toContainText('Edit');
     await expect(f.locator('.al-ctxmenu')).toContainText('Attribute Editor');
     await expect(f.locator('.al-ctxmenu')).toContainText('Delete');
-    await page.keyboard.press('Escape');
-    await expect(f.locator('.al-ctxmenu')).toHaveCount(0);
+    await expect(f.locator('.al-ctxmenu')).toContainText('Deletion protection');
+    // open the deletion-protection toggle — read-only object-get, performs no write
+    await f.locator('.al-ctxitem', { hasText: 'Deletion protection' }).click();
+    await expect(f.locator('.al-ctxmenu')).toHaveCount(0);   // menu closes on activate
+    await expect(f.locator('.al-modal', { hasText: 'Deletion protection' })
+        .getByRole('button', { name: /^Protect$/ })).toBeVisible({ timeout: 10000 });
+    await f.locator('.al-backdrop').last().click({ position: { x: 6, y: 6 } });   // dismiss, no change
 });

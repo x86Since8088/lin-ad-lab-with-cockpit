@@ -796,6 +796,7 @@
                 { sep: true },
                 { label: "Rename…", disabled: !isOU, onClick: function () { renamePrompt(dn); } },
                 { label: "Delete…", danger: true, disabled: isRoot, onClick: function () { deletePrompt(dn); } },
+                { label: "Deletion protection…", disabled: isRoot, onClick: function () { protectPrompt(dn); } },
                 { sep: true },
                 { label: "Refresh", onClick: function () { loadTree(); } },
                 { label: "Properties…", onClick: function () { openModal("object-edit", { target: dn }); } },
@@ -809,6 +810,7 @@
                 { sep: true },
                 { label: "Rename / Move…", onClick: function () { renamePrompt(dn); } },
                 { label: "Delete…", danger: true, onClick: function () { deletePrompt(dn); } },
+                { label: "Deletion protection…", onClick: function () { protectPrompt(dn); } },
             ];
             if (o.class === "user") {
                 var sam = (o.attrs && o.attrs.sAMAccountName) || o.name;
@@ -877,7 +879,9 @@
             Promise.all([run("object-get", { dn: dn }), run("object-schema", { dn: dn })]).then(function (res) {
                 var obj = res[0], sch = res[1];
                 clear(body);
-                body.appendChild(el("div", "hint", sch.class_label + " · ")).appendChild(el("kbd", "al", dn));
+                var hl = el("div", "hint", sch.class_label + " · "); hl.appendChild(el("kbd", "al", dn));
+                if (obj.protected) hl.appendChild(el("span", "al-tag", "🔒 protected"));
+                body.appendChild(hl);
                 if (aduc.previewMode === "tabs") {
                     sch.tabs.forEach(function (tab) {
                         var sec = el("div", "al-prev-sec");
@@ -1028,7 +1032,13 @@
                     if (!changes.length) { msg.textContent = " no changes"; return; }
                     save.disabled = true; msg.textContent = " saving " + changes.length + " change(s)…";
                     run("object-modify", { dn: dn, changes: JSON.stringify(changes) }).then(function (r) {
-                        msg.textContent = " saved " + r.changes + " change(s) on " + r.on;
+                        if (r.all_ok === false) {
+                            var bad = (r.applied || []).filter(function (x) { return x.ok === false; })
+                                .map(function (x) { return x.attr; });
+                            msg.textContent = " saved, but did not take: " + bad.join(", ");
+                        } else {
+                            msg.textContent = " saved " + r.changes + " change(s) on " + r.on;
+                        }
                         save.disabled = false;
                         if (aducReload) aducReload();
                     }).catch(function (e) { save.disabled = false; msg.textContent = " " + e; });
@@ -1177,6 +1187,38 @@
             act("Reset password…", function () { close(); openModal("user-setpassword", { name: name }); });
             act("Move…", function () { close(); renamePrompt(dn); });
             box.appendChild(msg);
+        });
+    }
+
+    // Protect-from-accidental-deletion toggle for one object.
+    function protectPrompt(dn) {
+        transientModal("Deletion protection", function (box) {
+            box.appendChild(el("div", "hint", "")).appendChild(el("kbd", "al", dn));
+            var status = el("div", "al-alert", "checking…"); box.appendChild(status);
+            var row = el("div", "row");
+            var onBtn = el("button", "al-btn", "Protect");
+            var offBtn = el("button", "al-btn secondary", "Remove protection");
+            var msg = el("span", "hint", "");
+            function refresh() {
+                run("object-get", { dn: dn }).then(function (o) {
+                    status.className = "al-alert " + (o.protected ? "warn" : "ok");
+                    status.textContent = o.protected
+                        ? "🔒 Protected from accidental deletion."
+                        : "Not protected — anyone can delete this object.";
+                    onBtn.disabled = o.protected; offBtn.disabled = !o.protected;
+                }).catch(function (e) { status.className = "al-alert err"; status.textContent = String(e); });
+            }
+            function set(state) {
+                onBtn.disabled = offBtn.disabled = true; msg.textContent = " …";
+                run("object-protect", { dn: dn, state: state }).then(function () {
+                    msg.textContent = " done"; refresh(); if (aducReload) aducReload();
+                }).catch(function (e) { msg.textContent = " " + e; refresh(); });
+            }
+            onBtn.addEventListener("click", function () { set("on"); });
+            offBtn.addEventListener("click", function () { set("off"); });
+            row.appendChild(onBtn); row.appendChild(offBtn);
+            box.appendChild(row); box.appendChild(msg);
+            refresh();
         });
     }
 

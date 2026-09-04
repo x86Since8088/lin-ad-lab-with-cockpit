@@ -1036,7 +1036,11 @@ class TestObjectVerbs(Base):
 
     def test_modify_builds_ldif_changetype(self):
         self.fake.lab_up()
+        self.fake.on(lambda a: any(str(x).startswith("(&(objectClass=attributeSchema)") for x in a),
+                     out=_attrschema("sn", "2.5.5.12") + _attrschema("description", "2.5.5.12"))
         self.fake.on(lambda a: "ldbmodify" in a, out="Modified 1 record\n")
+        self.fake.on(lambda a: "ldbsearch" in a and "base" in a,
+                     out="dn: CN=Bob,CN=Users,DC=ad,DC=edt1,DC=lab\nsn: Smith\n")
         changes = json.dumps([{"attr": "sn", "op": "replace", "values": ["Smith"]},
                               {"attr": "description", "op": "delete", "values": []}])
         rc, out = self.call_main(["object-modify", "--dn", "CN=Bob,CN=Users,DC=ad,DC=edt1,DC=lab",
@@ -1072,7 +1076,11 @@ class TestObjectVerbs(Base):
 
     def test_modify_escapes_ldif_injection(self):
         self.fake.lab_up()
+        self.fake.on(lambda a: any(str(x).startswith("(&(objectClass=attributeSchema)") for x in a),
+                     out=_attrschema("description", "2.5.5.12"))
         self.fake.on(lambda a: "ldbmodify" in a, out="Modified 1 record\n")
+        self.fake.on(lambda a: "ldbsearch" in a and "base" in a,
+                     out="dn: CN=Bob,CN=Users,DC=ad,DC=edt1,DC=lab\n")
         evil = "inj\nreplace: displayName\ndisplayName: PWNED\n-"
         rc, out = self.call_main(["object-modify", "--dn", "CN=Bob,CN=Users,DC=ad,DC=edt1,DC=lab",
                                   "--changes", json.dumps([{"attr": "description", "op": "replace", "values": [evil]}])])
@@ -1171,6 +1179,98 @@ class TestObjectVerbs(Base):
                                   "--name", "Sales", "--parent", "DC=ad,DC=edt1,DC=lab"])
         self.assertEqual(rc, 0)
         self.assertEqual(out["dn"], "OU=Sales,DC=ad,DC=edt1,DC=lab")
+
+    # -- P0: honest writes ------------------------------------------------
+    def test_modify_rejects_readonly_attribute(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: any(str(x).startswith("(&(objectClass=attributeSchema)") for x in a),
+                     out=_attrschema("objectSid", "2.5.5.17", sysonly="TRUE"))
+        rc, out = self.call_main(["object-modify", "--dn", "CN=Bob,CN=Users,DC=ad,DC=edt1,DC=lab",
+                                  "--changes", json.dumps([{"attr": "objectSid", "op": "replace", "values": ["x"]}])])
+        self.assertEqual(rc, 1)
+        self.assertIn("read-only", out["error"])
+        self.assertFalse(self.fake.argv_containing("ldbmodify"))   # never dispatched
+
+    def test_modify_reports_not_applied(self):
+        # ldbmodify accepts, but read-back shows the value did not take -> all_ok False
+        self.fake.lab_up()
+        self.fake.on(lambda a: any(str(x).startswith("(&(objectClass=attributeSchema)") for x in a),
+                     out=_attrschema("description", "2.5.5.12"))
+        self.fake.on(lambda a: "ldbmodify" in a, out="Modified 1 record\n")
+        self.fake.on(lambda a: "ldbsearch" in a and "base" in a,
+                     out="dn: CN=Bob,CN=Users,DC=ad,DC=edt1,DC=lab\ndescription: OLD\n")
+        rc, out = self.call_main(["object-modify", "--dn", "CN=Bob,CN=Users,DC=ad,DC=edt1,DC=lab",
+                                  "--changes", json.dumps([{"attr": "description", "op": "replace", "values": ["NEW"]}])])
+        self.assertEqual(rc, 0)
+        self.assertFalse(out["all_ok"])
+        self.assertFalse(out["applied"][0]["ok"])
+        self.assertEqual(out["applied"][0]["observed"], ["OLD"])
+
+    def test_modify_readonly_guard_is_case_insensitive(self):
+        # a lowercase name must not slip past the read-only guard (LDAP is CI)
+        self.fake.lab_up()
+        self.fake.on(lambda a: any(str(x).startswith("(&(objectClass=attributeSchema)") for x in a),
+                     out=_attrschema("whenCreated", "2.5.5.11", sysonly="TRUE"))
+        rc, out = self.call_main(["object-modify", "--dn", "OU=x,DC=ad,DC=edt1,DC=lab",
+                                  "--changes", json.dumps([{"attr": "whencreated", "op": "replace",
+                                                            "values": ["20200101000000.0Z"]}])])
+        self.assertEqual(rc, 1)
+        self.assertIn("read-only", out["error"])
+        self.assertFalse(self.fake.argv_containing("ldbmodify"))
+
+    def test_modify_dn_value_verified_normalised(self):
+        # a DN written lowercase is stored canonical; verify must still say ok
+        self.fake.lab_up()
+        self.fake.on(lambda a: any(str(x).startswith("(&(objectClass=attributeSchema)") for x in a),
+                     out=_attrschema("managedBy", "2.5.5.1"))
+        self.fake.on(lambda a: "ldbmodify" in a, out="Modified 1 record\n")
+        self.fake.on(lambda a: "ldbsearch" in a and "base" in a,
+                     out="dn: OU=x,DC=ad,DC=edt1,DC=lab\nmanagedBy: CN=Administrator,CN=Users,DC=ad,DC=edt1,DC=lab\n")
+        rc, out = self.call_main(["object-modify", "--dn", "OU=x,DC=ad,DC=edt1,DC=lab",
+                                  "--changes", json.dumps([{"attr": "managedBy", "op": "replace",
+                                                            "values": ["cn=administrator,cn=users,DC=ad,DC=edt1,DC=lab"]}])])
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["all_ok"])                 # normalised DN compare -> ok
+        self.assertTrue(out["applied"][0]["ok"])
+
+    def test_modify_b64_change_is_verified(self):
+        # a b64 change is now actually verified, not blindly reported ok
+        self.fake.lab_up()
+        self.fake.on(lambda a: any(str(x).startswith("(&(objectClass=attributeSchema)") for x in a),
+                     out=_attrschema("description", "2.5.5.12"))
+        self.fake.on(lambda a: "ldbmodify" in a, out="Modified 1 record\n")
+        self.fake.on(lambda a: "ldbsearch" in a and "base" in a,
+                     out="dn: OU=x,DC=ad,DC=edt1,DC=lab\ndescription: STILL_OLD\n")
+        rc, out = self.call_main(["object-modify", "--dn", "OU=x,DC=ad,DC=edt1,DC=lab",
+                                  "--changes", json.dumps([{"attr": "description", "op": "replace",
+                                                            "b64": True, "values": [_b64(b"NEWVAL")]}])])
+        self.assertEqual(rc, 0)
+        self.assertFalse(out["all_ok"])                # value did not take -> honest
+        self.assertFalse(out["applied"][0]["ok"])
+
+    # -- P1: protect from accidental deletion -----------------------------
+    _PROTECTED_SDDL = "O:DAG:DAD:AI(D;;DTSD;;;WD)(A;;LC;;;RU)"
+
+    def test_protect_on_and_off(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "dsacl" in a and "set" in a, out="")
+        self.fake.on(lambda a: "dsacl" in a and "delete" in a, out="")
+        self.fake.on(lambda a: "dsacl" in a and "get" in a, out=self._PROTECTED_SDDL)
+        rc, out = self.call_main(["object-protect", "--dn", "OU=x,DC=ad,DC=edt1,DC=lab", "--state", "on"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["protected"])
+        self.assertTrue(self.fake.argv_containing("dsacl", "set", "(D;;SDDT;;;WD)"))
+        rc, out = self.call_main(["object-protect", "--dn", "OU=x,DC=ad,DC=edt1,DC=lab", "--state", "off"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.fake.argv_containing("dsacl", "delete", "(D;;SDDT;;;WD)"))
+
+    def test_delete_refused_when_protected(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "dsacl" in a and "get" in a, out=self._PROTECTED_SDDL)
+        rc, out = self.call_main(["object-delete", "--dn", "OU=keep,DC=ad,DC=edt1,DC=lab"])
+        self.assertEqual(rc, 1)
+        self.assertIn("protected", out["error"])
+        self.assertFalse(self.fake.argv_containing("ldbdel"))      # never deleted
 
 
 if __name__ == "__main__":

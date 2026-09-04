@@ -1079,6 +1079,7 @@ def v_object_get(a):
     return {"dn": e["dn"],
             "name": (at.get("name") or at.get("cn") or [_rdn(dn)])[0],
             "classes": cls, "structural_class": _structural(cls),
+            "protected": _is_protected(d, e["dn"]),
             "attrs": at, "b64": e["b64"]}
 
 def v_object_schema(a):
@@ -1127,6 +1128,82 @@ def v_object_schema(a):
             "mandatory": sorted(res["mandatory"]),
             "chain": res["chain"], "pages": disp.get("pages", [])}
 
+def _b64_display(v):
+    """Render a base64 value the same way parse_ldif_full renders a stored one,
+    so a b64 write can be compared against the read-back."""
+    try:
+        dec = base64.b64decode(v).decode("utf-8")
+        if any(ord(c) < 32 and c not in "\t\n\r" for c in dec):
+            raise ValueError
+        return dec
+    except Exception:
+        try:
+            return base64.b64decode(v).hex().upper()
+        except Exception:
+            return v
+
+def _verify_changes(dc, dn, changes, meta_lc):
+    """Read the touched attributes back and report requested vs. observed per
+    change, honestly (ok=False when a value did not take). Attribute names match
+    case-insensitively (LDAP is), DN-syntax values compare normalised (the
+    server canonicalises them), and b64 values are decoded before comparing."""
+    names = sorted({ch["attr"] for ch in changes if isinstance(ch, dict) and ch.get("attr")})
+    cur_lc = {}
+    if names:
+        ents = _ldb(dc, dn, "base", "(objectClass=*)", names)
+        if ents:
+            cur_lc = {k.lower(): v for k, v in ents[0]["attrs"].items()}
+    applied, all_ok = [], True
+    for ch in changes:
+        attr = ch["attr"]
+        lc = attr.lower()
+        op = ch.get("op", "replace")
+        is_dn = meta_lc.get(lc, {}).get("type") == "dn"
+        norm = (lambda v: _norm_dn(v)) if is_dn else (lambda v: v)
+        raw_req = [v for v in (ch.get("values") or []) if v not in (None, "")]
+        req = [_b64_display(v) for v in raw_req] if ch.get("b64") else raw_req
+        obs = cur_lc.get(lc, [])
+        obs_n = [norm(v) for v in obs]
+        req_n = [norm(v) for v in req]
+        if op == "replace":
+            ok = sorted(obs_n) == sorted(req_n)
+        elif op == "add":
+            ok = all(v in obs_n for v in req_n)
+        elif op == "delete":
+            ok = (not obs) if not req else all(v not in obs_n for v in req_n)
+        else:
+            ok = None
+        if ok is False:
+            all_ok = False
+        applied.append({"attr": attr, "op": op, "requested": ch.get("values") or [],
+                        "observed": obs, "ok": ok})
+    return applied, all_ok
+
+# ---- object protection (protect from accidental deletion) -----------------
+PROTECT_SDDL = "(D;;SDDT;;;WD)"   # Deny Everyone (WD): Delete + Delete-Tree
+
+def _is_protected(dc, dn):
+    """True if the object carries the accidental-deletion Deny ACE — a Deny to
+    Everyone (WD) whose rights include both SD (delete) and DT (delete-tree).
+    Note the ACE reads back with rights order normalised (e.g. DTSD)."""
+    rc, out, _ = podman(dc, ["samba-tool", "dsacl", "get", "--objectdn", dn])
+    if rc != 0:
+        return False
+    for m in re.finditer(r'\(D;[^;]*;([^;]*);[^;]*;[^;]*;WD\)', out):
+        rights = m.group(1)
+        if "SD" in rights and "DT" in rights:
+            return True
+    return False
+
+def v_object_protect(a):
+    dn, state = a["dn"], a["state"]
+    d = pdc_emulator()
+    verb = "set" if state == "on" else "delete"
+    rc, out, err = podman(d, ["samba-tool", "dsacl", verb, "--objectdn", dn, "--sddl", PROTECT_SDDL])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip() or ("dsacl %s failed" % verb))
+    return {"dn": dn, "protected": _is_protected(d, dn), "on": d}
+
 def v_object_modify(a):
     dn = a["dn"]
     try:
@@ -1135,36 +1212,51 @@ def v_object_modify(a):
         raise Fail("changes must be JSON: %s" % e)
     if not isinstance(changes, list) or not changes:
         raise Fail("changes must be a non-empty JSON array")
-    lines = ["dn: " + dn, "changetype: modify"]
+    d = pdc_emulator()
+    # validate shape + refuse writes to read-only attributes up front, rather
+    # than trusting ldbmodify's exit code (which no-ops such a write with rc 0).
+    names = []
     for ch in changes:
         if not isinstance(ch, dict):
             raise Fail("each change must be an object {attr, op, values}")
-        attr = ch.get("attr")
-        op = ch.get("op", "replace")
-        if not attr:
+        if not ch.get("attr"):
             raise Fail("each change needs an attr")
-        if op not in ("replace", "add", "delete"):
-            raise Fail("bad op %r (replace|add|delete)" % op)
-        b64 = bool(ch.get("b64"))
+        if ch.get("op", "replace") not in ("replace", "add", "delete"):
+            raise Fail("bad op %r (replace|add|delete)" % ch.get("op"))
+        names.append(ch["attr"])
+    metas = _attr_meta(d, names)
+    # LDAP attribute names are case-insensitive; _attr_meta keys by the schema's
+    # canonical lDAPDisplayName, so match case-insensitively or a lowercase name
+    # would slip past the read-only guard (and ldbmodify would apply it).
+    meta_lc = {k.lower(): v for k, v in metas.items()}
+    for ch in changes:
+        if meta_lc.get(ch["attr"].lower(), {}).get("readonly"):
+            raise Fail("attribute %r is read-only (system-only or a computed "
+                       "back-link) and cannot be modified" % ch["attr"])
+    lines = ["dn: " + dn, "changetype: modify"]
+    for ch in changes:
+        attr, op, b64 = ch["attr"], ch.get("op", "replace"), bool(ch.get("b64"))
         lines.append("%s: %s" % (op, attr))
         for v in (ch.get("values") or []):
             if v is None or v == "":
                 continue
-            # b64 = caller-supplied base64 (binary); otherwise auto-encode any
-            # value that is not an LDIF SAFE-STRING — this closes the newline
-            # injection where a value could smuggle in extra modify ops.
+            # b64 = caller-supplied base64; otherwise auto-encode any non-SAFE
+            # value (closes the newline LDIF-injection).
             lines.append("%s:: %s" % (attr, v) if b64 else _ldif_value_line(attr, v))
         lines.append("-")
     ldif = "\n".join(lines) + "\n"
-    d = pdc_emulator()
     rc, out, err = podman(d, ["ldbmodify", "-H", SAM], stdin=ldif)
     if rc != 0:
         raise Fail(err.strip() or out.strip() or "ldbmodify failed")
-    return {"modified": dn, "on": d, "changes": len(changes)}
+    applied, all_ok = _verify_changes(d, dn, changes, meta_lc)   # confirm it actually took
+    return {"modified": dn, "on": d, "changes": len(changes),
+            "applied": applied, "all_ok": all_ok}
 
 def v_object_rename(a):
     _guard_critical(a["dn"], "rename")
     d = pdc_emulator()
+    if _is_protected(d, a["dn"]):
+        raise Fail("object is protected from accidental deletion — turn off protection first")
     rc, out, err = podman(d, ["ldbrename", "-H", SAM, a["dn"], a["new_dn"]])
     if rc != 0:
         raise Fail(err.strip() or out.strip() or "ldbrename failed")
@@ -1173,6 +1265,8 @@ def v_object_rename(a):
 def v_object_delete(a):
     _guard_critical(a["dn"], "delete")
     d = pdc_emulator()
+    if _is_protected(d, a["dn"]):
+        raise Fail("object is protected from accidental deletion — turn off protection first")
     argv = ["ldbdel", "-H", SAM]
     if (a.get("recursive") or "").lower() in ("1", "yes", "true"):
         argv.append("--recursive")
@@ -2114,6 +2208,9 @@ VERBS = {
     "object-delete": {"fn": v_object_delete, "group": "objects", "danger": True,
                       "help": "Delete an object (ldbdel on the PDC emulator).",
                       "args": [arg("dn"), arg("recursive", required=False, help_="yes = delete a subtree")]},
+    "object-protect": {"fn": v_object_protect, "group": "objects", "danger": True,
+                      "help": "Protect/unprotect an object from accidental deletion (Deny-delete ACE).",
+                      "args": [arg("dn"), arg("state", "enum", choices=["on", "off"])]},
     "object-create": {"fn": v_object_create, "group": "objects", "danger": True,
                       "help": "Create an object (OU/user/group/computer/contact) inside a container.",
                       "args": [arg("class", "enum", choices=["organizationalUnit", "user", "group", "computer", "contact"]),
