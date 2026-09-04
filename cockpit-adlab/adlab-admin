@@ -1182,6 +1182,114 @@ def v_object_delete(a):
         raise Fail(err.strip() or out.strip() or "ldbdel failed")
     return {"deleted": a["dn"], "on": d}
 
+def _relative_ou(parent):
+    """samba-tool's --userou/--groupou/... want the container path WITHOUT the
+    domain DN. Strip our domain suffix; empty means the default container."""
+    d = domain_dn()
+    p = (parent or "").strip()
+    if not p or _norm_dn(p) == _norm_dn(d):
+        return ""
+    if _norm_dn(p).endswith(_norm_dn("," + d)):
+        return p[:-(len(d) + 1)]     # drop the trailing ",<domain-dn>"
+    return p
+
+def _validate_name(name):
+    """Reject DN/LDAP metacharacters so a crafted name can't redirect the DN
+    (e.g. an OU name of 'x,OU=elsewhere' being interpolated into the DN)."""
+    if not name or not name.strip():
+        raise Fail("name is required")
+    if name != name.strip():
+        raise Fail("name must not have leading or trailing spaces")
+    if name[0] == "#" or any(c in ',=+<>;"\\/\x00\n\r\t' for c in name):
+        raise Fail('name must not contain any of  , = + < > ; " \\ /  a leading #  or control characters')
+
+def _clean_st_err(s):
+    """Strip samba-tool getpass prompt noise from an error string."""
+    keep = []
+    for line in (s or "").splitlines():
+        t = line.strip()
+        if not t or "GetPassWarning" in line or t.startswith(("New Password", "Retype Password", "Password:")):
+            continue
+        keep.append(line)
+    return "\n".join(keep).strip()
+
+def _find_created_dn(dc, cls, name, parent):
+    """Resolve the DN of a just-created object — samba-tool may derive the RDN
+    from a display name, so the caller can't reconstruct CN=<name>,<parent>."""
+    try:
+        if cls == "organizationalUnit":
+            return "OU=%s,%s" % (name, parent)
+        if cls in ("user", "group", "computer"):
+            sam = name + "$" if cls == "computer" else name
+            ents = _ldb(dc, domain_dn(), "sub", "(sAMAccountName=%s)" % _ldap_escape(sam), ["cn"])
+            if ents:
+                return ents[0]["dn"]
+        ents = _ldb(dc, parent, "one", "(cn=%s)" % _ldap_escape(name), ["cn"])
+        if ents:
+            return ents[0]["dn"]
+    except Fail:
+        pass
+    return None
+
+def v_object_create(a):
+    cls = a["class"]
+    name = a["name"]
+    _validate_name(name)
+    parent = a.get("parent") or domain_dn()
+    rel = _relative_ou(parent)
+    given, surname, desc = a.get("given"), a.get("surname"), a.get("description")
+    d = pdc_emulator()
+    if cls == "organizationalUnit":
+        argv = ["samba-tool", "ou", "create", "OU=%s,%s" % (name, parent)]
+        if desc:
+            argv += ["--description", desc]
+    elif cls == "user":
+        pw = _gen_password()
+        argv = ["samba-tool", "user", "create", name]
+        if rel:
+            argv += ["--userou", rel]
+        if given:
+            argv += ["--given-name", given]
+        if surname:
+            argv += ["--surname", surname]
+        if desc:
+            argv += ["--description", desc]
+        rc, out, err = podman(d, argv, stdin=pw + "\n" + pw + "\n")
+        if rc != 0:
+            raise Fail(_clean_st_err(err) or _clean_st_err(out) or "user create failed")
+        return {"created": name, "class": cls, "in": parent, "on": d,
+                "dn": _find_created_dn(d, cls, name, parent),
+                "password": pw, "note": "password shown once; store it now"}
+    elif cls == "group":
+        argv = ["samba-tool", "group", "add", name]
+        if rel:
+            argv += ["--groupou", rel]
+        if desc:
+            argv += ["--description", desc]
+    elif cls == "computer":
+        argv = ["samba-tool", "computer", "create", name]
+        if rel:
+            argv += ["--computerou", rel]
+        if desc:
+            argv += ["--description", desc]
+    elif cls == "contact":
+        argv = ["samba-tool", "contact", "create", name]
+        if rel:
+            argv += ["--ou", rel]
+        if given:
+            argv += ["--given-name", given]
+        if surname:
+            argv += ["--surname", surname]
+        if desc:
+            argv += ["--description", desc]
+    else:
+        raise Fail("unsupported class %r" % cls)
+    rc, out, err = podman(d, argv)
+    if rc != 0:
+        raise Fail(_clean_st_err(err) or _clean_st_err(out) or "create failed")
+    return {"created": name, "class": cls, "in": parent, "on": d,
+            "dn": _find_created_dn(d, cls, name, parent)}
+
 # ---- GPO (gpmc.msc) — ALWAYS the PDC emulator -----------------------------
 
 def v_gpo_list(a):
@@ -2006,6 +2114,13 @@ VERBS = {
     "object-delete": {"fn": v_object_delete, "group": "objects", "danger": True,
                       "help": "Delete an object (ldbdel on the PDC emulator).",
                       "args": [arg("dn"), arg("recursive", required=False, help_="yes = delete a subtree")]},
+    "object-create": {"fn": v_object_create, "group": "objects", "danger": True,
+                      "help": "Create an object (OU/user/group/computer/contact) inside a container.",
+                      "args": [arg("class", "enum", choices=["organizationalUnit", "user", "group", "computer", "contact"]),
+                               arg("name"),
+                               arg("parent", required=False, help_="container DN (default: domain root)"),
+                               arg("given", required=False), arg("surname", required=False),
+                               arg("description", required=False)]},
 
     "gpo-list":      {"fn": v_gpo_list, "group": "gpo", "help": "All GPOs (queried on the PDC emulator)."},
     "gpo-create":    {"fn": v_gpo_create, "group": "gpo",

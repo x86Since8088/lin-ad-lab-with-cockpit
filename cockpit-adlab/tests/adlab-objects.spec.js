@@ -151,3 +151,36 @@ test('Advanced opens the filterable Attribute Editor grid', async ({ page }) => 
         .toBeLessThan(before);
     await dlg.locator('.al-attrname', { hasText: 'sAMAccountName' }).first().waitFor({ state: 'visible', timeout: 15000 });
 });
+
+test('context menus expose tree and object actions (New / Rename / Delete)', async ({ page }) => {
+    test.setTimeout(160000);
+    await login(page);
+    const f = await openObjects(page);
+
+    // right-click a container node -> tree context menu with the node actions
+    await f.locator('.al-tree-row', { hasText: 'Users' }).first().click({ button: 'right' });
+    await f.locator('.al-ctxmenu').waitFor({ state: 'visible', timeout: 15000 });
+    await expect(f.locator('.al-ctxmenu')).toContainText('New');
+    await expect(f.locator('.al-ctxmenu')).toContainText('Delete');
+    await expect(f.locator('.al-ctxmenu')).toContainText('Properties');
+
+    // hover "New" -> submenu of object classes; open the New OU flow, then cancel
+    await f.locator('.al-ctxitem.has-sub', { hasText: 'New' }).hover();
+    await expect(f.locator('.al-ctxsub')).toContainText('Organizational Unit');
+    await expect(f.locator('.al-ctxsub')).toContainText('User');
+    await f.locator('.al-ctxsub .al-ctxitem', { hasText: 'Organizational Unit' }).click();
+    await expect(f.locator('.al-modal h2', { hasText: /New Organizational Unit/i })).toBeVisible({ timeout: 10000 });
+    await expect(f.locator('.al-modal', { hasText: 'New Organizational Unit' }).getByRole('button', { name: 'Create' })).toBeVisible();
+    await f.locator('.al-backdrop').last().click({ position: { x: 6, y: 6 } });   // dismiss without creating
+
+    // right-click an object row -> row context menu with object actions
+    await f.locator('.al-tree-row', { hasText: 'Users' }).first().click();
+    await f.locator('table.al-objtable tr td').first().waitFor({ state: 'visible', timeout: 30000 });
+    await f.locator('table.al-objtable tr').nth(1).click({ button: 'right' });
+    await f.locator('.al-ctxmenu').waitFor({ state: 'visible', timeout: 15000 });
+    await expect(f.locator('.al-ctxmenu')).toContainText('Edit');
+    await expect(f.locator('.al-ctxmenu')).toContainText('Attribute Editor');
+    await expect(f.locator('.al-ctxmenu')).toContainText('Delete');
+    await page.keyboard.press('Escape');
+    await expect(f.locator('.al-ctxmenu')).toHaveCount(0);
+});

@@ -634,6 +634,10 @@
             row.addEventListener("click", function () {
                 aduc.base = dn; aduc.selected = null; drawTree(); loadList(); drawPreview();
             });
+            row.addEventListener("contextmenu", function (ev) { ev.preventDefault(); treeNodeMenu(node, ev.clientX, ev.clientY); });
+            var tkeb = el("button", "al-kebab", "⋯"); tkeb.type = "button"; tkeb.title = "actions";
+            tkeb.addEventListener("click", function (ev) { ev.stopPropagation(); var b = tkeb.getBoundingClientRect(); treeNodeMenu(node, b.right, b.bottom); });
+            row.appendChild(tkeb);
             treeHost.appendChild(row);
             if (kids.length && open) kids.forEach(function (c) { drawNode(c.dn, depth + 1); });
         }
@@ -705,6 +709,7 @@
                 var t = el("table", "al al-objtable");
                 var hr = el("tr");
                 columns().forEach(function (c) { hr.appendChild(el("th", null, c)); });
+                hr.appendChild(el("th", "al-kebhdr", ""));
                 t.appendChild(hr);
                 (r.objects || []).forEach(function (o) {
                     var tr = el("tr", aduc.selected === o.dn ? "sel" : "");
@@ -714,10 +719,22 @@
                     });
                     tr.addEventListener("click", function () {
                         aduc.selected = o.dn; aduc.selectedName = o.name; aduc.selectedClass = o.class;
+                        aduc.selectedSam = (o.attrs && o.attrs.sAMAccountName) || o.name;
                         [].forEach.call(t.querySelectorAll("tr.sel"), function (x) { x.className = ""; });
                         tr.className = "sel"; drawPreview();
                     });
                     tr.addEventListener("dblclick", function () { openModal("object-edit", { target: o.dn }); });
+                    function selectRow() {
+                        aduc.selected = o.dn; aduc.selectedName = o.name; aduc.selectedClass = o.class;
+                        aduc.selectedSam = (o.attrs && o.attrs.sAMAccountName) || o.name;
+                        [].forEach.call(t.querySelectorAll("tr.sel"), function (x) { x.className = ""; });
+                        tr.className = "sel"; drawPreview();
+                    }
+                    tr.addEventListener("contextmenu", function (ev) { ev.preventDefault(); selectRow(); objectRowMenu(o, ev.clientX, ev.clientY); });
+                    var kcell = el("td", "al-kebcell");
+                    var rkeb = el("button", "al-kebab", "⋯"); rkeb.type = "button"; rkeb.title = "actions";
+                    rkeb.addEventListener("click", function (ev) { ev.stopPropagation(); selectRow(); var b = rkeb.getBoundingClientRect(); objectRowMenu(o, b.right, b.bottom); });
+                    kcell.appendChild(rkeb); tr.appendChild(kcell);
                     t.appendChild(tr);
                 });
                 tableWrap.appendChild(t);
@@ -726,6 +743,83 @@
             }).catch(function (e) { clear(tableWrap); tableWrap.appendChild(el("div", "al-alert err", String(e))); });
         }
         aducReload = function () { loadList(); drawPreview(); };
+
+        // ---- context-menu actions (tree nodes + object rows) ----------
+        var NEW_CLASSES = [["organizationalUnit", "Organizational Unit"], ["user", "User"],
+            ["group", "Group"], ["computer", "Computer"], ["contact", "Contact"]];
+        function actRun(verb, args) {
+            run(verb, args).then(function () { if (aducReload) aducReload(); })
+                .catch(function (e) { transientModal("Error", function (b) { b.appendChild(el("div", "al-alert err", String(e))); }); });
+        }
+        function createFlow(cls, parentDn) {
+            var labels = {}; NEW_CLASSES.forEach(function (c) { labels[c[0]] = c[1]; });
+            transientModal("New " + labels[cls], function (box) {
+                box.appendChild(el("div", "hint", "in: ")).appendChild(el("kbd", "al", dnRdn(parentDn)));
+                var name = el("input", "al-in"); name.type = "text";
+                name.placeholder = cls === "user" ? "logon name (sAMAccountName)" : cls === "organizationalUnit" ? "OU name" : "name";
+                box.appendChild(el("label", null, "Name")); box.appendChild(name);
+                var given, surname;
+                if (cls === "user" || cls === "contact") {
+                    given = el("input", "al-in"); given.type = "text";
+                    surname = el("input", "al-in"); surname.type = "text";
+                    box.appendChild(el("label", null, "Given name")); box.appendChild(given);
+                    box.appendChild(el("label", null, "Surname")); box.appendChild(surname);
+                }
+                var desc = el("input", "al-in"); desc.type = "text";
+                box.appendChild(el("label", null, "Description")); box.appendChild(desc);
+                var msg = el("div", "hint", "");
+                var ok = el("button", "al-btn", "Create");
+                ok.addEventListener("click", function () {
+                    var n = name.value.trim(); if (!n) { msg.textContent = "name is required"; return; }
+                    var args = { class: cls, name: n, parent: parentDn };
+                    if (given && given.value.trim()) args.given = given.value.trim();
+                    if (surname && surname.value.trim()) args.surname = surname.value.trim();
+                    if (desc.value.trim()) args.description = desc.value.trim();
+                    ok.disabled = true; msg.textContent = "creating…";
+                    run("object-create", args).then(function (r) {
+                        clear(msg);
+                        var done = el("div", "al-alert ok"); done.textContent = "Created " + n + ".";
+                        if (r.password) { done.appendChild(el("span", null, " One-time password: ")); done.appendChild(el("kbd", "al", r.password)); }
+                        msg.appendChild(done);
+                        aduc.base = parentDn; loadTree(); if (aducReload) aducReload();
+                        name.value = ""; if (given) given.value = ""; if (surname) surname.value = ""; desc.value = "";
+                        ok.disabled = false; ok.textContent = "Create another";
+                    }).catch(function (e) { ok.disabled = false; msg.textContent = String(e); });
+                });
+                box.appendChild(ok); box.appendChild(msg);
+            });
+        }
+        function treeNodeMenu(node, x, y) {
+            var dn = node.dn, isOU = node.class === "organizationalUnit", isRoot = !aduc.byDn[node.parent];
+            contextMenu(x, y, [
+                { label: "New", submenu: NEW_CLASSES.map(function (c) { return { label: c[1], onClick: function () { createFlow(c[0], dn); } }; }) },
+                { sep: true },
+                { label: "Rename…", disabled: !isOU, onClick: function () { renamePrompt(dn); } },
+                { label: "Delete…", danger: true, disabled: isRoot, onClick: function () { deletePrompt(dn); } },
+                { sep: true },
+                { label: "Refresh", onClick: function () { loadTree(); } },
+                { label: "Properties…", onClick: function () { openModal("object-edit", { target: dn }); } },
+            ]);
+        }
+        function objectRowMenu(o, x, y) {
+            var dn = o.dn;
+            var items = [
+                { label: "Edit…", onClick: function () { openModal("object-edit", { target: dn }); } },
+                { label: "Attribute Editor…", onClick: function () { openModal("object-attrs", { target: dn }); } },
+                { sep: true },
+                { label: "Rename / Move…", onClick: function () { renamePrompt(dn); } },
+                { label: "Delete…", danger: true, onClick: function () { deletePrompt(dn); } },
+            ];
+            if (o.class === "user") {
+                var sam = (o.attrs && o.attrs.sAMAccountName) || o.name;
+                items.push({ sep: true });
+                items.push({ label: "Enable account", onClick: function () { actRun("user-enable", { name: sam }); } });
+                items.push({ label: "Disable account", onClick: function () { actRun("user-disable", { name: sam }); } });
+                items.push({ label: "Reset password…", onClick: function () { openModal("user-setpassword", { name: sam }); } });
+            }
+            contextMenu(x, y, items);
+        }
+        renderObjects._treeMenu = treeNodeMenu; renderObjects._rowMenu = objectRowMenu;
 
         function columnPicker() {
             transientModal("Columns", function (box, close) {
@@ -1046,7 +1140,7 @@
                 if (!nd || nd === dn) { msg.textContent = " unchanged"; return; }
                 ok.disabled = true; msg.textContent = " …";
                 run("object-rename", { dn: dn, new_dn: nd }).then(function () {
-                    aduc.selected = nd; close(); if (aducReload) aducReload();
+                    aduc.selected = nd; aduc.selectedName = dnRdn(nd); close(); if (aducReload) aducReload();
                 }).catch(function (e) { ok.disabled = false; msg.textContent = " " + e; });
             });
             box.appendChild(ok); box.appendChild(msg);
@@ -1075,7 +1169,7 @@
     function otherMenu(dn) {
         transientModal("Other actions", function (box, close) {
             box.appendChild(el("kbd", "al", dn));
-            var name = aduc.selectedName || dnRdn(dn);
+            var name = aduc.selectedSam || aduc.selectedName || dnRdn(dn);
             function act(label, fn) { var b = el("button", "al-btn secondary", label); b.style.display = "block"; b.style.margin = "0.3rem 0"; b.addEventListener("click", fn); box.appendChild(b); }
             var msg = el("div", "hint", "");
             act("Enable account", function () { run("user-enable", { name: name }).then(function () { msg.textContent = "enabled"; if (aducReload) aducReload(); }).catch(function (e) { msg.textContent = String(e); }); });
@@ -1084,6 +1178,78 @@
             act("Move…", function () { close(); renamePrompt(dn); });
             box.appendChild(msg);
         });
+    }
+
+    // A floating right-click / kebab context menu. items are
+    // {label, onClick, danger?, disabled?, submenu:[…]} or {sep:true}.
+    var _ctxMenu = null;
+    function closeContextMenu() {
+        if (!_ctxMenu) return;
+        document.removeEventListener("mousedown", _ctxMenu._down, true);
+        document.removeEventListener("keydown", _ctxMenu._esc, true);
+        if (_ctxMenu.parentNode) _ctxMenu.parentNode.removeChild(_ctxMenu);
+        _ctxMenu = null;
+    }
+    function contextMenu(x, y, items) {
+        closeContextMenu();
+        var menu = el("div", "al-ctxmenu"); menu.setAttribute("role", "menu"); menu.tabIndex = -1;
+        function levelItems(node) {
+            return [].filter.call(node.children, function (c) {
+                return c.classList && c.classList.contains("al-ctxitem") && !c.classList.contains("disabled");
+            });
+        }
+        function focusFirst(node) { var it = levelItems(node)[0]; if (it) it.focus(); }
+        function mkItem(it, host) {
+            if (it.sep) { host.appendChild(el("div", "al-ctxsep")); return; }
+            var mi = el("div", "al-ctxitem" + (it.danger ? " danger" : "") +
+                        (it.disabled ? " disabled" : "") + (it.submenu ? " has-sub" : ""));
+            mi.setAttribute("role", "menuitem");
+            mi.appendChild(el("span", "al-ctxlabel", it.label));
+            if (it.submenu) {
+                mi.appendChild(el("span", "al-ctxarrow", "▸"));
+                var sub = el("div", "al-ctxsub");
+                it.submenu.forEach(function (s) { mkItem(s, sub); });
+                mi.appendChild(sub); mi._sub = sub;
+                if (!it.disabled) mi.tabIndex = -1;
+            } else if (!it.disabled) {
+                mi.tabIndex = -1;
+                mi._activate = function () { closeContextMenu(); it.onClick(); };
+                mi.addEventListener("click", function (ev) { ev.stopPropagation(); mi._activate(); });
+            }
+            host.appendChild(mi);
+        }
+        items.forEach(function (it) { mkItem(it, menu); });
+        document.body.appendChild(menu);
+        var r = menu.getBoundingClientRect();
+        var leftPx = Math.max(4, Math.min(x, window.innerWidth - r.width - 8));
+        menu.style.left = leftPx + "px";
+        menu.style.top = Math.max(4, Math.min(y, window.innerHeight - r.height - 8)) + "px";
+        if (leftPx + r.width + 190 > window.innerWidth) menu.classList.add("sub-left");  // flip submenus
+
+        menu.addEventListener("keydown", function (ev) {
+            var focused = document.activeElement;
+            var inSub = focused && focused.parentNode && focused.parentNode.classList.contains("al-ctxsub");
+            var level = inSub ? focused.parentNode : menu;
+            var list = levelItems(level), i = list.indexOf(focused);
+            if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+                ev.preventDefault();
+                if (!inSub) [].forEach.call(menu.querySelectorAll(".al-ctxsub.open"), function (s) { s.classList.remove("open"); });
+                var n = ev.key === "ArrowDown" ? (i + 1) % list.length : (i - 1 + list.length) % list.length;
+                if (list[n]) list[n].focus();
+            } else if (ev.key === "ArrowRight" || ev.key === "Enter" || ev.key === " ") {
+                if (focused && focused._sub) { ev.preventDefault(); focused._sub.classList.add("open"); focusFirst(focused._sub); }
+                else if (focused && focused._activate) { ev.preventDefault(); focused._activate(); }
+            } else if (ev.key === "ArrowLeft" && inSub) {
+                ev.preventDefault(); level.classList.remove("open"); if (level.parentNode) level.parentNode.focus();
+            }
+        });
+
+        menu._down = function (ev) { if (_ctxMenu && !_ctxMenu.contains(ev.target)) closeContextMenu(); };
+        menu._esc = function (ev) { if (ev.key === "Escape") { ev.preventDefault(); closeContextMenu(); } };
+        _ctxMenu = menu;
+        document.addEventListener("mousedown", menu._down, true);
+        document.addEventListener("keydown", menu._esc, true);
+        focusFirst(menu);
     }
 
     function makeSplitter(splitEl, pane, min, max, onWidth, right) {

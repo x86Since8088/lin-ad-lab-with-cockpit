@@ -1113,6 +1113,65 @@ class TestObjectVerbs(Base):
         meta = mod._attr_meta("dc1", ["memberOf"])
         self.assertTrue(meta["memberOf"]["readonly"])   # odd linkID -> read-only
 
+    def test_relative_ou_strips_domain(self):
+        self.assertEqual(mod._relative_ou("DC=ad,DC=edt1,DC=lab"), "")
+        self.assertEqual(mod._relative_ou("OU=Sales,DC=ad,DC=edt1,DC=lab"), "OU=Sales")
+        self.assertEqual(mod._relative_ou("OU=Team,OU=Sales,DC=ad,DC=edt1,DC=lab"), "OU=Team,OU=Sales")
+
+    def test_create_ou_uses_full_dn(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ou" in a and "create" in a, out="")
+        rc, out = self.call_main(["object-create", "--class", "organizationalUnit",
+                                  "--name", "Sales", "--parent", "DC=ad,DC=edt1,DC=lab"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.fake.argv_containing("samba-tool", "ou", "create", "OU=Sales,DC=ad,DC=edt1,DC=lab"))
+
+    def test_create_user_placed_and_returns_password(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "user" in a and "create" in a, out="")
+        rc, out = self.call_main(["object-create", "--class", "user", "--name", "jdoe",
+                                  "--parent", "OU=Sales,DC=ad,DC=edt1,DC=lab",
+                                  "--given", "Jane", "--surname", "Doe"])
+        self.assertEqual(rc, 0)
+        self.assertIn("password", out)          # generated password returned once
+        call = next((argv, stdin) for argv, stdin in self.fake.calls
+                    if "user" in argv and "create" in argv)
+        argv, stdin = call
+        self.assertIn("--userou", argv)
+        self.assertEqual(argv[argv.index("--userou") + 1], "OU=Sales")   # domain stripped
+        self.assertIn("--given-name", argv)
+        self.assertTrue(stdin and stdin.count("\n") >= 2)                # pw entered twice
+
+    def test_create_group_relative_ou(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "group" in a and "add" in a, out="")
+        rc, out = self.call_main(["object-create", "--class", "group", "--name", "Eng",
+                                  "--parent", "OU=Team,OU=Sales,DC=ad,DC=edt1,DC=lab"])
+        self.assertEqual(rc, 0)
+        argv = self.fake.argv_containing("samba-tool", "group", "add")[0]
+        self.assertEqual(argv[argv.index("--groupou") + 1], "OU=Team,OU=Sales")
+
+    def test_create_rejects_unknown_class(self):
+        rc, out = self.call_main(["object-create", "--class", "printQueue", "--name", "p1"])
+        self.assertEqual(rc, 2)      # enum validation at parse time
+
+    def test_create_rejects_dn_metacharacters(self):
+        # a crafted name must not be able to redirect the DN (silent-redirect bug)
+        self.fake.lab_up()
+        rc, out = self.call_main(["object-create", "--class", "organizationalUnit",
+                                  "--name", "x,OU=elsewhere", "--parent", "DC=ad,DC=edt1,DC=lab"])
+        self.assertEqual(rc, 1)
+        self.assertIn("must not contain", out["error"])
+        self.assertFalse(self.fake.argv_containing("samba-tool", "ou", "create"))  # never issued
+
+    def test_create_ou_returns_real_dn(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ou" in a and "create" in a, out="")
+        rc, out = self.call_main(["object-create", "--class", "organizationalUnit",
+                                  "--name", "Sales", "--parent", "DC=ad,DC=edt1,DC=lab"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["dn"], "OU=Sales,DC=ad,DC=edt1,DC=lab")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
