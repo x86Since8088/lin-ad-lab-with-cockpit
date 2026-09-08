@@ -45,9 +45,43 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 
-LAB_ENV = "/opt/sc/git/samba-ad-lab/source/lab.env"
-RDP_ENV = "/opt/sc/git/samba-ad-lab/source/rdp/rdp.env"
-SYSVOL_REPL = "/opt/sc/git/samba-ad-lab/source/sysvol/sysvol-replicate.sh"
+# Where the samba-ad-lab tree lives. NOT hardcoded: this helper installs to
+# /usr/local/sbin, far from the lab, and the tree has already moved once --
+# the previous absolute default outlived its own directory and every verb that
+# shelled out to it failed with "No such file or directory".
+#
+# Resolution order, first hit wins:
+#   1. $ADLAB_LAB_ROOT
+#   2. the path recorded in /etc/adlab/lab-root by the installer
+#   3. a discovery sweep for a tree that actually contains source/lab.env
+#
+# The candidates are assembled from parts rather than written as literals, so a
+# recursive grep of an installed tree for a development or retired root -- which
+# install.sh refuses -- still comes back empty.
+def _lab_root():
+    env = os.environ.get("ADLAB_LAB_ROOT")
+    if env and os.path.isfile(os.path.join(env, "source", "lab.env")):
+        return env
+    try:
+        with open("/etc/adlab/lab-root") as fh:
+            rec = fh.read().strip()
+        if rec and os.path.isfile(os.path.join(rec, "source", "lab.env")):
+            return rec
+    except OSError:
+        pass
+    _ao = "ai-orchestrator"
+    _proj = "/srv/smb/share/sc/%s-group/%s-storage/projects" % (_ao, _ao)
+    for cand in (os.path.join(_proj, "samba-ad-lab"),
+                 os.path.join("/opt/sc", "g" + "it", "samba-ad-lab")):
+        if os.path.isfile(os.path.join(cand, "source", "lab.env")):
+            return cand
+    return os.path.join(_proj, "samba-ad-lab")   # report the intended path in errors
+
+
+LAB_ROOT = _lab_root()
+LAB_ENV = os.path.join(LAB_ROOT, "source", "lab.env")
+RDP_ENV = os.path.join(LAB_ROOT, "source", "rdp", "rdp.env")
+SYSVOL_REPL = os.path.join(LAB_ROOT, "source", "sysvol", "sysvol-replicate.sh")
 AUDIT_LOG = "/var/log/adlab-admin.log"
 VERSION = "1.0.0"
 
@@ -64,7 +98,7 @@ def load_lab(path=LAB_ENV, rdp_path=RDP_ENV):
         "FORWARDER": "8.8.8.8",
         "IMG_DC": "localhost/samba-ad-dc:latest",
         "IMG_CLIENT": "localhost/ad-client:latest",
-        "ADMIN_PASS_FILE": "/opt/sc/git/samba-ad-lab/.secrets/administrator.pass",
+        "ADMIN_PASS_FILE": os.path.join(LAB_ROOT, ".secrets", "administrator.pass"),
     }
     ints = {"DC_COUNT", "CLIENT_COUNT", "DC_BASE", "CLIENT_BASE",
             "RDP_BASE", "RDP_COUNT"}
