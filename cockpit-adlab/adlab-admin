@@ -45,175 +45,18 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 
+LAB_ENV = "/opt/sc/git/samba-ad-lab/source/lab.env"
+RDP_ENV = "/opt/sc/git/samba-ad-lab/source/rdp/rdp.env"
+SYSVOL_REPL = "/opt/sc/git/samba-ad-lab/source/sysvol/sysvol-replicate.sh"
 AUDIT_LOG = "/var/log/adlab-admin.log"
 VERSION = "1.0.0"
 
 # --------------------------------------------------------------------------
-# where this helper's configuration comes from  (DEPLOY-CONTRACT sections 4.3, 8.3)
+# lab configuration (parsed from lab.env; defaults match the deployed lab)
 # --------------------------------------------------------------------------
-#
-# This helper holds NO path to the samba-ad-lab project. It used to hold four,
-# all naming a checkout that has since been retired, which is why a host with an
-# unmounted share had a plugin that was not merely broken but ABSENT.
-#
-# Resolution order, and there is deliberately no fourth step:
-#
-#   1. $ADLAB_ENV -- TESTS ONLY. Honoured only for a non-root process, and only
-#      when the file is owned by the invoking uid. A root helper ignores it and
-#      says so on stderr: an environment variable that redirects a root
-#      process's configuration is a privilege escalation, and the fact that this
-#      file holds no secrets does not change that it holds paths root acts on.
-#   2. ENV_FILE= from /etc/cockpit-adlab/install.conf, written by install.sh.
-#      This is the normal path and the only one on a production host.
-#   3. Nothing. Fail, naming install.conf.
-#
-# There is no "look for a .env beside me" step, on purpose. Resolving relative to
-# this file lands in the payload when deployed and in the CHECKOUT when this is a
-# dev install -- so the deployed helper would read a developer's .env the day
-# somebody makes a dev install on the same host. The indirection through
-# install.conf makes dev-versus-deployed a fact recorded at install time instead
-# of a coincidence of where a file happens to sit.
 
-class Fail(Exception):
-    """A verb refused. main() turns it into {"error": ...} and a non-zero exit.
-    Defined here, above the configuration layer, because cfg() raises it: a
-    missing location is a refusal the page can render, not a crash."""
-
-
-INSTALL_CONF = "/etc/cockpit-adlab/install.conf"
-
-# Not a path. It is the value LAB["ADMIN_PASS_FILE"] carries when nothing has
-# configured ADLAB_SECRET_DIR, and it is deliberately un-openable: every caller
-# that needs the real file goes through admin_pass_file(), which refuses.
-UNCONFIGURED = "<unconfigured>"
-
-
-class ConfigError(Exception):
-    """The helper cannot find out where anything is. Always names the file."""
-
-
-def load_env(path):
-    """Parse the DEPLOY-CONTRACT section 4.1 grammar. A strict subset of what sh,
-    Python and systemd's EnvironmentFile all accept: KEY=value, optional whole-value
-    double quotes, full-line '#' comments, and NO interpolation whatsoever."""
-    out = {}
-    try:
-        fh = open(path, encoding="utf-8")
-    except OSError as e:
-        raise ConfigError("%s: %s" % (path, e.strerror or e))
-    with fh:
-        for n, raw in enumerate(fh, 1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                raise ConfigError("%s:%d: not KEY=VALUE" % (path, n))
-            k, v = line.split("=", 1)
-            k, v = k.strip(), v.strip()
-            if not re.match(r"^[A-Z][A-Z0-9_]*$", k):
-                raise ConfigError("%s:%d: bad key %r" % (path, n, k))
-            if len(v) >= 2 and v[0] == v[-1] == '"':
-                v = v[1:-1]
-            if "$" in v or "`" in v:
-                raise ConfigError(
-                    "%s:%d: %s contains $ or ` - interpolation is not supported "
-                    "(docs/DEPLOY-CONTRACT.md section 4.1). Write the value out in "
-                    "full, or let the consumer join the two." % (path, n, k))
-            if k in out:
-                sys.stderr.write("warning: %s:%d: %s is set twice; last wins\n"
-                                 % (path, n, k))
-            out[k] = v
-    return out
-
-
-def _resolve_env_file():
-    """The path of the .env this host is configured by. Raises ConfigError."""
-    override = os.environ.get("ADLAB_ENV")
-    if override:
-        if os.geteuid() == 0:
-            sys.stderr.write(
-                "warning: ADLAB_ENV is set but ignored: a root helper takes its "
-                "configuration from %s only.\n" % INSTALL_CONF)
-        else:
-            try:
-                st = os.stat(override)
-            except OSError as e:
-                raise ConfigError("ADLAB_ENV=%s: %s" % (override, e.strerror or e))
-            if st.st_uid != os.getuid():
-                raise ConfigError(
-                    "ADLAB_ENV=%s is not owned by uid %d. Refusing to read a "
-                    "configuration file somebody else can write."
-                    % (override, os.getuid()))
-            return override
-    conf = load_env(INSTALL_CONF)          # ConfigError names install.conf
-    path = conf.get("ENV_FILE")
-    if not path:
-        raise ConfigError("%s defines no ENV_FILE=. Re-run install.sh." % INSTALL_CONF)
-    return path
-
-
-_ENV = None          # cached {key: value}
-_ENV_FILE = None     # cached path it came from
-_ENV_ERROR = None    # cached ConfigError text, so we diagnose once and identically
-
-
-def env():
-    """The parsed .env, cached. Raises ConfigError, always naming a file."""
-    global _ENV, _ENV_FILE, _ENV_ERROR
-    if _ENV is not None:
-        return _ENV
-    if _ENV_ERROR is not None:
-        raise ConfigError(_ENV_ERROR)
-    try:
-        _ENV_FILE = _resolve_env_file()
-        _ENV = load_env(_ENV_FILE)
-    except ConfigError as e:
-        _ENV_ERROR = str(e)
-        raise
-    return _ENV
-
-
-def cfg(key):
-    """One configured location, or a Fail that names the key AND the file it is
-    missing from. A disappearance is never an acceptable answer here: the page
-    renders this string as a configuration panel."""
-    try:
-        e = env()
-    except ConfigError as ce:
-        raise Fail("cockpit-adlab is not configured: %s  Run deploy.sh, or create "
-                   "%s from .envdefault and re-run install.sh." % (ce, INSTALL_CONF))
-    v = e.get(key, "")
-    if not v:
-        raise Fail("%s is not set in %s. Set it to the location on this host and "
-                   "re-run the verb; nothing else needs restarting."
-                   % (key, _ENV_FILE))
-    return v
-
-
-def cfg_or(key, default=UNCONFIGURED):
-    """cfg() for the import-time path, where refusing is not yet an option."""
-    try:
-        return cfg(key)
-    except Fail:
-        return default
-
-
-def admin_pass_file():
-    """The lab's administrator credential FILE. Joined here rather than read from
-    lab.env: lab.env writes it as ADMIN_PASS_FILE="$SECRET_DIR/administrator.pass"
-    and this helper does not expand shell variables, so reading that line gives a
-    literal dollar sign that has been mounted into containers as a path."""
-    return os.path.join(cfg("ADLAB_SECRET_DIR"), "administrator.pass")
-
-
-# --------------------------------------------------------------------------
-# lab configuration (parsed from the lab's own lab.env / rdp.env)
-# --------------------------------------------------------------------------
-# Whose LOCATION comes from .env, above. The lab's settings themselves still come
-# from the lab, which is the only place they are ever edited.
-
-def load_lab(path=None, rdp_path=None):
-    cfg_ = {
+def load_lab(path=LAB_ENV, rdp_path=RDP_ENV):
+    cfg = {
         "REALM": "AD.EDT1.LAB", "DOMAIN_DNS": "ad.edt1.lab",
         "DOMAIN_NB": "EDT1LAB", "DC_COUNT": 5, "CLIENT_COUNT": 10,
         "NET": "static-edt", "NET_PREFIX": "172.15.4",
@@ -221,32 +64,22 @@ def load_lab(path=None, rdp_path=None):
         "FORWARDER": "8.8.8.8",
         "IMG_DC": "localhost/samba-ad-dc:latest",
         "IMG_CLIENT": "localhost/ad-client:latest",
+        "ADMIN_PASS_FILE": "/opt/sc/git/samba-ad-lab/.secrets/administrator.pass",
     }
-    # Never parsed out of lab.env -- derived from ADLAB_SECRET_DIR. See
-    # admin_pass_file() for why reading it would be worse than not having it.
-    cfg_["ADMIN_PASS_FILE"] = os.path.join(
-        cfg_or("ADLAB_SECRET_DIR"), "administrator.pass")
-    if path is None:
-        path = cfg_or("ADLAB_LAB_ENV")
-    if rdp_path is None:
-        rdp_path = cfg_or("ADLAB_RDP_ENV")
     ints = {"DC_COUNT", "CLIENT_COUNT", "DC_BASE", "CLIENT_BASE",
             "RDP_BASE", "RDP_COUNT"}
-    readable = {"REALM", "DOMAIN_DNS", "DOMAIN_NB", "DC_COUNT", "CLIENT_COUNT",
-                "NET", "NET_PREFIX", "DC_BASE", "CLIENT_BASE", "RDP_BASE",
-                "RDP_COUNT", "FORWARDER", "IMG_DC", "IMG_CLIENT"}
     for p in (path, rdp_path):
         try:
             with open(p) as f:
                 for line in f:
                     m = re.match(r'^([A-Z_]+)="?([^"#\n]*)"?\s*(#.*)?$', line)
-                    if m and m.group(1) in readable:
+                    if m and m.group(1) in cfg:
                         v = m.group(2).strip()
-                        cfg_[m.group(1)] = int(v) if m.group(1) in ints else v
+                        cfg[m.group(1)] = int(v) if m.group(1) in ints else v
         except OSError:
             pass
-    cfg_["DOMAIN_DNS"] = cfg_["REALM"].lower()
-    return cfg_
+    cfg["DOMAIN_DNS"] = cfg["REALM"].lower()
+    return cfg
 
 LAB = load_lab()
 
@@ -313,6 +146,8 @@ def pdc_emulator():
         raise Fail("could not determine the PDC emulator")
     return holder.lower()
 
+class Fail(Exception):
+    pass
 
 # Run a samba-tool command that needs domain credentials. The password moves
 # via a mode-600 authfile created and removed INSIDE the container in one
@@ -526,6 +361,18 @@ def parse_preg(blob):
                         "data": _reg_decode(type_id, data)})
     return entries
 
+def _admx_fromstring(xml_text):
+    """Parse ADMX/ADML text whose declaration may name an encoding Python does not
+    know. Search.admx declares encoding='unicode' (not a registered codec), so a
+    plain ET.fromstring raises LookupError -- which is NOT a ParseError, so callers
+    guarding only against ParseError lose the file without a word. The declaration
+    is rewritten because the text is already decoded by this point."""
+    fixed = re.sub(r"(<\?xml[^>]*?encoding=)(['\"])[^'\"]*\2",
+                   lambda m: m.group(1) + m.group(2) + "utf-8" + m.group(2),
+                   xml_text, count=1)
+    return ET.fromstring(fixed)
+
+
 def _admx_local(tag):
     return tag.rsplit("}", 1)[-1]               # strip XML namespace
 
@@ -548,7 +395,7 @@ def parse_admx(xml_text):
     toggled Enabled/Disabled. Best-effort over the common policy shape."""
     out = []
     try:
-        root = ET.fromstring(xml_text)
+        root = _admx_fromstring(xml_text)
     except ET.ParseError:
         return out
     for pol in root.iter():
@@ -633,61 +480,6 @@ def parse_domain_info(text):
 def v_version(a):
     return {"version": VERSION, "realm": LAB["REALM"],
             "domain": LAB["DOMAIN_DNS"], "netbios": LAB["DOMAIN_NB"]}
-
-# The five ADLAB_* keys, what each one is for, and -- the point of the verb --
-# whether the thing it names is actually there. A Cockpit condition may only
-# test paths THIS project's install.sh creates (DEPLOY-CONTRACT section 8.4),
-# because an unmet condition makes the plugin silently absent. So the sibling
-# project's absence is diagnosed HERE, in the page the operator is already
-# looking at, naming the file, the key and the file to edit.
-CONFIG_KEYS = [
-    ("ADLAB_ROOT", "dir",
-     "Where the samba-ad-lab project keeps its installed configuration."),
-    ("ADLAB_LAB_ENV", "file",
-     "The lab's settings file. Realm, network, DC/client counts, images."),
-    ("ADLAB_RDP_ENV", "file",
-     "The RDP overlay's settings. Read for RDP_BASE and RDP_COUNT."),
-    ("ADLAB_SYSVOL_REPLICATE", "file",
-     "The SYSVOL replication script the 'sysvol-sync' verb runs."),
-    ("ADLAB_SECRET_DIR", "dir",
-     "Directory holding the lab credential FILES. Never the credentials "
-     "themselves, and never anything this helper prints."),
-    ("ADLAB_GPO_TEMPLATE_DIR", "dir",
-     "GPO template store, as seen inside a DC container (a bind mount)."),
-]
-
-def v_config(a):
-    """Where this helper's configuration came from, and whether it points at
-    anything. Safe to call on a completely unconfigured host -- that is the
-    case it exists for."""
-    out = {"install_conf": INSTALL_CONF, "env_file": None,
-           "install_kind": None, "install_path": None,
-           "configured": False, "error": None, "keys": []}
-    try:
-        conf = load_env(INSTALL_CONF)
-        out["install_kind"] = conf.get("INSTALL_KIND")
-        out["install_path"] = conf.get("INSTALL_PATH")
-    except ConfigError as e:
-        out["error"] = str(e)
-    try:
-        e = env()
-        out["env_file"] = _ENV_FILE
-        out["configured"] = True
-    except ConfigError as ce:
-        out["error"] = str(ce)
-        e = {}
-    for key, kind, why in CONFIG_KEYS:
-        v = e.get(key, "")
-        row = {"key": key, "value": v, "kind": kind, "help": why,
-               "set": bool(v), "exists": False}
-        if v:
-            row["exists"] = os.path.isdir(v) if kind == "dir" else os.path.isfile(v)
-        row["fix"] = ("" if row["exists"] else
-                      "Deploy samba-ad-lab, or point %s at it in %s."
-                      % (key, out["env_file"] or "the .env named by " + INSTALL_CONF))
-        out["keys"].append(row)
-    out["ok"] = out["configured"] and all(r["exists"] for r in out["keys"])
-    return out
 
 def v_schema(a):
     table = {}
@@ -1661,11 +1453,7 @@ def v_gpo_unlink(a):
 # All Administrative-Template settings compile to registry.pol entries applied
 # with `samba-tool gpo load` (a JSON array on stdin).
 
-# The GPO template store, as seen INSIDE a DC container: every use below is
-# under `podman exec`. It is a bind mount so saved templates survive a
-# container recreate, which is why it is operator-settable rather than fixed.
-def gpo_template_dir():
-    return cfg("ADLAB_GPO_TEMPLATE_DIR")
+GPO_TEMPLATE_DIR = "/var/lib/samba/gpo-templates"   # persists (bind mount)
 DEFAULT_REG_CSE = "{35378EAC-683F-11D2-A89A-00C04FBBCFA2}"  # registry policy
 REG_CLASSES = ["MACHINE", "USER", "BOTH"]
 GPO_CSES = ["smb_conf", "security", "motd", "issue", "sudoers", "files",
@@ -1822,7 +1610,7 @@ def parse_adml(xml_text):
     $(string.ID) references in ADMX displayName/explainText into real names."""
     out = {}
     try:
-        root = ET.fromstring(xml_text)
+        root = _admx_fromstring(xml_text)
     except ET.ParseError:
         return out
     for s in root.iter():
@@ -1841,7 +1629,19 @@ def _read_b64(dc, path):
     if rc != 0 or not b64.strip():
         return None
     try:
-        return base64.b64decode(b64.strip()).decode("utf-8", "replace")
+        raw = base64.b64decode(b64.strip())
+    except Exception:
+        return None
+    # Decode by BOM, not by assumption. Microsoft ships at least two templates
+    # (Search.admx, Camera.admx) as UTF-16LE; decoding those as UTF-8 yields
+    # mojibake that then fails to parse, and the caller's except-and-skip drops
+    # the whole file. Search.admx alone is 50 policies that simply never appeared.
+    try:
+        if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            return raw.decode("utf-16")
+        if raw[:3] == b"\xef\xbb\xbf":
+            return raw.decode("utf-8-sig")
+        return raw.decode("utf-8", "replace")
     except Exception:
         return None
 
@@ -1855,6 +1655,18 @@ def v_gpo_admx_list(a):
     lang = a.get("lang") or "en-US"
     rc, ls, _ = podman(d, ["bash", "-c", "ls %s/*.admx 2>/dev/null" % shq(root)])
     files = [x for x in (ls or "").split() if x.endswith(".admx")]
+    # Resolve ADML by case-INSENSITIVE filename. Windows filesystems are case
+    # insensitive and Microsoft's own set relies on it: kdc.admx ships alongside
+    # KDC.adml, inetres.admx alongside InetRes.adml, messaging.admx alongside
+    # Messaging.adml. On SYSVOL (case sensitive) an exact-name lookup misses those
+    # three files, and every policy in them renders as string.POL_* and is hidden
+    # by the unresolved filter -- 948 settings invisible with no error anywhere.
+    rc_l, ls_l, _ = podman(d, ["bash", "-c",
+                               "ls %s/%s/*.adml 2>/dev/null" % (shq(root), shq(lang))])
+    adml_by_lower = {}
+    for x in (ls_l or "").split():
+        if x.endswith(".adml"):
+            adml_by_lower[x.rsplit("/", 1)[-1].lower()] = x
     policies, admx = [], []
     for f in files:
         name = f.rsplit("/", 1)[-1]
@@ -1862,7 +1674,8 @@ def v_gpo_admx_list(a):
         xml = _read_b64(d, f)
         if xml is None:
             continue
-        adml = _read_b64(d, "%s/%s/%s" % (root, lang, name[:-5] + ".adml"))
+        adml_path = adml_by_lower.get((name[:-5] + ".adml").lower())
+        adml = _read_b64(d, adml_path) if adml_path else None
         strings = parse_adml(adml) if adml else {}
         for p in parse_admx(xml):
             p["admx"] = name
@@ -1953,7 +1766,7 @@ def v_gpo_backup(a):
     d = pdc_emulator()
     gpo = _gpo_guid(a)
     name = re.sub(r'[^A-Za-z0-9_.-]', '_', a.get("name") or gpo.strip("{}"))
-    dest = "%s/%s" % (gpo_template_dir(), name)
+    dest = "%s/%s" % (GPO_TEMPLATE_DIR, name)
     rc, out, err = podman_auth(d,
         "mkdir -p %s && samba-tool gpo backup %s --tmpdir=%s"
         % (shq(dest), shq(gpo), shq(dest)), timeout=180)
@@ -1967,7 +1780,7 @@ def v_gpo_template_list(a):
     rc, out, err = podman_auth(d, "samba-tool gpo listall")
     gpos = parse_gpo_listall(out) if rc == 0 else []
     rc2, ls, _ = podman(d, ["bash", "-c",
-        "ls -1 %s 2>/dev/null" % shq(gpo_template_dir())])
+        "ls -1 %s 2>/dev/null" % shq(GPO_TEMPLATE_DIR)])
     backups = [x for x in (ls or "").split() if x]
     return {"on": d, "gpos": gpos, "backups": backups}
 
@@ -2004,7 +1817,7 @@ def v_gpo_restore(a):
     """Restore a saved template backup as a brand-NEW GPO."""
     d = pdc_emulator()
     tpl = re.sub(r'[^A-Za-z0-9_.-]', '_', a["template"])
-    src = "%s/%s" % (gpo_template_dir(), tpl)
+    src = "%s/%s" % (GPO_TEMPLATE_DIR, tpl)
     rc, out, err = podman_auth(d,
         "samba-tool gpo restore %s %s" % (shq(a["name"]), shq(src)), timeout=180)
     if rc != 0:
@@ -2131,7 +1944,7 @@ def v_sysvol_status(a):
     return {"dcs": rows, "identical": len(hashes) == 1}
 
 def v_sysvol_sync(a):
-    rc, out, err = RUN.run(["bash", cfg("ADLAB_SYSVOL_REPLICATE")], timeout=300)
+    rc, out, err = RUN.run(["bash", SYSVOL_REPL], timeout=300)
     if rc != 0:
         raise Fail((err.strip() or out.strip())[-800:])
     return {"synced": True, "output": out.strip()[-800:]}
@@ -2255,7 +2068,7 @@ def v_dc_promote(a):
     while ctr_state(dc_name(i)) != "missing":
         i += 1
     n, ip = dc_name(i), dc_ip(i)
-    pass_mount = admin_pass_file() + ":/run/adminpass:ro"
+    pass_mount = LAB["ADMIN_PASS_FILE"] + ":/run/adminpass:ro"
     rc, out, err = RUN.run([
         "podman", "run", "-d", "--name", n, "--hostname", n,
         "--network", LAB["NET"], "--ip", ip,
@@ -2310,7 +2123,7 @@ def v_client_onboard(a):
     while ctr_state(client_name(i)) != "missing":
         i += 1
     n, ip = client_name(i), client_ip(i)
-    pass_mount = admin_pass_file() + ":/run/adminpass:ro"
+    pass_mount = LAB["ADMIN_PASS_FILE"] + ":/run/adminpass:ro"
     rc, out, err = RUN.run([
         "podman", "run", "-d", "--name", n, "--hostname", n,
         "--network", LAB["NET"], "--ip", ip,
@@ -2363,9 +2176,6 @@ DC_CHOICES = all_dcs()
 
 VERBS = {
     "version":       {"fn": v_version, "group": "meta", "help": "Helper and lab identity."},
-    "config":        {"fn": v_config, "group": "meta",
-                      "help": "Where this helper's configuration comes from, and "
-                              "whether every ADLAB_* location exists on this host."},
     "schema":        {"fn": v_schema, "group": "meta", "help": "This verb table, as JSON — drives the UI."},
     "status":        {"fn": v_status, "group": "overview", "help": "Every lab container with state and IP."},
     "domain-info":   {"fn": v_domain_info, "group": "overview", "help": "Domain identity and functional levels."},
