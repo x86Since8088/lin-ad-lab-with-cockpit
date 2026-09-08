@@ -100,7 +100,7 @@ test('every tab renders live data with no visible error banner', async ({ page }
     await expect(f.locator('#al-identity')).toContainText('AD.EDT1.LAB', { timeout: 45000 });
 
     const TABS = [
-        ['Users & Groups', 'Administrator'],        // dsa.msc: the well-known account
+        ['Users & Computers', 'Administrator'],   // dsa.msc console: the well-known account
         ['Group Policy', 'Default Domain Policy'],  // gpmc.msc: default GPO
         ['Sites & Replication', 'Default-First-Site-Name'],
         ['DNS', 'ad.edt1.lab'],
@@ -119,7 +119,13 @@ test('every tab renders live data with no visible error banner', async ({ page }
     expect(errors, errors.join(' | ')).toEqual([]);
 });
 
-test('schema-driven modals: create user, see one-time password, delete with typed confirm', async ({ page }) => {
+// RETIRED TAB: this test drove the 'Users & Groups' tab's .al-actions bar, which
+// was removed when #/users was retired in favour of the objects console (#/objects).
+// The equivalent flow there is the container tree's context menu (New > user), a
+// different interaction entirely -- not a selector swap. Skipped rather than
+// silently deleted so the lost coverage stays visible. Rewriting it needs a run
+// against live Cockpit to confirm the menu selectors.
+test.skip('schema-driven modals: create user, see one-time password, delete with typed confirm', async ({ page }) => {
     test.setTimeout(180000);
     await login(page);
     const f = await frame(page);

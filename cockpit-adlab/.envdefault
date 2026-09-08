@@ -1,0 +1,52 @@
+# cockpit-adlab .envdefault - seeded to [install path]/.env by deploy.sh, MISSING-ONLY.
+#
+# Locations and settings only. NEVER a secret: see docs/DEPLOY-CONTRACT.md section 4.2.
+# deploy.sh refuses to write a .env whose value looks like a credential, so a key
+# named *_PASS or *_TOKEN must name a FILE (_FILE/_PATH/_DIR/_NAME/_ID), not hold one.
+#
+# Grammar (DEPLOY-CONTRACT section 4.1) - a strict subset of what sh, Python and
+# systemd's EnvironmentFile all accept:
+#   KEY=value            KEY="value with spaces"            EMPTY=
+#   full-line '#' comments only; a trailing '#' is part of the value
+#   NO $, NO backticks, NO interpolation. Write the value out in full.
+#
+# After editing: nothing to restart. adlab-admin reads this file on every call.
+# Check the result in the page, or with:  /usr/local/sbin/adlab-admin config
+
+# Where the samba-ad-lab project keeps its installed configuration on THIS host.
+# samba-ad-lab's own install.sh puts lab.env and rdp.env here; it is not a
+# checkout and it is not under /opt.
+#
+# You MAY point the keys below at a development checkout while working on the
+# lab - they are settings and that is what settings are for. No path to any
+# checkout is written here, deliberately: install.sh refuses to install a
+# payload whose files name a development or retired root, and a default that
+# ships a checkout path is how a location becomes a fact nobody can correct on
+# the host that has it wrong.
+ADLAB_ROOT=/etc/samba-ad-lab
+
+# The lab's own settings file. adlab-admin reads REALM, DOMAIN_NB, the network
+# prefix and the DC/client counts out of it; it does not guess its location and
+# it does not carry a copy of those values.
+ADLAB_LAB_ENV=/etc/samba-ad-lab/lab.env
+
+# The RDP overlay's settings. Read for RDP_BASE and RDP_COUNT.
+ADLAB_RDP_ENV=/etc/samba-ad-lab/rdp.env
+
+# The SYSVOL replication script that the 'sysvol-sync' verb runs. Installed by
+# samba-ad-lab's install.sh into its libexec directory - NOT into a checkout,
+# and NOT into this plugin's payload, because it belongs to the other project.
+ADLAB_SYSVOL_REPLICATE=/usr/local/libexec/samba-ad-lab/sysvol-replicate.sh
+
+# Where the lab's credential FILES live. 0700 root:root, created ONCE by the
+# operator; no script here creates it. An empty secrets directory created
+# wherever a stale variable pointed is how this lab minted a second
+# administrator passphrase for a forest that already had one.
+# This key names the DIRECTORY. adlab-admin joins "administrator.pass" onto it -
+# lab.env writes that as ADMIN_PASS_FILE="$SECRET_DIR/administrator.pass", and
+# this grammar has no $, so the consumer joins rather than the file interpolating.
+ADLAB_SECRET_DIR=/etc/samba-ad-lab/.secrets
+
+# GPO template store, as seen INSIDE a DC container - every use is under
+# `podman exec`. A bind mount, so saved templates survive a container recreate.
+ADLAB_GPO_TEMPLATE_DIR=/var/lib/samba/gpo-templates

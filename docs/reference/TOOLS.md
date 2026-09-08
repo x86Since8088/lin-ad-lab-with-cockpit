@@ -372,8 +372,12 @@ at it, and `smbd` never sees it.
 
 ## Credentials
 
-The admin password lives at `/opt/sc/git/samba-ad-lab/.secrets/administrator.pass`,
-root-only, mode 600. Nothing here prints it, and nothing here ever puts it on a
+The admin password lives in `$SECRET_DIR/administrator.pass`, root-only, mode 600.
+`SECRET_DIR` is never a hardcoded path: `lab.env` derives it from its own location
+(`<project>/.secrets` beside the checkout), and the copy installed at
+`/etc/samba-ad-lab/lab.env` carries the explicit `/etc/samba-ad-lab/.secrets`
+that `install.sh` substitutes in. Print it with `. lab.env; echo "$SECRET_DIR"`
+rather than copying a path out of any document. Nothing here prints it, and nothing here ever puts it on a
 command line — `/proc/<pid>/cmdline` is world-readable.
 
 `./inspect.sh ticket` submits a root job that reads the file, runs `kinit` with

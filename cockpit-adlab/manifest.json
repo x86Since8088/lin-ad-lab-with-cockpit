@@ -2,7 +2,7 @@
     "version": "1.0.0",
     "requires": { "cockpit": "266" },
     "conditions": [
-        {"path-exists": "/opt/sc/git/samba-ad-lab/source/lab.env"}
+        {"path-exists": "/usr/local/sbin/adlab-admin"}
     ],
     "menu": {
         "index": {

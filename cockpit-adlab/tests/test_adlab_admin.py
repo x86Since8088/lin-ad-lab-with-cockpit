@@ -22,10 +22,27 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 HELPER = os.path.join(HERE, "..", "adlab-admin")
 
+# The helper takes its locations from /etc/cockpit-adlab/install.conf (see
+# DEPLOY-CONTRACT sections 4.3 and 8.3) and holds no path to the samba-ad-lab
+# project itself. Tests are the one case the contract lets bypass that:
+# $ADLAB_ENV, honoured only for a NON-ROOT process whose own uid owns the file.
+# Point it at a fixture so these tests can describe a configured host.
+os.environ["ADLAB_ENV"] = os.path.join(HERE, "adlab.env.fixture")
+
 loader = importlib.machinery.SourceFileLoader("adlab_admin", HELPER)
 spec = importlib.util.spec_from_loader("adlab_admin", loader)
 mod = importlib.util.module_from_spec(spec)
 loader.exec_module(mod)
+
+# $ADLAB_ENV is refused for a root process, on purpose: an environment variable
+# that redirects a root helper's configuration is a privilege escalation. So when
+# the suite IS run as root, inject the same fixture directly rather than either
+# skipping the verbs that need configuration or weakening the rule that refused.
+if os.geteuid() == 0:
+    mod._ENV_ERROR = None
+    mod._ENV_FILE = os.environ["ADLAB_ENV"]
+    mod._ENV = mod.load_env(mod._ENV_FILE)
+    mod.LAB = mod.load_lab()
 
 
 # ---------------------------------------------------------------------------
@@ -1289,7 +1306,116 @@ class TestObjectVerbs(Base):
         rc, out = self.call_main(["object-get", "--dn", "OU=x,DC=ad,DC=edt1,DC=lab", "--protected", "yes"])
         self.assertTrue(out["protected"])
         self.assertTrue(self.fake.argv_containing("dsacl", "get"))
+# ---------------------------------------------------------------------------
+# the configuration layer (DEPLOY-CONTRACT sections 4.1, 4.3, 8.3)
+#
+# The helper used to carry four absolute paths into a checkout that has since
+# been retired. These tests are what stops that coming back.
+# ---------------------------------------------------------------------------
+
+class TestConfigLayer(unittest.TestCase):
+
+    def _write(self, text):
+        fd, p = tempfile.mkstemp(prefix="adlab-env-")
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        self.addCleanup(os.unlink, p)
+        return p
+
+    def test_grammar_accepts_the_documented_forms(self):
+        p = self._write('# a comment\nA=1\nB="two words"\nEMPTY=\n\nC=3\n')
+        self.assertEqual(mod.load_env(p),
+                         {"A": "1", "B": "two words", "EMPTY": "", "C": "3"})
+
+    def test_grammar_refuses_interpolation(self):
+        # This is the rule that bans lab.env's ADMIN_PASS_FILE="$SECRET_DIR/...":
+        # a shell expands it, Python does not, and a shell-semantics engine in a
+        # root-read config file makes command substitution a code-execution path.
+        p = self._write('ADMIN_PASS_FILE="$SECRET_DIR/administrator.pass"\n')
+        with self.assertRaises(mod.ConfigError) as e:
+            mod.load_env(p)
+        self.assertIn("interpolation", str(e.exception))
+
+    def test_grammar_refuses_a_lowercase_key_and_a_non_assignment(self):
+        with self.assertRaises(mod.ConfigError):
+            mod.load_env(self._write("lower=1\n"))
+        with self.assertRaises(mod.ConfigError):
+            mod.load_env(self._write("NOT AN ASSIGNMENT\n"))
+
+    def test_a_missing_key_fails_by_NAME_not_by_disappearing(self):
+        # An unmet Cockpit condition makes a plugin silently absent, so nothing
+        # here is allowed to answer a missing location with silence: the page
+        # renders this string as a configuration panel.
+        saved = (mod._ENV, mod._ENV_FILE, mod._ENV_ERROR)
+        self.addCleanup(lambda: setattr_all(mod, saved))
+        mod._ENV, mod._ENV_ERROR = {"ADLAB_ROOT": "/x"}, None
+        mod._ENV_FILE = "/test/.env"
+        with self.assertRaises(mod.Fail) as e:
+            mod.cfg("ADLAB_LAB_ENV")
+        self.assertIn("ADLAB_LAB_ENV", str(e.exception))
+        self.assertIn("/test/.env", str(e.exception))
+
+    def test_admin_pass_file_is_JOINED_never_parsed_out_of_lab_env(self):
+        self.assertEqual(mod.admin_pass_file(), "/test/secrets/administrator.pass")
+
+    def test_the_helper_names_no_project_path_of_its_own(self):
+        with open(HELPER, encoding="utf-8") as fh:
+            src = fh.read()
+        for banned in ("/opt/sc" + "/git",
+                       "/srv/smb/share/sc/ai-orchestrator-group"):
+            self.assertNotIn(banned, src,
+                             "adlab-admin names %s. A location is configuration; "
+                             "it belongs in .env, not compiled into the helper." % banned)
+
+    def test_config_verb_survives_a_completely_unconfigured_host(self):
+        saved = (mod._ENV, mod._ENV_FILE, mod._ENV_ERROR)
+        self.addCleanup(lambda: setattr_all(mod, saved))
+        mod._ENV, mod._ENV_FILE = None, None
+        mod._ENV_ERROR = "/etc/cockpit-adlab/install.conf: No such file or directory"
+        out = mod.v_config({})
+        self.assertFalse(out["configured"])
+        self.assertFalse(out["ok"])
+        self.assertIn("install.conf", out["error"])
+        # every key still described, so the page can name what to set
+        self.assertEqual([r["key"] for r in out["keys"]],
+                         [k for k, _, _ in mod.CONFIG_KEYS])
+        for r in out["keys"]:
+            self.assertTrue(r["fix"], "an unset key must carry a fix, not a blank")
 
 
+def setattr_all(m, saved):
+    m._ENV, m._ENV_FILE, m._ENV_ERROR = saved
+
+
+class TestSuiteCompleteness(unittest.TestCase):
+    """The suite must run every test this file defines.
+
+    This exists because it once did not. `unittest.main()` sat above
+    TestConfigLayer, and since it exits the interpreter, seven tests were never
+    even defined, let alone run -- and the suite reported OK. A green run that
+    silently covers less than it claims is worse than a red one, and nothing
+    here would have noticed. So: count the `def test_` in the source, count what
+    the loader actually collects, and refuse to agree that they can differ.
+    """
+
+    def test_every_test_defined_in_this_file_is_collected(self):
+        import re
+        with open(__file__, encoding="utf-8") as fh:
+            defined = len(re.findall(r"^\s+def (test_\w+)", fh.read(), re.M))
+        collected = 0
+        for obj in list(globals().values()):
+            if isinstance(obj, type) and issubclass(obj, unittest.TestCase):
+                collected += len(unittest.TestLoader().getTestCaseNames(obj))
+        self.assertEqual(
+            collected, defined,
+            "this file defines %d test methods but the loader collects %d. "
+            "Something below a module-level exit, or a class the loader cannot "
+            "see, is not running." % (defined, collected))
+
+
+# NOTE: this block MUST stay the last thing in the file. unittest.main() exits
+# the interpreter, so any class defined below it is never collected -- which is
+# exactly how seven TestConfigLayer tests silently stopped running once, and
+# TestSuiteCompleteness above is what now refuses to let that recur.
 if __name__ == "__main__":
     unittest.main(verbosity=2)

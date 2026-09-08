@@ -1,6 +1,6 @@
 [Unit]
 Description=Periodic SYSVOL replication (Samba has no DFS-R)
-Documentation=file:///opt/sc/git/samba-ad-lab/source/sysvol/README.md
+Documentation=https://wiki.samba.org/index.php/SysVol_replication_(DFS-R_alternatives)
 
 [Timer]
 # Every 5 minutes, matching the interval the Samba wiki's own rsync cron
