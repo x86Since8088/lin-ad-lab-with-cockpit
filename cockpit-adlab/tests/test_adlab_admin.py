@@ -1291,5 +1291,216 @@ class TestObjectVerbs(Base):
         self.assertTrue(self.fake.argv_containing("dsacl", "get"))
 
 
+ADMX_TMPL = """<?xml version="1.0" encoding="{enc}"?>
+<policyDefinitions revision="1.0" schemaVersion="1.0"
+    xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <policyNamespaces>
+    <target prefix="{pfx}" namespace="{ns}"/>
+    <using prefix="windows" namespace="Microsoft.Policies.Windows"/>
+  </policyNamespaces>
+  <resources minRequiredRevision="1.0"/>
+  <categories><category name="LocalCat" displayName="$(string.LocalCat)"/></categories>
+  <policies>{policies}</policies>
+</policyDefinitions>
+"""
+POL_TMPL = """
+    <policy name="{name}" class="{cls}" displayName="$(string.{name})"
+            key="Software\\Policies\\Test" valueName="{name}Value">
+      <parentCategory ref="LocalCat"/>
+      <supportedOn ref="windows:SUPPORTED_Windows10"/>
+      <enabledValue><decimal value="1"/></enabledValue>
+      <disabledValue><decimal value="0"/></disabledValue>
+    </policy>"""
+ADML_TMPL = """<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitionResources revision="1.0" schemaVersion="1.0"
+    xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <displayName/><description/>
+  <resources><stringTable>{strings}</stringTable><presentationTable/></resources>
+</policyDefinitionResources>
+"""
+
+
+def _mk_admx(d, stem, names, ns=None, adml_stem=None, enc="utf-8", encoding_bytes=None):
+    """Write one ADMX plus its ADML into d. adml_stem lets a test create a
+    case-mismatched pair; encoding_bytes lets it write real UTF-16."""
+    import os as _os
+    ns = ns or ("Test.Policies." + stem)
+    xml = ADMX_TMPL.format(enc=enc, pfx=stem.lower(), ns=ns,
+                           policies="".join(POL_TMPL.format(name=n, cls="Machine") for n in names))
+    path = _os.path.join(d, stem + ".admx")
+    if encoding_bytes:
+        open(path, "wb").write(xml.encode(encoding_bytes))
+    else:
+        open(path, "w").write(xml)
+    _os.makedirs(_os.path.join(d, "en-US"), exist_ok=True)
+    strings = "".join('<string id="%s">%s text</string>' % (n, n) for n in names)
+    strings += '<string id="LocalCat">Local Category</string>'
+    open(_os.path.join(d, "en-US", (adml_stem or stem) + ".adml"), "w").write(
+        ADML_TMPL.format(strings=strings))
+    return path
+
+
+class AdmxImportNaming(unittest.TestCase):
+    """Retired files must keep valid .admx/.adml extensions -- the suffix goes on
+    the STEM. A file named EAIME.admx_retired is not readable by the store."""
+
+    def test_suffix_is_on_the_stem(self):
+        self.assertEqual(mod.admx_retired_names("EAIME.admx"),
+                         ("EAIME_retired.admx", "EAIME_retired.adml"))
+        self.assertEqual(mod.admx_retired_names("WindowsDefender.admx"),
+                         ("WindowsDefender_retired.admx", "WindowsDefender_retired.adml"))
+
+    def test_extensions_are_valid(self):
+        for src in ("a.admx", "Some.Long.Name.admx"):
+            admx, adml = mod.admx_retired_names(src)
+            self.assertTrue(admx.endswith(".admx"), admx)
+            self.assertTrue(adml.endswith(".adml"), adml)
+            self.assertNotIn(".admx_", admx)
+
+
+class AdmxLint(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_clean_tree_passes(self):
+        _mk_admx(self.d, "Alpha", ["PolA", "PolB"])
+        r = mod.admx_lint(self.d)
+        self.assertEqual(r["errors"], [], r["errors"])
+        self.assertEqual(r["files"], 1)
+
+    def test_adml_case_mismatch_is_an_error(self):
+        # kdc.admx + KDC.adml is Microsoft's own shipping pattern; on a
+        # case-sensitive SYSVOL it silently unresolves every name in the file.
+        _mk_admx(self.d, "kdc", ["PolA"], adml_stem="KDC")
+        r = mod.admx_lint(self.d)
+        # A warning, not an error: this reader pairs case-insensitively, and
+        # Microsoft's own set ships this way, so failing the batch would reject
+        # every real import.
+        self.assertTrue(any("case mismatch" in w for w in r["warnings"]), r["warnings"])
+        self.assertEqual(r["errors"], [], r["errors"])
+
+    def test_namespace_claimed_twice_is_an_error(self):
+        _mk_admx(self.d, "One", ["PolA"], ns="Dup.Namespace")
+        _mk_admx(self.d, "Two", ["PolB"], ns="Dup.Namespace")
+        r = mod.admx_lint(self.d)
+        self.assertTrue(any("already claimed by" in e for e in r["errors"]), r["errors"])
+
+    def test_dangling_string_reference_is_an_error(self):
+        _mk_admx(self.d, "Beta", ["PolA"])
+        import os as _os
+        open(_os.path.join(self.d, "en-US", "Beta.adml"), "w").write(
+            ADML_TMPL.format(strings='<string id="LocalCat">c</string>'))
+        r = mod.admx_lint(self.d)
+        self.assertTrue(any("$(string.PolA)" in e for e in r["errors"]), r["errors"])
+
+    def test_unregistered_encoding_declaration_warns(self):
+        # Search.admx ships exactly like this: UTF-16 declaring encoding='unicode'.
+        _mk_admx(self.d, "Gamma", ["PolA"], enc="unicode", encoding_bytes="utf-16")
+        r = mod.admx_lint(self.d)
+        self.assertTrue(any("not a registered codec" in w for w in r["warnings"]), r["warnings"])
+        self.assertEqual([e for e in r["errors"] if "unparseable" in e], [])
+
+
+class AdmxPlan(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.a = tempfile.mkdtemp()
+        self.b = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.a, ignore_errors=True)
+        shutil.rmtree(self.b, ignore_errors=True)
+
+    def test_same_batch_is_a_no_op(self):
+        _mk_admx(self.a, "Alpha", ["PolA", "PolB"])
+        inv = mod.admx_inventory(self.a)
+        p = mod.admx_plan(inv, inv)
+        self.assertEqual(p["counts"], {"add": 0, "update": 0,
+                                       "retire_files": 0, "retire_policies": 0})
+
+    def test_dropped_policy_is_retired(self):
+        _mk_admx(self.a, "Alpha", ["PolA"])              # new batch
+        _mk_admx(self.b, "Alpha", ["PolA", "PolGone"])   # what the store holds
+        p = mod.admx_plan(mod.admx_inventory(self.a), mod.admx_inventory(self.b))
+        self.assertEqual(p["retire"], {"Alpha.admx": ["PolGone"]})
+
+    def test_policy_moved_between_files_is_not_retired(self):
+        # PolA leaves Alpha but arrives in Beta. Retiring it would create a second
+        # definition writing the same registry target once it is re-added.
+        _mk_admx(self.a, "Alpha", [])
+        _mk_admx(self.a, "Beta", ["PolA"])
+        _mk_admx(self.b, "Alpha", ["PolA"])
+        p = mod.admx_plan(mod.admx_inventory(self.a), mod.admx_inventory(self.b))
+        self.assertEqual(p["retire"], {})
+
+    def test_filename_case_change_is_the_same_file(self):
+        _mk_admx(self.a, "inkwatson", ["PolA"])
+        _mk_admx(self.b, "InkWatson", ["PolA"])
+        p = mod.admx_plan(mod.admx_inventory(self.a), mod.admx_inventory(self.b))
+        self.assertEqual(p["counts"]["retire_policies"], 0)
+
+    def test_protected_files_are_never_retired(self):
+        _mk_admx(self.a, "Alpha", ["PolA"])
+        _mk_admx(self.b, "Alpha", ["PolA"])
+        _mk_admx(self.b, "samba", ["SambaPol"])
+        p = mod.admx_plan(mod.admx_inventory(self.a), mod.admx_inventory(self.b))
+        self.assertNotIn("samba.admx", p["retire"])
+
+
+class AdmxRetirementTranscription(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp()
+        _mk_admx(self.d, "Alpha", ["PolKeep", "PolGone"])
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_targets_are_preserved_exactly(self):
+        import os as _os
+        src = mod.admx_read_local(_os.path.join(self.d, "Alpha.admx"))
+        root, sids, pids, disp = mod.admx_build_retired(src, ["PolGone"], "alpha")
+        orig = mod.admx_policy_elements(src)["PolGone"]
+        new = mod.admx_policy_elements(root)["PolGone"]
+        for attr in ("class", "key", "valueName"):
+            self.assertEqual(new.get(attr), orig.get(attr), attr)
+
+    def test_namespace_is_distinct_from_the_source(self):
+        import os as _os
+        src = mod.admx_read_local(_os.path.join(self.d, "Alpha.admx"))
+        root, _s, _p, _d = mod.admx_build_retired(src, ["PolGone"], "alpha")
+        self.assertNotEqual(mod.admx_target(root)[1], mod.admx_target(src)[1])
+        self.assertTrue(mod.admx_target(root)[1].endswith(".Retired"))
+
+    def test_local_category_ref_becomes_qualified(self):
+        import os as _os
+        src = mod.admx_read_local(_os.path.join(self.d, "Alpha.admx"))
+        root, _s, _p, _d = mod.admx_build_retired(src, ["PolGone"], "alpha")
+        new = mod.admx_policy_elements(root)["PolGone"]
+        refs = [c.get("ref") for c in new if mod._admx_local(c.tag) == "parentCategory"]
+        self.assertTrue(all(":" in r for r in refs), refs)
+
+    def test_only_the_display_name_is_branded(self):
+        import os as _os
+        src = mod.admx_read_local(_os.path.join(self.d, "Alpha.admx"))
+        root, sids, pids, disp = mod.admx_build_retired(src, ["PolGone"], "alpha")
+        adml = mod.admx_read_local(_os.path.join(self.d, "en-US", "Alpha.adml"))
+        out, missing = mod.admx_build_retired_adml(
+            adml, sids, pids, brand={disp["PolGone"]: ["2022"]})
+        self.assertEqual(missing, [])
+        texts = dict((n.get("id"), n.text) for n in out.iter()
+                     if mod._admx_local(n.tag) == "string")
+        self.assertTrue(texts[disp["PolGone"]].endswith("(2022)"), texts)
+        self.assertFalse((texts.get("LocalCat") or "").endswith("(2022)"))
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

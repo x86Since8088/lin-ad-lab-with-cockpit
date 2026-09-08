@@ -361,6 +361,18 @@ def parse_preg(blob):
                         "data": _reg_decode(type_id, data)})
     return entries
 
+def _admx_fromstring(xml_text):
+    """Parse ADMX/ADML text whose declaration may name an encoding Python does not
+    know. Search.admx declares encoding='unicode' (not a registered codec), so a
+    plain ET.fromstring raises LookupError -- which is NOT a ParseError, so callers
+    guarding only against ParseError lose the file without a word. The declaration
+    is rewritten because the text is already decoded by this point."""
+    fixed = re.sub(r"(<\?xml[^>]*?encoding=)(['\"])[^'\"]*\2",
+                   lambda m: m.group(1) + m.group(2) + "utf-8" + m.group(2),
+                   xml_text, count=1)
+    return ET.fromstring(fixed)
+
+
 def _admx_local(tag):
     return tag.rsplit("}", 1)[-1]               # strip XML namespace
 
@@ -383,7 +395,7 @@ def parse_admx(xml_text):
     toggled Enabled/Disabled. Best-effort over the common policy shape."""
     out = []
     try:
-        root = ET.fromstring(xml_text)
+        root = _admx_fromstring(xml_text)
     except ET.ParseError:
         return out
     for pol in root.iter():
@@ -1598,7 +1610,7 @@ def parse_adml(xml_text):
     $(string.ID) references in ADMX displayName/explainText into real names."""
     out = {}
     try:
-        root = ET.fromstring(xml_text)
+        root = _admx_fromstring(xml_text)
     except ET.ParseError:
         return out
     for s in root.iter():
@@ -1617,7 +1629,19 @@ def _read_b64(dc, path):
     if rc != 0 or not b64.strip():
         return None
     try:
-        return base64.b64decode(b64.strip()).decode("utf-8", "replace")
+        raw = base64.b64decode(b64.strip())
+    except Exception:
+        return None
+    # Decode by BOM, not by assumption. Microsoft ships at least two templates
+    # (Search.admx, Camera.admx) as UTF-16LE; decoding those as UTF-8 yields
+    # mojibake that then fails to parse, and the caller's except-and-skip drops
+    # the whole file. Search.admx alone is 50 policies that simply never appeared.
+    try:
+        if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            return raw.decode("utf-16")
+        if raw[:3] == b"\xef\xbb\xbf":
+            return raw.decode("utf-8-sig")
+        return raw.decode("utf-8", "replace")
     except Exception:
         return None
 
@@ -1631,6 +1655,18 @@ def v_gpo_admx_list(a):
     lang = a.get("lang") or "en-US"
     rc, ls, _ = podman(d, ["bash", "-c", "ls %s/*.admx 2>/dev/null" % shq(root)])
     files = [x for x in (ls or "").split() if x.endswith(".admx")]
+    # Resolve ADML by case-INSENSITIVE filename. Windows filesystems are case
+    # insensitive and Microsoft's own set relies on it: kdc.admx ships alongside
+    # KDC.adml, inetres.admx alongside InetRes.adml, messaging.admx alongside
+    # Messaging.adml. On SYSVOL (case sensitive) an exact-name lookup misses those
+    # three files, and every policy in them renders as string.POL_* and is hidden
+    # by the unresolved filter -- 948 settings invisible with no error anywhere.
+    rc_l, ls_l, _ = podman(d, ["bash", "-c",
+                               "ls %s/%s/*.adml 2>/dev/null" % (shq(root), shq(lang))])
+    adml_by_lower = {}
+    for x in (ls_l or "").split():
+        if x.endswith(".adml"):
+            adml_by_lower[x.rsplit("/", 1)[-1].lower()] = x
     policies, admx = [], []
     for f in files:
         name = f.rsplit("/", 1)[-1]
@@ -1638,7 +1674,8 @@ def v_gpo_admx_list(a):
         xml = _read_b64(d, f)
         if xml is None:
             continue
-        adml = _read_b64(d, "%s/%s/%s" % (root, lang, name[:-5] + ".adml"))
+        adml_path = adml_by_lower.get((name[:-5] + ".adml").lower())
+        adml = _read_b64(d, adml_path) if adml_path else None
         strings = parse_adml(adml) if adml else {}
         for p in parse_admx(xml):
             p["admx"] = name
@@ -2137,6 +2174,455 @@ def arg(name, type_="str", required=True, help_="", choices=None, default=None):
 
 DC_CHOICES = all_dcs()
 
+
+# ---------------------------------------------------------------------------
+# ADMX import
+#
+# Staging, an idempotent apply, and retirement of policies a newer template
+# release dropped.
+#
+# Why retirement matters: a policy removed from a newer release disappears from
+# the editor, but any Registry.pol value already set for it KEEPS APPLYING --
+# the client-side extension reads only the .pol and never consults ADMX. The
+# setting is then in force and invisible. Transcribing it into
+# <stem>_retired.admx preserves class/key/valueName exactly, which is what lets
+# the editor map the existing .pol entry back to a policy and manage it again.
+# ---------------------------------------------------------------------------
+
+ADMX_WORK = "/var/lib/adlab/admx-import"
+ADMX_STATE = ADMX_WORK + "/state.json"
+ADMX_STAGING = ADMX_WORK + "/staging"
+ADMX_PROTECTED = {"samba.admx", "gnome_settings.admx"}
+ADMX_RETIRED_SUFFIX = "_retired"
+
+
+def admx_retired_names(admx_filename):
+    """EAIME.admx -> ('EAIME_retired.admx', 'EAIME_retired.adml'). The suffix goes
+    on the STEM: these must stay valid .admx/.adml or the store will not read them."""
+    stem = admx_filename[:-5] if admx_filename.lower().endswith(".admx") else admx_filename
+    return stem + ADMX_RETIRED_SUFFIX + ".admx", stem + ADMX_RETIRED_SUFFIX + ".adml"
+
+
+def admx_read_local(path):
+    """Parse an ADMX/ADML from disk, tolerating a BOM and a bogus declaration."""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = raw.decode("utf-16")
+    elif raw[:3] == b"\xef\xbb\xbf":
+        text = raw.decode("utf-8-sig")
+    else:
+        text = raw.decode("utf-8", "replace")
+    return _admx_fromstring(text)
+
+
+def admx_policy_elements(root):
+    return dict((p.get("name"), p) for p in root.iter()
+                if _admx_local(p.tag) == "policy" and p.get("name"))
+
+
+def admx_target(root):
+    for t in root.iter():
+        if _admx_local(t.tag) == "target":
+            return t.get("prefix"), t.get("namespace")
+    return None, None
+
+
+def admx_usings(root):
+    return [(u.get("prefix"), u.get("namespace")) for u in root.iter()
+            if _admx_local(u.tag) == "using"]
+
+
+def admx_string_refs(elem):
+    """Every $(string.X)/$(presentation.X) id referenced in this subtree."""
+    s, q = set(), set()
+    for node in elem.iter():
+        for v in list(node.attrib.values()):
+            for m in re.finditer(r"\$\((string|presentation)\.([^)]+)\)", v or ""):
+                (s if m.group(1) == "string" else q).add(m.group(2))
+    return s, q
+
+
+def admx_lint(admx_dir, lang="en-US"):
+    """Pre-flight gate covering the CROSS-FILE checks no XSD can express -- which
+    is every defect this project has actually hit."""
+    import glob as _glob
+    import codecs as _codecs
+    errors, warnings = [], []
+    files = sorted(_glob.glob(os.path.join(admx_dir, "*.admx")))
+    if not files:
+        return {"errors": ["no .admx files in %s" % admx_dir], "warnings": [],
+                "files": 0, "namespaces": 0}
+    namespaces, seen = {}, {}
+    for f in files:
+        base = os.path.basename(f)
+        stem = base[:-5]
+        with open(f, "rb") as fh:
+            raw = fh.read(400)
+        head = raw.replace(b"\x00", b"").lstrip(b"\xff\xfe\xef\xbb\xbf")
+        m = re.match(rb"\s*<\?xml[^>]*?encoding=['\"]([^'\"]+)['\"]", head)
+        if m:
+            enc = m.group(1).decode("ascii", "replace")
+            try:
+                _codecs.lookup(enc)
+            except LookupError:
+                warnings.append("%s: declares encoding=%r, not a registered codec; "
+                                "a strict parser raises LookupError and callers that "
+                                "catch only ParseError drop the file silently" % (base, enc))
+        try:
+            root = admx_read_local(f)
+        except Exception as exc:
+            errors.append("%s: unparseable (%s)" % (base, type(exc).__name__))
+            continue
+        _pfx, ns = admx_target(root)
+        if not ns:
+            errors.append("%s: declares no target namespace" % base)
+        elif ns in namespaces:
+            errors.append("%s: namespace %s already claimed by %s" % (base, ns, namespaces[ns]))
+        else:
+            namespaces[ns] = base
+        pols = admx_policy_elements(root)
+        for name in pols:
+            if (ns, name) in seen:
+                errors.append("%s: policy %r duplicates one in %s" % (base, name, seen[(ns, name)]))
+            else:
+                seen[(ns, name)] = base
+        exact = os.path.join(admx_dir, lang, stem + ".adml")
+        if not os.path.exists(exact):
+            ci = [x for x in _glob.glob(os.path.join(admx_dir, lang, "*.adml"))
+                  if os.path.basename(x).lower() == (stem + ".adml").lower()]
+            if ci:
+                # A WARNING, not an error: Microsoft's own set ships kdc.admx with
+                # KDC.adml, so treating this as fatal would reject every genuine
+                # batch. This reader pairs case-insensitively; the warning exists
+                # because a strict reader would silently unresolve the whole file.
+                warnings.append("%s: ADML case mismatch -- expects %s.adml, found %s; "
+                                "harmless here (pairing is case-insensitive) but a "
+                                "case-sensitive reader would unresolve every name in it"
+                                % (base, stem, os.path.basename(ci[0])))
+                exact = ci[0]
+            else:
+                errors.append("%s: no %s/%s.adml" % (base, lang, stem))
+                continue
+        try:
+            adml = admx_read_local(exact)
+        except Exception as exc:
+            errors.append("%s.adml: unparseable (%s)" % (stem, type(exc).__name__))
+            continue
+        have_s = set(n.get("id") for n in adml.iter()
+                     if _admx_local(n.tag) == "string" and n.get("id"))
+        have_p = set(n.get("id") for n in adml.iter()
+                     if _admx_local(n.tag) == "presentation" and n.get("id"))
+        for pname, pel in pols.items():
+            sref, pref = admx_string_refs(pel)
+            for sid in sorted(sref - have_s):
+                errors.append("%s: %s references $(string.%s), absent from %s.adml"
+                              % (base, pname, sid, stem))
+            for pid in sorted(pref - have_p):
+                errors.append("%s: %s references $(presentation.%s), absent from %s.adml"
+                              % (base, pname, pid, stem))
+    return {"errors": errors, "warnings": warnings,
+            "files": len(files), "namespaces": len(namespaces)}
+
+
+def admx_inventory(admx_dir):
+    """{lowername: {...}} -- lowercased because Microsoft changes filename CASE
+    between releases (InkWatson.admx -> inkwatson.admx); a case-sensitive match
+    would treat those as two files and duplicate their namespace."""
+    import glob as _glob
+    import hashlib as _hashlib
+    out = {}
+    for f in sorted(_glob.glob(os.path.join(admx_dir, "*.admx"))):
+        base = os.path.basename(f)
+        try:
+            root = admx_read_local(f)
+        except Exception:
+            continue
+        # Hash the CONTENT, not the bytes. The store side can only hash decoded
+        # text (it reads through base64 from the container), and most Microsoft
+        # ADMX carry a UTF-8 BOM, so hashing raw bytes here made 164 of 230 files
+        # look changed on every run and destroyed idempotency.
+        out[base.lower()] = {"file": base,
+                             "sha": admx_content_sha(f),
+                             "policies": sorted(admx_policy_elements(root))}
+    return out
+
+
+def admx_content_sha(path):
+    """sha256 over the file's DECODED text, so a BOM or a UTF-16 encoding does not
+    make identical content hash differently on the two sides of a comparison."""
+    import hashlib as _hashlib
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = raw.decode("utf-16")
+    elif raw[:3] == b"\xef\xbb\xbf":
+        text = raw.decode("utf-8-sig")
+    else:
+        text = raw.decode("utf-8", "replace")
+    return _hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def admx_fingerprint(inv):
+    import hashlib as _hashlib
+    h = _hashlib.sha256()
+    for k in sorted(inv):
+        h.update(k.encode())
+        h.update(inv[k]["sha"].encode())
+    return h.hexdigest()
+
+
+def admx_plan(batch_inv, store_inv):
+    """What an apply would do. Pure -- changes nothing."""
+    add, update, retire = [], [], {}
+    for name, meta in sorted(batch_inv.items()):
+        cur = store_inv.get(name)
+        if cur is None:
+            add.append(meta["file"])
+        elif cur["sha"] != meta["sha"]:
+            update.append(meta["file"])
+    batch_all = set()
+    for meta in batch_inv.values():
+        batch_all |= set(meta["policies"])
+    for name, cur in sorted(store_inv.items()):
+        if name in ADMX_PROTECTED or name.endswith(ADMX_RETIRED_SUFFIX + ".admx"):
+            continue
+        # A policy retires only if the WHOLE BATCH lacks it. Comparing just the
+        # same-named file would wrongly retire a policy Microsoft moved between
+        # files, and re-adding it later would collide on the registry target.
+        gone = [q for q in cur["policies"] if q not in batch_all]
+        if gone:
+            retire[cur["file"]] = sorted(gone)
+    return {"add": add, "update": update, "retire": retire,
+            "counts": {"add": len(add), "update": len(update),
+                       "retire_files": len(retire),
+                       "retire_policies": sum(len(v) for v in retire.values())}}
+
+
+def admx_state_load():
+    try:
+        with open(ADMX_STATE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {"batches": {}, "applied": {}}
+
+
+def admx_state_save(st):
+    os.makedirs(ADMX_WORK, exist_ok=True)
+    tmp = ADMX_STATE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(st, fh, indent=2, sort_keys=True)
+    os.replace(tmp, ADMX_STATE)     # atomic: a torn state file loses the record
+
+
+
+
+def admx_build_retired(src_root, retire_names, src_stem):
+    """Build the retired ADMX. Returns (root, string_ids, presentation_ids, display_sids).
+
+    The retired file takes its OWN namespace (<orig>.Retired) so it can never
+    collide with the file it came from, and <using>s the original namespace so
+    that category refs which were LOCAL in the source still resolve -- they are
+    rewritten to the qualified form, or they would dangle in the new namespace.
+    """
+    import copy as _copy
+    src_prefix, src_ns = admx_target(src_root)
+    if not src_ns:
+        raise Fail("source ADMX declares no target namespace")
+    local_cats = set(c.get("name") for c in src_root.iter()
+                     if _admx_local(c.tag) == "category" and c.get("name"))
+    NS = "http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions"
+    ET.register_namespace("", NS)
+    Q = "{%s}" % NS
+    root = ET.Element(Q + "policyDefinitions", {"revision": "1.0", "schemaVersion": "1.0"})
+    nsel = ET.SubElement(root, Q + "policyNamespaces")
+    ET.SubElement(nsel, Q + "target",
+                  {"prefix": (src_prefix or src_stem) + "retired",
+                   "namespace": src_ns + ".Retired"})
+    seen, src_alias = set(), None
+    for pfx, ns in admx_usings(src_root):
+        if ns and ns not in seen:
+            ET.SubElement(nsel, Q + "using", {"prefix": pfx, "namespace": ns})
+            seen.add(ns)
+            if ns == src_ns:
+                src_alias = pfx
+    if src_alias is None:
+        src_alias = (src_prefix or src_stem) + "orig"
+        ET.SubElement(nsel, Q + "using", {"prefix": src_alias, "namespace": src_ns})
+    ET.SubElement(root, Q + "resources", {"minRequiredRevision": "1.0"})
+    polel = ET.SubElement(root, Q + "policies")
+
+    sids, pids, disp = set(), set(), {}
+    src_pols = admx_policy_elements(src_root)
+    for name in sorted(retire_names):
+        src = src_pols.get(name)
+        if src is None:
+            continue
+        clone = _copy.deepcopy(src)
+        for pc in [c for c in clone if _admx_local(c.tag) == "parentCategory"]:
+            ref = pc.get("ref") or ""
+            if ref and ":" not in ref and ref in local_cats:
+                pc.set("ref", "%s:%s" % (src_alias, ref))
+        a, b = admx_string_refs(clone)
+        sids |= a
+        pids |= b
+        m = re.match(r"^\$\(string\.(.+)\)$", clone.get("displayName") or "")
+        if m:
+            disp[name] = m.group(1)
+        polel.append(clone)
+    return root, sorted(sids), sorted(pids), disp
+
+
+def admx_build_retired_adml(src_adml_root, string_ids, presentation_ids, brand=None):
+    """Carry across exactly the strings and presentations the retired policies use.
+
+    brand maps a string id -> release labels, and is applied to DISPLAY NAMES
+    ONLY. Never to explainText: a version suffix glued onto the end of a
+    descriptive paragraph is noise, not information.
+    """
+    import copy as _copy
+    NS = "http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions"
+    ET.register_namespace("", NS)
+    Q = "{%s}" % NS
+    root = ET.Element(Q + "policyDefinitionResources",
+                      {"revision": "1.0", "schemaVersion": "1.0"})
+    ET.SubElement(root, Q + "displayName")
+    ET.SubElement(root, Q + "description")
+    res = ET.SubElement(root, Q + "resources")
+    st = ET.SubElement(res, Q + "stringTable")
+    pt = ET.SubElement(res, Q + "presentationTable")
+    src_s, src_p = {}, {}
+    for n in src_adml_root.iter():
+        if _admx_local(n.tag) == "string" and n.get("id"):
+            src_s[n.get("id")] = n
+        elif _admx_local(n.tag) == "presentation" and n.get("id"):
+            src_p[n.get("id")] = n
+    missing = []
+    for sid in string_ids:
+        src = src_s.get(sid)
+        if src is None:
+            missing.append("string." + sid)
+            continue
+        node = _copy.deepcopy(src)
+        labels = (brand or {}).get(sid)
+        if labels:
+            suffix = " (%s)" % ", ".join(sorted(set(labels)))
+            if not (node.text or "").endswith(suffix):
+                node.text = (node.text or "") + suffix
+        st.append(node)
+    for pid in presentation_ids:
+        src = src_p.get(pid)
+        if src is None:
+            missing.append("presentation." + pid)
+            continue
+        pt.append(_copy.deepcopy(src))
+    return root, missing
+
+
+def v_admx_import_lint(a):
+    """Validate a staged ADMX tree before it can be applied."""
+    path = a["path"]
+    if not os.path.isdir(path):
+        raise Fail("not a directory: %s" % path)
+    r = admx_lint(path, a.get("lang") or "en-US")
+    r["ok"] = not r["errors"]
+    r["path"] = path
+    return r
+
+
+def v_admx_import_state(a):
+    """Everything the import form needs to repopulate itself after a reload."""
+    st = admx_state_load()
+    st["work_dir"] = ADMX_WORK
+    st["staging_dir"] = ADMX_STAGING
+    st["staged"] = sorted(st.get("batches", {}))
+    return st
+
+
+def v_admx_import_stage(a):
+    """Copy a validated ADMX tree into the working folder and record it. Refuses
+    a tree that does not lint, so a batch that would hide settings never lands."""
+    import glob as _glob
+    import shutil as _shutil
+    label, src = a["label"], a["source"]
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", label):
+        raise Fail("label must be 1-64 chars of [A-Za-z0-9._-] and start alphanumeric")
+    if not os.path.isdir(src):
+        raise Fail("source is not a directory: %s" % src)
+    lint = admx_lint(src, a.get("lang") or "en-US")
+    if lint["errors"] and (a.get("force") or "").lower() not in ("1", "yes", "true"):
+        return {"staged": False, "label": label, "lint": lint,
+                "note": "refused: fix the errors, or pass --force to stage anyway"}
+    dest = os.path.join(ADMX_STAGING, label)
+    if os.path.isdir(dest):
+        _shutil.rmtree(dest)
+    os.makedirs(os.path.join(dest, "en-US"), exist_ok=True)
+    for f in _glob.glob(os.path.join(src, "*.admx")):
+        _shutil.copy2(f, dest)
+    for f in _glob.glob(os.path.join(src, "en-US", "*.adml")):
+        _shutil.copy2(f, os.path.join(dest, "en-US"))
+    inv = admx_inventory(dest)
+    st = admx_state_load()
+    st.setdefault("batches", {})[label] = {
+        "path": dest, "fingerprint": admx_fingerprint(inv),
+        "staged_at": int(time.time()), "files": len(inv),
+        "policies": sum(len(v["policies"]) for v in inv.values()),
+        "lint": {"errors": len(lint["errors"]), "warnings": len(lint["warnings"])},
+    }
+    admx_state_save(st)
+    return {"staged": True, "label": label, "batch": st["batches"][label], "lint": lint}
+
+
+def v_admx_import_plan(a):
+    """Dry run: what applying this batch would add, update and retire."""
+    label = a["label"]
+    st = admx_state_load()
+    b = st.get("batches", {}).get(label)
+    if not b:
+        raise Fail("no staged batch %r (stage it first)" % label)
+    batch_inv = admx_inventory(b["path"])
+    store_inv, dc = admx_store_inventory()
+    p = admx_plan(batch_inv, store_inv)
+    p["label"] = label
+    p["on"] = dc
+    p["already_applied"] = admx_already_applied(label, b["fingerprint"],
+                                                admx_fingerprint(store_inv))
+    return p
+
+
+def admx_store_inventory():
+    """Inventory the SYSVOL central store, read through the PDC emulator."""
+    d = pdc_emulator()
+    root = "%s/PolicyDefinitions" % _pol_root(d)
+    rc, ls, _ = podman(d, ["bash", "-c", "ls %s/*.admx 2>/dev/null" % shq(root)])
+    inv = {}
+    import hashlib as _hashlib
+    for f in [x for x in (ls or "").split() if x.endswith(".admx")]:
+        base = f.rsplit("/", 1)[-1]
+        xml = _read_b64(d, f)
+        if xml is None:
+            continue
+        try:
+            r = _admx_fromstring(xml)
+        except Exception:
+            continue
+        inv[base.lower()] = {
+            "file": base,
+            "sha": _hashlib.sha256(xml.encode("utf-8", "replace")).hexdigest(),
+            "policies": sorted(admx_policy_elements(r)),
+        }
+    return inv, d
+
+
+def admx_already_applied(label, batch_fp, store_fp):
+    """Idempotency: the same batch onto the same store state means no action."""
+    rec = admx_state_load().get("applied", {}).get(label)
+    if not rec:
+        return False
+    return rec.get("batch_fp") == batch_fp and rec.get("store_fp") == store_fp
+
+
+
 VERBS = {
     "version":       {"fn": v_version, "group": "meta", "help": "Helper and lab identity."},
     "schema":        {"fn": v_schema, "group": "meta", "help": "This verb table, as JSON — drives the UI."},
@@ -2253,6 +2739,21 @@ VERBS = {
     "gpo-settings-remove": {"fn": v_gpo_settings_remove, "group": "gpo", "danger": True,
                       "help": "Remove registry-policy settings from a GPO.",
                       "args": [arg("gpo"), arg("entries", help_="JSON array of {keyname,valuename,class}")]},
+    "admx-import-lint":  {"fn": v_admx_import_lint, "group": "gpo",
+                      "help": "Validate an ADMX tree (cross-file checks no XSD can express).",
+                      "args": [arg("path", help_="directory holding *.admx and <lang>/*.adml"),
+                               arg("lang", required=False, help_="ADML language dir (default en-US)")]},
+    "admx-import-state": {"fn": v_admx_import_state, "group": "gpo",
+                      "help": "Working-folder state: staged batches and what has been applied."},
+    "admx-import-stage": {"fn": v_admx_import_stage, "group": "gpo",
+                      "help": "Copy a validated ADMX tree into the working folder.",
+                      "args": [arg("label", help_="batch label, e.g. ws2025-2025oct"),
+                               arg("source", help_="directory to stage from"),
+                               arg("lang", required=False, help_="ADML language dir (default en-US)"),
+                               arg("force", required=False, help_="stage even if lint reports errors")]},
+    "admx-import-plan": {"fn": v_admx_import_plan, "group": "gpo",
+                      "help": "Dry run: what applying a staged batch would add, update and retire.",
+                      "args": [arg("label", help_="staged batch label")]},
     "gpo-admxload":  {"fn": v_gpo_admxload, "group": "gpo",
                       "help": "Load samba ADMX templates into the SYSVOL central store."},
     "gpo-admx-list": {"fn": v_gpo_admx_list, "group": "gpo",

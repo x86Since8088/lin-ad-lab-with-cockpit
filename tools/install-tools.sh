@@ -11,7 +11,13 @@
 # Run it as root through the job runner (eddie cannot sudo):
 #
 #     cd ~/Documents/ClaudeSystem
-#     ./submit-job.sh --wait install-ad-tools /opt/sc/git/samba-ad-lab/source/tools/install-tools.sh
+#     ./submit-job.sh --wait install-ad-tools \
+#         /srv/smb/share/sc/ai-orchestrator-group/ai-orchestrator-storage/\
+#         projects/samba-ad-lab/source/tools/install-tools.sh
+#
+#   (path shown for the dev checkout; from an installed host, run the copy
+#    under the checkout you actually have -- this script derives its own
+#    location and does not care where that is.)
 #
 #   ./install-tools.sh                  install everything (idempotent)
 #   ./install-tools.sh --no-gui         CLI only, skip jxplorer and its JRE

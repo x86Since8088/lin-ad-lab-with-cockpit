@@ -17,7 +17,6 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-LAB="$(dirname "$(dirname "$HERE")")"          # /opt/sc/git/samba-ad-lab
 . "$HERE/../lab.env"
 
 DC="${AD_DC:-dc1.$DOMAIN_DNS}"

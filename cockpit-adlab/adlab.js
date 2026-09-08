@@ -125,6 +125,12 @@
     function route() {
         var loc = cockpit.location;
         var tab = (loc.path && loc.path[0]) || "overview";
+        // #/users was the old "Users & Groups" tab. The objects console (#/objects)
+        // replaces it, so redirect rather than let the unknown-tab fallback drop the
+        // visitor on Overview: an existing link or bookmark should land on the
+        // replacement, not somewhere unrelated. Options are carried across so a
+        // deep link keeps any modal it named.
+        if (tab === "users") { nav("/objects", loc.options); return; }
         if (!RENDER[tab]) tab = "overview";
         currentTab = tab;
         if (tab !== lastRenderedTab) {
@@ -442,7 +448,7 @@
 
     // ---------------------------------------------------------------- tabs
     var TABS = [
-        ["overview", "Overview"], ["users", "Users & Groups"],
+        ["overview", "Overview"],
         ["objects", "Users & Computers"],
         ["gpo", "Group Policy"], ["sites", "Sites & Replication"],
         ["dns", "DNS"], ["dcs", "Domain Controllers"],
@@ -513,64 +519,6 @@
     }
 
     // ------------------------------------------------------ users & groups
-    function renderUsers() {
-        var m = content();
-        var acts = el("div", "al-actions");
-        acts.appendChild(actionButton("Create user", "user-create", {}, ""));
-        acts.appendChild(actionButton("Create group", "group-create", {}));
-        acts.appendChild(actionButton("Create OU", "ou-create", {}));
-        m.appendChild(acts);
-        var grid = el("div", "al-grid"); m.appendChild(grid);
-        var fUsers = slotCard(grid, "Users", true);
-        var fGroups = slotCard(grid, "Groups", true);
-        var fOus = slotCard(grid, "Organizational units");
-        var fComputers = slotCard(grid, "Computers");
-        function errNode(e) { return el("div", "al-alert err", String(e)); }
-        run("user-list").then(function (r) {
-            var box = el("div");
-            var filter = el("input"); filter.type = "search"; filter.placeholder = "filter…";
-            filter.style.marginBottom = "0.5rem"; box.appendChild(filter);
-            var holder = el("div"); box.appendChild(holder);
-            function draw() {
-                clear(holder);
-                var f = filter.value.toLowerCase();
-                var names = r.users.filter(function (u) { return !f || u.toLowerCase().indexOf(f) >= 0; }).slice(0, 200);
-                holder.appendChild(emptyOr(names, ["user", "actions"], function (u) {
-                    var b = el("div", "al-actions");
-                    [["show", "user-show"], ["set password", "user-setpassword"],
-                     ["disable", "user-disable"], ["enable", "user-enable"],
-                     ["delete", "user-delete"]].forEach(function (p) {
-                        b.appendChild(actionButton(p[0], p[1], { name: u }));
-                    });
-                    return [u, b];
-                }, f ? "no users match the filter" : "no users"));
-            }
-            filter.addEventListener("input", draw); draw();
-            fUsers(box, "Users (" + r.count + ")");
-        }).catch(function (e) { fUsers(errNode(e)); });
-        run("group-list").then(function (r) {
-            fGroups(emptyOr(r.groups.slice(0, 150), ["group", "actions"], function (g) {
-                var b = el("div", "al-actions");
-                [["members", "group-show"], ["add member", "group-add-member"],
-                 ["remove member", "group-remove-member"], ["delete", "group-delete"]].forEach(function (p) {
-                    var preset = p[1] === "group-show" ? { name: g } : { group: g };
-                    b.appendChild(actionButton(p[0], p[1], preset));
-                });
-                return [g, b];
-            }, "no groups"), "Groups (" + r.groups.length + ")");
-        }).catch(function (e) { fGroups(errNode(e)); });
-        run("ou-list").then(function (r) {
-            fOus(emptyOr(r.ous, ["OU", ""], function (o) {
-                var b = el("div", "al-actions");
-                b.appendChild(actionButton("delete", "ou-delete", { dn: o }));
-                return [o, b];
-            }, "no organizational units"));
-        }).catch(function (e) { fOus(errNode(e)); });
-        run("computer-list").then(function (r) {
-            fComputers(emptyOr(r.computers, ["account"], function (x) { return [x]; }, "no computers"),
-                       "Computers (" + r.computers.length + ")");
-        }).catch(function (e) { fComputers(errNode(e)); });
-    }
 
     // ------------------------------------------- Users & Computers (dsa.msc)
     // A three-pane object console: a container/OU tree on the left, a
@@ -608,7 +556,7 @@
     var aduc = {
         base: null, classes: null, advanced: false, search: "",
         extraCols: ["description"], selected: null, previewMode: "tabs",
-        treeFilter: "", expanded: {}, treeWidth: 600, nodes: [], schemaCache: {},
+        treeFilter: "", expanded: {}, treeWidth: 300, nodes: [], schemaCache: {},
     };
     var aducReload = null;      // set by renderObjects; modals call it after a write
 
@@ -656,7 +604,9 @@
         wrap.appendChild(prevPane);
         m.appendChild(wrap);
 
-        makeSplitter(split1, treePane, 320, 1000, function (w) { aduc.treeWidth = w; });
+        // Floor is below the default so the default width is actually reachable by
+        // dragging: a 300px default under a 320px floor would snap wider on first drag.
+        makeSplitter(split1, treePane, 200, 1000, function (w) { aduc.treeWidth = w; });
         makeSplitter(split2, prevPane, 280, 900, null, true);
 
         // ---- left: filtered container tree -----------------------------
@@ -1987,7 +1937,27 @@
         var expanded = {}, selGroup = null;
 
         modal("Edit Group Policy", function (box) {
-            box.appendChild(el("div", "hint", "GPO: ")).appendChild(el("kbd", "al", target));
+            // Identify the GPO by its DISPLAY NAME, not just the GUID. A GUID alone
+            // cannot be checked against intent — {31B2F340-...} and {6AC1786C-...}
+            // are the two default policies and differ by one character in a glance.
+            // The name is resolved asynchronously; the GUID renders immediately so
+            // the header never sits empty, and stays visible because it is what the
+            // URL, the backend verbs and SYSVOL all key on.
+            var head = el("div", "al-edit-head");
+            var nameEl = el("div", "al-edit-gpo-name", "\u2026");
+            var guidLine = el("div", "hint", "GPO: ");
+            guidLine.appendChild(el("kbd", "al", target));
+            head.appendChild(nameEl); head.appendChild(guidLine);
+            box.appendChild(head);
+            run("gpo-show", { gpo: target }).then(function (r) {
+                var n = r && r.meta && r.meta.display_name;
+                nameEl.textContent = n || "(unnamed GPO)";
+                if (!n) nameEl.classList.add("muted");
+            }, function () {
+                // A failed lookup must not imply the GPO is nameless.
+                nameEl.textContent = "(name unavailable)";
+                nameEl.classList.add("muted");
+            });
             var panes = el("div", "al-edit-panes");
             var treePane = el("div", "al-edit-tree"); treePane.style.width = "500px";
             var splitter = el("div", "al-edit-splitter");
@@ -2462,7 +2432,7 @@
     }
 
     // ---------------------------------------------------------------- boot
-    var RENDER = { overview: renderOverview, users: renderUsers,
+    var RENDER = { overview: renderOverview,
                    objects: renderObjects, gpo: renderGpo,
                    sites: renderSites, dns: renderDns, dcs: renderDcs,
                    clients: renderClients, activity: renderActivity };
