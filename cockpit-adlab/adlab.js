@@ -1937,7 +1937,27 @@
         var expanded = {}, selGroup = null;
 
         modal("Edit Group Policy", function (box) {
-            box.appendChild(el("div", "hint", "GPO: ")).appendChild(el("kbd", "al", target));
+            // Identify the GPO by its DISPLAY NAME, not just the GUID. A GUID alone
+            // cannot be checked against intent — {31B2F340-...} and {6AC1786C-...}
+            // are the two default policies and differ by one character in a glance.
+            // The name is resolved asynchronously; the GUID renders immediately so
+            // the header never sits empty, and stays visible because it is what the
+            // URL, the backend verbs and SYSVOL all key on.
+            var head = el("div", "al-edit-head");
+            var nameEl = el("div", "al-edit-gpo-name", "\u2026");
+            var guidLine = el("div", "hint", "GPO: ");
+            guidLine.appendChild(el("kbd", "al", target));
+            head.appendChild(nameEl); head.appendChild(guidLine);
+            box.appendChild(head);
+            run("gpo-show", { gpo: target }).then(function (r) {
+                var n = r && r.meta && r.meta.display_name;
+                nameEl.textContent = n || "(unnamed GPO)";
+                if (!n) nameEl.classList.add("muted");
+            }, function () {
+                // A failed lookup must not imply the GPO is nameless.
+                nameEl.textContent = "(name unavailable)";
+                nameEl.classList.add("muted");
+            });
             var panes = el("div", "al-edit-panes");
             var treePane = el("div", "al-edit-tree"); treePane.style.width = "500px";
             var splitter = el("div", "al-edit-splitter");
