@@ -21,6 +21,27 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HELPER = os.path.join(HERE, "..", "adlab-admin")
+_LABSRC = os.path.abspath(os.path.join(HERE, "..", ".."))  # samba-ad-lab/source
+
+# adlab-admin now resolves its configuration per DEPLOY-CONTRACT section 4.3
+# (install.conf -> ENV_FILE -> the six ADLAB_* keys) and no longer discovers the
+# tree. The tests supply config the sanctioned way: $ADLAB_ENV (section 4.3
+# step 1 — honoured only for a non-root caller on a file it owns, which is
+# exactly `unittest` run as a normal user). It points the keys at the real,
+# checked-in lab.env/rdp.env so LAB matches the lab under test; SECRET_DIR and
+# the GPO/sysvol locations are paths the verbs name but the FakeRunner never opens.
+_envfd, _ENVPATH = tempfile.mkstemp(prefix="adlab-test-", suffix=".env")
+os.write(_envfd, ("\n".join([
+    "ADLAB_ROOT=%s" % _LABSRC,
+    "ADLAB_LAB_ENV=%s" % os.path.join(_LABSRC, "lab.env"),
+    "ADLAB_RDP_ENV=%s" % os.path.join(_LABSRC, "rdp", "rdp.env"),
+    "ADLAB_SYSVOL_REPLICATE=%s" % os.path.join(_LABSRC, "sysvol", "sysvol-replicate.sh"),
+    "ADLAB_SECRET_DIR=%s" % os.path.join(_LABSRC, "..", ".secrets"),
+    "ADLAB_GPO_TEMPLATE_DIR=/var/lib/samba/gpo-templates",
+    "",
+])).encode())
+os.close(_envfd)
+os.environ["ADLAB_ENV"] = _ENVPATH
 
 loader = importlib.machinery.SourceFileLoader("adlab_admin", HELPER)
 spec = importlib.util.spec_from_loader("adlab_admin", loader)
@@ -262,6 +283,39 @@ class TestSchema(Base):
         rc, out = self.call_main(["version"])
         self.assertEqual(rc, 0)
         self.assertEqual(out["realm"], mod.LAB["REALM"])
+
+    def test_config_verb_reports_resolved_paths(self):
+        # config is a meta verb; README.md and .envdefault point operators at it,
+        # so it must be computed (never go stale). It reports which .env was read,
+        # how it was found, and every resolved path with whether it exists.
+        rc, out = self.call_main(["config"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["version"], mod.VERSION)
+        self.assertEqual(out["env_file"], mod.ENV_FILE)
+        self.assertEqual(out["env_file_source"], "env:ADLAB_ENV")  # tests use the 4.3 override
+        self.assertEqual(out["install_conf"], mod.INSTALL_CONF)
+        for key in ("lab_env", "rdp_env", "sysvol_replicate", "secret_dir",
+                    "admin_pass_file", "gpo_template_dir", "audit_log"):
+            self.assertIn(key, out["paths"])
+            self.assertIn("exists", out["paths"][key])
+        # the credential file is joined onto ADLAB_SECRET_DIR, never lab.env's literal
+        apf = out["paths"]["admin_pass_file"]["path"]
+        self.assertTrue(apf.endswith("/administrator.pass"))
+        self.assertNotIn("$", apf)
+
+    def test_lab_verb_fails_loudly_without_config(self):
+        # DEPLOY-CONTRACT 4.3 step 3: with no resolved .env a LAB verb fails,
+        # naming install.conf, while meta verbs stay usable for diagnosis.
+        old_ef, old_le = mod.ENV_FILE, mod.LAB_ENV
+        mod.ENV_FILE, mod.LAB_ENV = None, ""
+        try:
+            rc, out = self.call_main(["status"])
+            self.assertEqual(rc, 1)
+            self.assertIn("install.conf", out["error"])
+            rc2, _ = self.call_main(["config"])   # meta verb unaffected
+            self.assertEqual(rc2, 0)
+        finally:
+            mod.ENV_FILE, mod.LAB_ENV = old_ef, old_le
 
 
 # ---------------------------------------------------------------------------
