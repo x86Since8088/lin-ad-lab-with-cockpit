@@ -5,6 +5,27 @@ which was retired to a tombstone that day. It is kept here, with the code it
 describes, because nothing else in this repository records these findings.
 It is a POINT-IN-TIME analysis, not a live status page: re-verify before acting.
 
+## RESOLUTION (2026-09-11, adlab-admin 1.1.0)
+
+The central gap below — "adlab-admin does not read `.env`, does not read
+`install.conf`, and uses none of its six `REQUIRED_ENV` keys" — is **closed**.
+`adlab-admin` now resolves its configuration per DEPLOY-CONTRACT §4.3:
+`$ADLAB_ENV` (tests only, non-root, owned) → `ENV_FILE=` from
+`/etc/cockpit-adlab/install.conf` → else fail loudly naming install.conf. There
+is no discovery sweep and no path relative to the helper, so §4.4's four standing
+greps pass. Every storage location now comes from the `.env`'s six `ADLAB_*`
+keys; `ADMIN_PASS_FILE` is joined onto `ADLAB_SECRET_DIR` by the consumer (never
+lab.env's un-interpolated `$SECRET_DIR` literal, a bug this exposed). The
+`config` verb (new) reports which `.env` was read, how, and every resolved path
+with whether it exists — so `.envdefault`/README's "check with `adlab-admin
+config`" is now real, and "adlab-admin reads this file on every call" is now
+true. On edt1 this was deployed as a **dev install** (per-file symlinks into the
+checkout, `.env` pointing at the checkout's locations), replacing the stale
+regular-file `/usr/local/sbin/adlab-admin` copy with a proper symlink. Verified
+live: `status` (5 DCs), `domain-info` (dc1, forest ad.edt1.lab), 118 unit tests.
+Still open below: the sysvol-replicate units running off the share as root (a
+samba-ad-lab-side, DEV-unit concern outside this plugin's deploy path).
+
 ---
 
 # cockpit-adlab
