@@ -26,6 +26,8 @@
 !42-tls-from-edy-ca.sh
 !45-agent-verify.sh
 !99-down.sh
+!install-start.sh
+!samba-ad-lab.service
 
 # ---- tracked trees ----------------------------------------------------------
 !docs

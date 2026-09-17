@@ -1,0 +1,34 @@
+[Unit]
+Description=Start Samba AD lab containers after boot
+Documentation=file://@LAB_DIR@/docs/operations/LIFECYCLE.md
+# DCs, clients and RDP targets have RestartPolicy=no on purpose: a parallel
+# podman-restart would bring clients up before LDAP is serving and with
+# aardvark DNS (no AD zone). This unit is the ordered recovery path.
+After=network-online.target
+After=podman.socket
+After=podman-restart.service
+After=lab-edt-bridge.service
+After=edy-proxy-go.service
+Wants=network-online.target
+Wants=podman.socket
+# Agents inside the lab containers are installed by 21-start.sh; the generic
+# edy-container-agents sweep should see them already running when both fire.
+Before=edy-container-agents.service
+Before=sysvol-replicate.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Load-bearing. Default KillMode=control-group SIGTERMs conmon when this
+# oneshot exits, which kills every lab container and desyncs podman state
+# (inspect says running, exec says not running). Same trap as
+# edy-container-agents.service.
+KillMode=process
+TimeoutStartSec=600
+Restart=on-failure
+RestartSec=15
+ExecStart=@LAB_DIR@/21-start.sh
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -50,10 +50,11 @@ interactive sudo); the scripts assert `EUID -eq 0` and drive rootful podman.
 ./30-verify.sh
 ```
 
-After a host reboot the containers are `exited` but their state persists —
-`./21-start.sh` brings the lab back (starts in order, restores AD DNS, restarts
-agents). `./99-down.sh` removes containers but KEEPS state; `--purge` wipes it
-for a fresh forest.
+After a host reboot the containers are `exited` but their state persists.
+`samba-ad-lab.service` (`./install-start.sh`) runs `./21-start.sh` at boot —
+starts in order, restores AD DNS, restarts agents. Manual recovery is still
+`./21-start.sh` or `systemctl restart samba-ad-lab`. `./99-down.sh` removes
+containers but KEEPS state; `--purge` wipes it for a fresh forest.
 
 ## Secrets
 

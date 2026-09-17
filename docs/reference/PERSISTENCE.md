@@ -32,8 +32,8 @@ client" (it just starts) — so `up` is now idempotent and non-destructive.
   because these are adcli-joined clients with no secrets.tdb).
 - **Fresh forest:** `./99-down.sh --purge` deletes the state dirs; the next
   `up` provisions anew. Plain `./99-down.sh` keeps state.
-- **Reboot/crash:** `21-start.sh` still restores resolv.conf + agents, and now
-  the state it starts is on durable host storage.
+- **Reboot/crash:** `samba-ad-lab.service` runs `21-start.sh` at boot (ordered
+  start, resolv.conf, agents). The state it starts is on durable host storage.
 - The agent binary is not persisted (it is not in the image); `40-agent.sh`
   reinstalls it after a recreate and restarts each agent under its SAME pinned
   identity because `/etc/edy-agent` persists.
