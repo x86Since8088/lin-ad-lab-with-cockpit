@@ -100,19 +100,23 @@ as root and says so on stderr.
 
 ## The other copy
 
-`projects/cockpit-adlab/source` is untracked and was byte-identical to this
-directory apart from `__pycache__`. **A human should delete it**, and nothing here
-can or should do it:
+**Reconciled 2026-09-11.** `projects/cockpit-adlab/source` is gone. It was
+verified first, not assumed: every shared file was byte-identical to this
+directory, the only content difference was a superseded 1.6 KB `install.sh`, and
+no unit, service or script on the host referenced it. A backup of the removed
+tree is at `_migration-preserve-20260905/cockpit-adlab-RETIRED-20260911.tar.gz`.
 
-```bash
-rm -rf /srv/smb/share/sc/ai-orchestrator-group/ai-orchestrator-storage/projects/cockpit-adlab
-```
+One correction to what this section used to say. It claimed that copy's
+`project_scope.md` and `config.json` were "superseded by this README". The
+`config.json` was, and is gone. The `project_scope.md` was **not** — it was the
+newest file in either copy and carried a verified analysis of where the shipped
+helper departs from `DEPLOY-CONTRACT.md`, which appears nowhere else. Deleting the
+directory wholesale, as this section previously instructed, would have destroyed
+it. It is preserved at `docs/CONTRACT-GAP.md`.
 
-Nothing in git references it; it is not a submodule and not a remote. Its
-`project_scope.md` and `config.json` describe this same plugin and are superseded
-by this README and by the repository they now live in. The place that name should
-point at from now on is `/opt/cockpit-adlab` — the *output* of `deploy.sh`, not a
-checkout.
+`projects/cockpit-adlab/` now holds only a tombstone `project_scope.md` pointing
+here and at `/opt/cockpit-adlab` — the *output* of `deploy.sh`, not a checkout,
+and the place that name should point at from now on.
 
 ## Conformance (DEPLOY-CONTRACT)
 
