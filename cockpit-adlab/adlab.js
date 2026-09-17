@@ -465,7 +465,7 @@
     // ---------------------------------------------------------------- tabs
     var TABS = [
         ["overview", "Overview"],
-        ["objects", "Users & Computers"],
+        ["objects", "AD Objects"],
         ["gpo", "Group Policy"], ["sites", "Sites & Replication"],
         ["dns", "DNS"], ["domains", "Domains"], ["dcs", "Domain Controllers"],
         ["clients", "Clients"], ["activity", "Activity"],
@@ -606,10 +606,16 @@
         [0x00400000, "Do not require Kerberos preauthentication"],
     ];
 
+    // A synthetic tree node (not a real directory object): the "Group Policy
+    // Objects" folder. Selecting it lists every GPO in the middle pane and its
+    // links in the preview — the GPMC "Group Policy Objects" container, in the
+    // AD Objects console. The \0 prefix guarantees it never collides with a DN.
+    var GPO_NODE = " GPOs";
     var aduc = {
         base: null, classes: null, advanced: false, search: "",
         extraCols: ["description"], selected: null, previewMode: "tabs",
         treeFilter: "", expanded: {}, treeWidth: 300, nodes: [], schemaCache: {},
+        gpoSel: null, gpoList: null,   // GPO folder: selected GUID + cached gpo-list
     };
     var aducReload = null;      // set by renderObjects; modals call it after a write
 
@@ -697,16 +703,19 @@
                 aduc.expanded[dn] = !open; drawTree();
             });
             row.appendChild(tog);
-            var lbl = el("span", "al-tree-label wrap", node.name);
+            var lbl = el("span", "al-tree-label wrap", (node.synthetic ? "🗐 " : "") + node.name);
             if (node.system) lbl.appendChild(badge("sys", "dim"));
             row.appendChild(lbl);
             row.addEventListener("click", function () {
-                aduc.base = dn; aduc.selected = null; drawTree(); loadList(); drawPreview();
+                aduc.base = dn; aduc.selected = null; aduc.gpoSel = null;
+                drawTree(); loadList(); drawPreview();
             });
-            row.addEventListener("contextmenu", function (ev) { ev.preventDefault(); treeNodeMenu(node, ev.clientX, ev.clientY); });
-            var tkeb = el("button", "al-kebab", "⋯"); tkeb.type = "button"; tkeb.title = "actions";
-            tkeb.addEventListener("click", function (ev) { ev.stopPropagation(); var b = tkeb.getBoundingClientRect(); treeNodeMenu(node, b.right, b.bottom); });
-            row.appendChild(tkeb);
+            if (!node.synthetic) {   // real directory objects get the object context menu
+                row.addEventListener("contextmenu", function (ev) { ev.preventDefault(); treeNodeMenu(node, ev.clientX, ev.clientY); });
+                var tkeb = el("button", "al-kebab", "⋯"); tkeb.type = "button"; tkeb.title = "actions";
+                tkeb.addEventListener("click", function (ev) { ev.stopPropagation(); var b = tkeb.getBoundingClientRect(); treeNodeMenu(node, b.right, b.bottom); });
+                row.appendChild(tkeb);
+            }
             treeHost.appendChild(row);
             if (kids.length && open) kids.forEach(function (c) { drawNode(c.dn, depth + 1); });
         }
@@ -720,7 +729,13 @@
             treeHost.appendChild(el("div", "al-loading", "loading tree…"));
             run("object-tree", { system: aduc.advanced ? "yes" : "" }).then(function (r) {
                 aduc.nodes = r.nodes || [];
+                // Append the synthetic "Group Policy Objects" folder as a root
+                // sibling of the domain. parent is a sentinel absent from byDn,
+                // so drawTree() treats it as a root; it has no real children.
+                aduc.nodes.push({ dn: GPO_NODE, parent: " root",
+                                  name: "Group Policy Objects", class: "gpoFolder", synthetic: true });
                 aduc.byDn = {}; aduc.nodes.forEach(function (n) { aduc.byDn[n.dn] = n; });
+                aduc.rootBase = r.base;   // the domain root DN (its children are the tree roots)
                 if (!aduc.base || !aduc.byDn[aduc.base]) aduc.base = r.base;
                 drawTree(); loadList();
             }).catch(function (e) { clear(treeHost); treeHost.appendChild(el("div", "al-alert err", String(e))); });
@@ -767,6 +782,7 @@
 
         function columns() { return ["name", "class"].concat(aduc.extraCols); }
         function loadList() {
+            if (aduc.base === GPO_NODE) { loadGpoList(); return; }
             if (!aduc.base) { clear(tableWrap); tableWrap.appendChild(el("div", "hint", "select a container in the tree")); summary.textContent = ""; return; }
             clear(tableWrap); tableWrap.appendChild(el("div", "al-loading", "listing objects…"));
             var classes = aducActiveClasses();
@@ -815,6 +831,128 @@
         aducSelect = function (dn) {   // jump the preview to a referenced object
             aduc.selected = dn; aduc.selectedName = dnRdn(dn); aduc.selectedSam = null; drawPreview();
         };
+
+        // ---- GPOs folder: list + preview + links ----------------------
+        function gpoDisplayName(guid) {
+            var list = aduc.gpoList || [], u = String(guid).toUpperCase();
+            for (var i = 0; i < list.length; i++)
+                if (String(list[i].gpo).toUpperCase() === u) return list[i].display_name || guid;
+            return guid;
+        }
+        function matchGpoGuid(guid) {   // the exact gpo-list key matching a gPLink GUID (for row highlight)
+            var list = aduc.gpoList || [], u = String(guid).toUpperCase();
+            for (var i = 0; i < list.length; i++)
+                if (String(list[i].gpo).toUpperCase() === u) return list[i].gpo;
+            return guid;
+        }
+        function withGpoNames(cb) {   // ensure aduc.gpoList is populated, then run cb (best-effort)
+            if (aduc.gpoList) { cb(); return; }
+            run("gpo-list").then(function (r) { aduc.gpoList = r.gpos || []; cb(); }).catch(function () { cb(); });
+        }
+        // A container's gPLink -> [{dn, guid, disabled, enforced}] (order as stored).
+        function parseGplink(raw) {
+            var s = Array.isArray(raw) ? raw.join("") : (raw || "");
+            var out = [], re = /\[LDAP:\/\/(CN=\{[0-9A-Fa-f-]+\}[^;]*);(\d+)\]/g, m;
+            while ((m = re.exec(s))) {
+                var dn = m[1], opt = parseInt(m[2], 10) || 0, gm = /\{[0-9A-Fa-f-]+\}/.exec(dn);
+                out.push({ dn: dn, guid: gm ? gm[0] : dn, disabled: !!(opt & 1), enforced: !!(opt & 2) });
+            }
+            return out;
+        }
+        function gotoContainer(dn) {   // jump from a GPO's link list to that container in the tree
+            if (aduc.byDn[dn] || dn === aduc.rootBase) { aduc.base = dn; aduc.selected = null; aduc.gpoSel = null; drawTree(); loadList(); drawPreview(); }
+            else transientModal("Linked container", function (b) {
+                b.appendChild(el("div", "hint", "This container is outside the object tree:"));
+                b.appendChild(el("kbd", "al", dn));
+            });
+        }
+        function gpoRowMenu(g, x, y) {
+            contextMenu(x, y, [
+                { label: "Edit settings…", onClick: function () { openModal("gpo-edit", { target: g.gpo }); } },
+                { label: "Advanced compose…", onClick: function () { openModal("gpo-compose", { target: g.gpo }); } },
+                { label: "Details…", onClick: function () { openModal("gpo-detail", { target: g.gpo }); } },
+                { label: "Preferences…", onClick: function () { openModal("gpo-prefs", { target: g.gpo }); } },
+                { sep: true },
+                { label: "Link to a container…", onClick: function () { openModal("gpo-link", { gpo: g.gpo }); } },
+                { label: "Refresh", onClick: function () { loadGpoList(); } },
+            ]);
+        }
+        function loadGpoList() {
+            clear(tableWrap); tableWrap.appendChild(el("div", "al-loading", "listing GPOs…"));
+            summary.textContent = "";
+            run("gpo-list").then(function (r) {
+                aduc.gpoList = r.gpos || [];
+                clear(tableWrap);
+                var t = el("table", "al al-objtable");
+                var hr = el("tr");
+                ["name", "version", "GUID"].forEach(function (c) { hr.appendChild(el("th", null, c)); });
+                hr.appendChild(el("th", "al-kebhdr", ""));
+                t.appendChild(hr);
+                aduc.gpoList.forEach(function (g) {
+                    var tr = el("tr", (aduc.gpoSel === g.gpo) ? "sel" : "");
+                    tr.appendChild(el("td", null, g.display_name || "(unnamed)"));
+                    tr.appendChild(el("td", null, g.version || ""));
+                    tr.appendChild(el("td", "al-gpo-guid", g.gpo));
+                    function selectRow() {
+                        aduc.gpoSel = g.gpo; aduc.selected = null;
+                        [].forEach.call(t.querySelectorAll("tr.sel"), function (x) { x.className = ""; });
+                        tr.className = "sel"; drawPreview();
+                    }
+                    tr.addEventListener("click", selectRow);
+                    tr.addEventListener("dblclick", function () { openModal("gpo-edit", { target: g.gpo }); });
+                    tr.addEventListener("contextmenu", function (ev) { ev.preventDefault(); selectRow(); gpoRowMenu(g, ev.clientX, ev.clientY); });
+                    var kcell = el("td", "al-kebcell");
+                    var rkeb = el("button", "al-kebab", "⋯"); rkeb.type = "button"; rkeb.title = "actions";
+                    rkeb.addEventListener("click", function (ev) { ev.stopPropagation(); selectRow(); var b = rkeb.getBoundingClientRect(); gpoRowMenu(g, b.right, b.bottom); });
+                    kcell.appendChild(rkeb); tr.appendChild(kcell);
+                    t.appendChild(tr);
+                });
+                tableWrap.appendChild(t);
+                summary.textContent = aduc.gpoList.length + " GPO" + (aduc.gpoList.length === 1 ? "" : "s") +
+                    (r.pdc_emulator ? " · " + r.pdc_emulator : "");
+            }).catch(function (e) { clear(tableWrap); tableWrap.appendChild(el("div", "al-alert err", String(e))); });
+        }
+        function drawGpoPreview() {
+            clear(prevPane);
+            var hdr = el("div", "al-prev-hdr");
+            hdr.appendChild(el("div", "al-prev-title", aduc.gpoSel ? gpoDisplayName(aduc.gpoSel) : "Group Policy Objects"));
+            prevPane.appendChild(hdr);
+            var actbar = el("div", "al-prev-actions");
+            function abtn(label, cls, fn, dis) { var b = el("button", "al-btn " + (cls || "secondary"), label); if (dis) b.disabled = true; else b.addEventListener("click", fn); actbar.appendChild(b); return b; }
+            var g = aduc.gpoSel;
+            abtn("Edit settings", "", function () { openModal("gpo-edit", { target: g }); }, !g);
+            abtn("Details", "secondary", function () { openModal("gpo-detail", { target: g }); }, !g);
+            abtn("Link…", "secondary", function () { openModal("gpo-link", { gpo: g }); }, !g);
+            abtn("⟳", "secondary", function () { drawPreview(); }, !g);
+            prevPane.appendChild(actbar);
+            var body = el("div", "al-prev-body"); prevPane.appendChild(body);
+            if (!g) { body.appendChild(el("div", "hint", "select a GPO to see its links and settings")); return; }
+            body.appendChild(el("div", "al-loading", "loading…"));
+            run("gpo-show", { gpo: g }).then(function (r) {
+                clear(body);
+                var meta = r.meta || {}, metaRows = [];
+                if (meta.display_name) metaRows.push(["display name", meta.display_name]);
+                metaRows.push(["GUID", g]);
+                if (meta.path) metaRows.push(["path", meta.path]);
+                if (meta.version) metaRows.push(["version", meta.version]);
+                metaRows.push(["registry settings", String((r.settings || []).length)]);
+                var secM = el("div", "al-prev-sec"); secM.appendChild(el("h4", null, "GPO"));
+                secM.appendChild(tableOf(["", ""], metaRows)); body.appendChild(secM);
+                var lk = r.links || [];
+                var secL = el("div", "al-prev-sec"); secL.appendChild(el("h4", null, "Links (" + lk.length + ")"));
+                if (!lk.length) secL.appendChild(el("div", "hint", "not linked to any container"));
+                else {
+                    var box = el("div", "al-valcell");
+                    lk.forEach(function (dn) {
+                        var a = el("a", "al-dnval al-dnlink", dn); a.href = "#"; a.title = "go to " + dn;
+                        a.addEventListener("click", function (ev) { ev.preventDefault(); gotoContainer(dn); });
+                        box.appendChild(a);
+                    });
+                    secL.appendChild(box);
+                }
+                body.appendChild(secL);
+            }).catch(function (e) { clear(body); body.appendChild(el("div", "al-alert err", String(e))); });
+        }
 
         // ---- context-menu actions (tree nodes + object rows) ----------
         var NEW_CLASSES = [["organizationalUnit", "Organizational Unit"], ["user", "User"],
@@ -919,6 +1057,7 @@
 
         // ---- right: docked preview + actions ---------------------------
         function drawPreview() {
+            if (aduc.base === GPO_NODE) { drawGpoPreview(); return; }
             clear(prevPane);
             var hdr = el("div", "al-prev-hdr");
             var title = el("div", "al-prev-title", aduc.selected ? aduc.selectedName : "No selection");
@@ -971,6 +1110,36 @@
                     body.appendChild(tableOf(["attribute", "value"], names.map(function (n) {
                         return [n, formatValue({ attr: n, multi: obj.attrs[n].length > 1 }, obj.attrs[n])];
                     })));
+                }
+                // Linked GPOs: parse this container's gPLink so the OU/domain
+                // side of the link is viewable too (names resolved, enforced/
+                // disabled flagged, click jumps to the GPO in the GPOs folder).
+                if (obj.attrs && obj.attrs.gPLink) {
+                    var glinks = parseGplink(obj.attrs.gPLink);
+                    if (glinks.length) {
+                        var secG = el("div", "al-prev-sec");
+                        secG.appendChild(el("h4", null, "Linked GPOs (" + glinks.length + ")"));
+                        var holder = el("div"); secG.appendChild(holder); body.appendChild(secG);
+                        withGpoNames(function () {
+                            clear(holder);
+                            var box = el("div", "al-valcell");
+                            glinks.forEach(function (lki) {
+                                var line = el("div", "al-gpolink");
+                                var a = el("a", "al-dnlink", gpoDisplayName(lki.guid)); a.href = "#";
+                                a.title = "open " + lki.guid;
+                                a.addEventListener("click", function (ev) {
+                                    ev.preventDefault();
+                                    aduc.base = GPO_NODE; aduc.gpoSel = matchGpoGuid(lki.guid); aduc.selected = null;
+                                    drawTree(); loadList(); drawPreview();
+                                });
+                                line.appendChild(a);
+                                if (lki.enforced) line.appendChild(badge("enforced", "warn"));
+                                if (lki.disabled) line.appendChild(badge("disabled", "dim"));
+                                box.appendChild(line);
+                            });
+                            holder.appendChild(box);
+                        });
+                    }
                 }
             }).catch(function (e) { clear(body); body.appendChild(el("div", "al-alert err", String(e))); });
         }
