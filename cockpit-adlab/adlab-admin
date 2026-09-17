@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 
 
 def _require_config():
@@ -1735,6 +1735,155 @@ def _write_catalog_tags(tags):
         json.dump(tags, f, indent=2, sort_keys=True)
     os.chmod(CATALOG_TAGS_FILE, 0o600)
 
+# ---- persistent ADMX catalog cache ----------------------------------------
+# Parsing the whole ADMX central store is a per-file `podman exec` read for
+# every .admx/.adml -- thousands of policies, tens of seconds -- and the editor
+# paid it on every open. The cache stores each ADMX file's PARSED policies keyed
+# by a 'size:mtime' signature, so a refresh re-reads only files newer than the
+# cache (differential), purges entries whose ADMX no longer exists (delete
+# detection), and keeps the rest. OS/subsystem facets + operator tag overrides
+# are applied at SERVE time, not cached, so retagging never needs a re-parse.
+CATALOG_CACHE_FILE = "/var/lib/adlab/catalog-cache.json"   # host, world-readable
+CATALOG_CACHE_VERSION = 1                                  # bump to invalidate
+
+
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _read_catalog_cache():
+    try:
+        with open(CATALOG_CACHE_FILE) as f:
+            c = json.load(f)
+            return c if isinstance(c, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_catalog_cache(cache):
+    # 0644 in a world-readable dir ON PURPOSE: the browser subscribes to a
+    # Cockpit fswatch on this file to learn when the catalog refreshed, and the
+    # session user (not root) must be able to watch it. It holds only ADMX policy
+    # metadata, no secrets. Atomic replace: a watcher never sees a half file, and
+    # the mtime bump IS the refresh event the browser reacts to.
+    d = os.path.dirname(CATALOG_CACHE_FILE)
+    os.makedirs(d, exist_ok=True)
+    try:
+        os.chmod(d, 0o755)
+    except OSError:
+        pass
+    tmp = CATALOG_CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cache, f)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, CATALOG_CACHE_FILE)
+
+
+def _admx_signatures(dc, root, lang):
+    """One exec: every ADMX (and the lang's ADML) in the central store with a
+    'size:mtime' signature. Returns (admx_sigs, adml_by_lower):
+      admx_sigs     = {admx_path: "size:mtime"}
+      adml_by_lower = {adml_basename_lower: (adml_path, "size:mtime")}"""
+    pd = "%s/PolicyDefinitions" % root
+    cmd = (r"find %s -maxdepth 2 \( -iname '*.admx' -o -iname '*.adml' \) "
+           r"-printf '%%p\t%%s\t%%T@\n' 2>/dev/null" % shq(pd))
+    rc, out, _ = podman(dc, ["bash", "-c", cmd])
+    admx, adml = {}, {}
+    lang_seg = ("/%s/" % lang).lower()
+    for line in (out or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        path, size, mtime = parts
+        sig = "%s:%s" % (size, mtime)
+        low = path.lower()
+        if low.endswith(".admx"):
+            admx[path] = sig
+        elif low.endswith(".adml") and lang_seg in low:
+            adml[path.rsplit("/", 1)[-1].lower()] = (path, sig)
+    return admx, adml
+
+
+def _adml_for(admx_path, adml_by_lower):
+    return adml_by_lower.get((admx_path.rsplit("/", 1)[-1][:-5] + ".adml").lower())
+
+
+def _catalog_diff(cached_admx, cur_admx_sigs, adml_by_lower, force=False):
+    """PURE: decide per-ADMX-file actions for a differential refresh. Returns
+    (to_parse, reused, deleted):
+      to_parse = [(admx_path, adml_path_or_None, admx_sig, adml_sig)]  -- (re)ingest
+      reused   = [admx_path ...]   unchanged; keep the cached policies
+      deleted  = [admx_path ...]   in the cache but no longer backed -> purge"""
+    deleted = [p for p in cached_admx if p not in cur_admx_sigs]
+    to_parse, reused = [], []
+    for path, sig in cur_admx_sigs.items():
+        adml = _adml_for(path, adml_by_lower)
+        adml_sig = adml[1] if adml else ""
+        cur = cached_admx.get(path)
+        if (not force) and cur and cur.get("sig") == sig and cur.get("adml_sig") == adml_sig:
+            reused.append(path)
+        else:
+            to_parse.append((path, adml[0] if adml else None, sig, adml_sig))
+    return to_parse, reused, deleted
+
+
+def _parse_one_admx(dc, admx_path, adml_path):
+    """Parse ONE ADMX file's policies, names resolved against its ADML."""
+    xml = _read_b64(dc, admx_path)
+    if xml is None:
+        return []
+    name = admx_path.rsplit("/", 1)[-1]
+    adml = _read_b64(dc, adml_path) if adml_path else None
+    strings = parse_adml(adml) if adml else {}
+    out = []
+    for p in parse_admx(xml):
+        p["admx"] = name
+        p["display"] = _resolve_ref(p.get("display", ""), strings) or p.get("id", "")
+        p["explain"] = _resolve_ref(p.get("explain", ""), strings)
+        disp = p["display"]
+        p["unresolved"] = (not disp) or disp.startswith("string.") \
+            or bool(re.match(r'^POL_[0-9A-Fa-f_]+$', disp))
+        out.append(p)
+    return out
+
+
+def _refresh_catalog_cache(force=False):
+    """Differentially refresh the persistent ADMX catalog cache. Stats the central
+    store once, re-parses only ADMX whose file (or its ADML) changed, purges
+    entries whose ADMX no longer exists, keeps the rest. Rewrites the cache file
+    ONLY when something changed, so a Cockpit fswatch fires only on real change.
+    Returns (cache, changed, stats)."""
+    dc = pdc_emulator()
+    root = _pol_root(dc)
+    lang = "en-US"
+    admx_sigs, adml_by_lower = _admx_signatures(dc, root, lang)
+    cache = _read_catalog_cache()
+    if (cache.get("version") != CATALOG_CACHE_VERSION or cache.get("pol_root") != root
+            or cache.get("lang") != lang or "admx" not in cache):
+        cache = {"version": CATALOG_CACHE_VERSION, "pol_root": root, "lang": lang, "admx": {}}
+        force = True
+    admx = cache["admx"]
+    to_parse, reused, deleted = _catalog_diff(admx, admx_sigs, adml_by_lower, force)
+    for p in deleted:
+        admx.pop(p, None)
+    for path, adml_path, sig, adml_sig in to_parse:
+        admx[path] = {"sig": sig, "adml_sig": adml_sig,
+                      "policies": _parse_one_admx(dc, path, adml_path)}
+    changed = bool(to_parse or deleted)
+    if changed:
+        cache["built"] = _now_iso()
+        cache["on"] = dc
+        _write_catalog_cache(cache)
+    return cache, changed, {"reparsed": len(to_parse), "reused": len(reused),
+                            "deleted": len(deleted)}
+
+
+def _catalog_policies_from_cache(cache):
+    pols = []
+    for _path, e in sorted((cache.get("admx") or {}).items()):
+        pols.extend(e.get("policies", []))
+    return pols
+
 def _gpo_guid(a, key="gpo"):
     g = a[key].strip()
     if not re.match(r'^\{[0-9A-Fa-f-]{36}\}$', g):
@@ -1933,14 +2082,26 @@ def v_gpo_catalog(a):
     --source cse|admx limits WHICH source is built. `cse` is the important one:
     it SKIPS the ADMX parse entirely (thousands of policies, tens of seconds),
     so a caller that only needs the ten CSE preferences — e.g. the preferences
-    modal's OS filter — is not billed for the whole central store."""
+    modal's OS filter — is not billed for the whole central store.
+
+    ADMX entries are served from the PERSISTENT cache (fast). --refresh true does
+    a differential refresh first (re-ingest only newer ADMX, purge deleted);
+    --rebuild true forces a full re-parse. When no cache exists yet the first
+    call builds it. The result carries `cache_file` (the browser fswatches it),
+    `cache_changed` (did this call rewrite it) and `cached_at`."""
     tags = _read_catalog_tags()
     fsource = a.get("source")             # "cse" | "admx" | None (both)
     entries = []
-    admx = {"loaded": None}               # None => ADMX not consulted this call
+    admx_loaded = None                    # None => ADMX not consulted this call
+    cache = _read_catalog_cache()
+    cache_changed = False
     if fsource != "cse":
-        admx = v_gpo_admx_list({})
-        for p in admx.get("policies", []):
+        want_refresh = str(a.get("refresh", "")).lower() in ("1", "true", "yes", "on")
+        want_rebuild = str(a.get("rebuild", "")).lower() in ("1", "true", "yes", "on")
+        if want_refresh or want_rebuild or not cache.get("admx"):
+            cache, cache_changed, _stats = _refresh_catalog_cache(force=want_rebuild)
+        admx_loaded = bool(cache.get("admx"))
+        for p in _catalog_policies_from_cache(cache):
             af = p.get("admx", "")
             eid = "admx:%s:%s" % (af, p.get("id", ""))
             os_t, subs = _derive_tags("admx", af)
@@ -1976,8 +2137,9 @@ def v_gpo_catalog(a):
     if fsub:
         entries = [e for e in entries if fsub in e["subsystems"]]
     return {"os_types": OS_TYPES, "subsystems": SUBSYSTEMS,
-            "admx_loaded": admx.get("loaded", False),
-            "entries": entries, "count": len(entries)}
+            "admx_loaded": admx_loaded, "entries": entries, "count": len(entries),
+            "cache_file": CATALOG_CACHE_FILE, "cache_changed": cache_changed,
+            "cached_at": cache.get("built")}
 
 def v_gpo_catalog_tag(a):
     """Assign the OS type and subsystem array for one catalog setting; persists
@@ -3166,7 +3328,11 @@ VERBS = {
                       "args": [arg("os_type", "enum", required=False, choices=OS_TYPES),
                                arg("subsystem", "enum", required=False, choices=SUBSYSTEMS),
                                arg("source", "enum", required=False, choices=["cse", "admx"],
-                                   help_="limit to one source; 'cse' skips the slow ADMX parse")]},
+                                   help_="limit to one source; 'cse' skips the slow ADMX parse"),
+                               arg("refresh", "enum", required=False, choices=["true", "false"],
+                                   help_="differential refresh: re-ingest only ADMX newer than the cache, purge deleted"),
+                               arg("rebuild", "enum", required=False, choices=["true", "false"],
+                                   help_="force a full re-parse of every ADMX file")]},
     "gpo-catalog-tag": {"fn": v_gpo_catalog_tag, "group": "gpo",
                       "help": "Assign a setting's OS type and subsystem array (persisted override).",
                       "args": [arg("id", help_="catalog entry id"),

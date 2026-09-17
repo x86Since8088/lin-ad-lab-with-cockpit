@@ -1700,5 +1700,73 @@ class TestGpoCatalog(Base):
         self.assertEqual(out["entries"], [])
 
 
+class TestCatalogCache(Base):
+    A = "/pd/PolicyDefinitions/a.admx"
+    B = "/pd/PolicyDefinitions/b.admx"
+
+    def test_diff_reuse_new_and_delete(self):
+        cached = {self.A: {"sig": "10:100", "adml_sig": "5:50", "policies": [{"id": "a"}]},
+                  "/pd/PolicyDefinitions/gone.admx": {"sig": "1:1", "adml_sig": "", "policies": []}}
+        cur = {self.A: "10:100", self.B: "20:200"}
+        adml = {"a.adml": ("/pd/PolicyDefinitions/en-US/a.adml", "5:50"),
+                "b.adml": ("/pd/PolicyDefinitions/en-US/b.adml", "9:90")}
+        to_parse, reused, deleted = mod._catalog_diff(cached, cur, adml)
+        self.assertEqual(reused, [self.A])                       # unchanged -> kept
+        self.assertEqual(deleted, ["/pd/PolicyDefinitions/gone.admx"])  # unbacked -> purged
+        self.assertEqual([t[0] for t in to_parse], [self.B])     # new -> ingested
+        self.assertEqual(to_parse[0][1], "/pd/PolicyDefinitions/en-US/b.adml")
+        self.assertEqual(to_parse[0][3], "9:90")                 # adml sig threaded through
+
+    def test_diff_reparses_on_admx_mtime_change(self):
+        cached = {self.A: {"sig": "10:100", "adml_sig": "5:50", "policies": []}}
+        adml = {"a.adml": ("/pd/PolicyDefinitions/en-US/a.adml", "5:50")}
+        to_parse, reused, _ = mod._catalog_diff(cached, {self.A: "10:101"}, adml)
+        self.assertEqual([t[0] for t in to_parse], [self.A])
+        self.assertEqual(reused, [])
+
+    def test_diff_reparses_when_adml_changes(self):
+        cached = {self.A: {"sig": "10:100", "adml_sig": "5:50", "policies": []}}
+        adml = {"a.adml": ("/pd/PolicyDefinitions/en-US/a.adml", "5:51")}   # adml newer
+        to_parse, reused, _ = mod._catalog_diff(cached, {self.A: "10:100"}, adml)
+        self.assertEqual([t[0] for t in to_parse], [self.A])
+        self.assertEqual(reused, [])
+
+    def test_diff_force_reparses_all(self):
+        cached = {self.A: {"sig": "10:100", "adml_sig": "", "policies": []}}
+        to_parse, reused, _ = mod._catalog_diff(cached, {self.A: "10:100"}, {}, force=True)
+        self.assertEqual([t[0] for t in to_parse], [self.A])
+        self.assertEqual(reused, [])
+
+    def test_gpo_catalog_serves_from_cache_without_podman(self):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        cache = {"version": mod.CATALOG_CACHE_VERSION, "pol_root": "/x", "lang": "en-US",
+                 "built": "2026-01-01T00:00:00Z",
+                 "admx": {"/x/PolicyDefinitions/samba.admx": {
+                     "sig": "1:1", "adml_sig": "",
+                     "policies": [{"id": "P1", "admx": "samba.admx", "display": "Samba P1",
+                                   "key": "Software\\Policies", "valuename": "P1",
+                                   "class": "MACHINE", "unresolved": False}]}}}
+        with open(path, "w") as f:
+            json.dump(cache, f)
+        old = mod.CATALOG_CACHE_FILE
+        mod.CATALOG_CACHE_FILE = path
+        try:
+            rc, out = self.call_main(["gpo-catalog"])
+        finally:
+            mod.CATALOG_CACHE_FILE = old
+        self.assertEqual(rc, 0, out)
+        admx = [e for e in out["entries"] if e["source"] == "admx"]
+        self.assertEqual(len(admx), 1)
+        self.assertEqual(admx[0]["name"], "Samba P1")
+        self.assertEqual(admx[0]["os_type"], "Linux")     # _derive_tags: samba -> Linux
+        self.assertEqual(out["cache_file"], path)
+        self.assertEqual(out["cached_at"], "2026-01-01T00:00:00Z")
+        # serving a warm cache shells out to nothing (this is the whole point)
+        self.assertEqual(self.fake.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

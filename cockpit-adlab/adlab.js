@@ -2400,11 +2400,57 @@
             box.appendChild(actions);
 
             treeHost.appendChild(el("div", "al-loading", "loading available settings…"));
+
+            // ---- persistent-cache load + live refresh --------------------
+            // The catalog is served from a PERSISTENT cache (fast). We then run a
+            // differential refresh in the background, subscribe to a Cockpit
+            // fswatch channel on the cache file so ANY refresh (this session,
+            // another session, or the periodic tick) reloads the tree, and poll a
+            // periodic refresh while the modal is open. All torn down on close.
+            var cacheWatch = null, refreshTimer = null, teardownDone = false;
+            function applyCatalog(r) {
+                if (!r) return;
+                catalog = r.entries || catalog;
+                facets = { os_types: r.os_types || facets.os_types,
+                           subsystems: r.subsystems || facets.subsystems };
+                if (r.cache_file && !cacheWatch) subscribeCache(r.cache_file);
+                drawFilters(); drawTree();
+            }
+            function loadCatalog(mode) {   // mode: undefined=serve cache, "refresh", "rebuild"
+                var args = {}; if (mode) args[mode] = "true";
+                return run("gpo-catalog", args).then(applyCatalog);
+            }
+            function subscribeCache(path) {
+                if (!window.cockpit || !cockpit.channel) return;
+                try {
+                    cacheWatch = cockpit.channel({ payload: "fswatch1", path: path });
+                    cacheWatch.addEventListener("message", function () { loadCatalog(); });
+                    cacheWatch.addEventListener("close", function () { cacheWatch = null; });
+                } catch (e) { /* fswatch unavailable -> the periodic refresh still covers it */ }
+            }
+            function teardown() {
+                if (teardownDone) return; teardownDone = true;
+                if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+                if (cacheWatch) { try { cacheWatch.close(); } catch (e) { /* noop */ } cacheWatch = null; }
+            }
+            // Tear down when this modal's box leaves the DOM (Close / back nav).
+            var mo = new MutationObserver(function () {
+                if (!document.body.contains(box)) { teardown(); mo.disconnect(); }
+            });
+            mo.observe(document.getElementById("al-modal-host"), { childList: true, subtree: true });
+
             Promise.all([run("gpo-catalog"), run("gpo-registry-list", { gpo: target })]).then(function (res) {
-                catalog = res[0].entries || [];
-                facets = { os_types: res[0].os_types || [], subsystems: res[0].subsystems || [] };
                 current = res[1].settings || [];
-                drawFilters(); drawTree(); drawList();
+                applyCatalog(res[0]);
+                drawList();
+                // Background differential refresh: cheap when nothing changed; if
+                // an ADMX moved it rewrites the cache and the fswatch reloads us.
+                loadCatalog("refresh").catch(function () { /* noop */ });
+                // Keep it fresh while the modal stays open (differential each tick).
+                refreshTimer = setInterval(function () {
+                    if (!document.body.contains(box)) { teardown(); return; }
+                    loadCatalog("refresh").catch(function () { /* noop */ });
+                }, 120000);
             }).catch(function (err) { clear(treeHost); treeHost.appendChild(el("div", "al-alert err", String(err))); });
         }, true);
     }
@@ -2799,6 +2845,10 @@
                 if (e.key === "Escape" && shownStack.length) closeModal();   // pop the top modal
             });
             loadDomains();   // populate the header forest selector (best-effort)
+            // Warm the ADMX catalog cache in the background so the GPO editor's
+            // left pane opens instantly later. Differential + persistent, so this
+            // is cheap once warm and only does the full parse on a cold host.
+            run("gpo-catalog", { refresh: "true" }).catch(function () { /* noop */ });
             route();     // render whatever the URL says (deep-link friendly)
         }).catch(function (e) {
             var m = content();
