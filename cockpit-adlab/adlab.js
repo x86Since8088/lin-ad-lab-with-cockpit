@@ -24,6 +24,17 @@
     var HELPER = "/usr/local/sbin/adlab-admin";
     var SCHEMA = null;
     var IDENT = null;
+    var DOMAINS = [];              // domain-list result (forests), primary first
+    var currentDomain = null;      // selected forest realm; null = primary (unscoped)
+    // Verbs that must NOT be scoped by the domain selector: lab-wide/meta verbs;
+    // the forest-lifecycle verbs (they carry their own --realm, or derive the
+    // domain from the DC container label); and the primary-only client verbs.
+    var GLOBAL_VERBS = {
+        "schema": 1, "version": 1, "config": 1,
+        "domain-list": 1, "domain-add": 1, "domain-remove": 1, "domain-backup": 1,
+        "dc-decommission": 1,
+        "client-list": 1, "client-onboard": 1, "client-remove": 1,
+    };
     var currentTab = "overview";
     var lastRenderedTab = null;
     var shownStack = [];           // [{sig, back}] — the open modal backdrops,
@@ -53,7 +64,11 @@
 
     /* One verb call. args = {name: value}; stdinData travels on stdin. */
     function run(verb, args, stdinData) {
-        var argv = [HELPER, verb];
+        var argv = [HELPER];
+        // The domain selector scopes every non-global verb onto the chosen
+        // forest via the helper's global --domain option (valid before the verb).
+        if (currentDomain && !GLOBAL_VERBS[verb]) argv.push("--domain", currentDomain);
+        argv.push(verb);
         Object.keys(args || {}).forEach(function (k) {
             if (args[k] !== "" && args[k] !== undefined && args[k] !== null)
                 argv.push("--" + k, String(args[k]));
@@ -305,7 +320,8 @@
                 form.appendChild(input);
                 inputs[a.name] = { spec: a, node: input };
             });
-            var needTyped = ["fsmo-seize", "dc-demote", "user-delete", "gpo-delete",
+            var needTyped = ["fsmo-seize", "dc-demote", "dc-decommission", "domain-remove",
+                             "user-delete", "gpo-delete",
                              "gpo-settings-remove", "client-remove"].indexOf(verb) >= 0;
             var confirmInput = null;
             if (needTyped) {
@@ -451,7 +467,7 @@
         ["overview", "Overview"],
         ["objects", "Users & Computers"],
         ["gpo", "Group Policy"], ["sites", "Sites & Replication"],
-        ["dns", "DNS"], ["dcs", "Domain Controllers"],
+        ["dns", "DNS"], ["domains", "Domains"], ["dcs", "Domain Controllers"],
         ["clients", "Clients"], ["activity", "Activity"],
     ];
 
@@ -463,6 +479,43 @@
             b.addEventListener("click", function () { goTab(t[0]); });
             nav_.appendChild(b);
         });
+    }
+
+    /* The global forest selector: a <select> in the header that scopes every
+     * non-global verb (see GLOBAL_VERBS) onto one domain. It only appears once
+     * more than one forest exists — a single-domain lab needs no chooser. */
+    function renderDomainSelector() {
+        var host = document.getElementById("al-conn");
+        if (!host) return;
+        clear(host);
+        if (DOMAINS.length < 2) return;   // nothing to choose between
+        host.appendChild(el("span", "al-dom-label", "Forest"));
+        var sel = el("select", "al-dom-select");
+        DOMAINS.forEach(function (d) {
+            var o = el("option", null, d.realm + (d.primary ? " (primary)" : ""));
+            o.value = d.primary ? "" : d.realm;   // "" = primary = unscoped
+            if ((currentDomain || "") === o.value) o.selected = true;
+            sel.appendChild(o);
+        });
+        sel.addEventListener("change", function () {
+            currentDomain = sel.value || null;
+            refreshTab();
+        });
+        host.appendChild(sel);
+    }
+
+    /* Fetch the forest list (always unscoped), keep it, and reconcile the
+     * selector. If the selected forest has vanished (e.g. just removed), fall
+     * back to the primary so no later verb is scoped onto a dead realm. */
+    function loadDomains() {
+        return run("domain-list").then(function (r) {
+            DOMAINS = (r && r.domains) || [];
+            if (currentDomain &&
+                !DOMAINS.some(function (d) { return !d.primary && d.realm === currentDomain; }))
+                currentDomain = null;
+            renderDomainSelector();
+            return DOMAINS;
+        }).catch(function () { DOMAINS = []; renderDomainSelector(); return DOMAINS; });
     }
 
     function content() {
@@ -2368,9 +2421,60 @@
         }).catch(function (e) { holder.appendChild(failCard("DNS", e)); });
     }
 
+    // ------------------------------------------------------------- domains
+    // Multi-forest lifecycle: every independent domain in the lab, primary
+    // first. "Add domain" provisions a NEW forest (its own podman network + a
+    // first DC); each additional forest can be backed up or removed whole.
+    // Per-DC promote/decommission lives on the DCs tab, scoped by the selector.
+    function renderDomains() {
+        var m = content();
+        var acts = el("div", "al-actions");
+        acts.appendChild(actionButton("Add domain", "domain-add", {}, ""));
+        m.appendChild(acts);
+        m.appendChild(el("div", "hint",
+            "Each domain is an independent Samba forest on its own podman network. "
+            + "Adding a domain deploys its first (provisioning) DC; removing a domain "
+            + "tears down all of its DCs and its network (optionally backing up first)."));
+        var holder = el("div", "al-grid"); m.appendChild(holder);
+        loadDomains().then(function (domains) {
+            if (!domains.length) { holder.appendChild(failCard("Domains", "no forests found")); return; }
+            domains.forEach(function (d) {
+                var c = card(d.realm, true);
+                var head = el("div", "al-actions");
+                head.appendChild(badge(d.primary ? "primary" : "additional", d.primary ? "ok" : "dim"));
+                head.appendChild(badge("NetBIOS " + d.domain_nb));
+                head.appendChild(badge("net " + d.net));
+                if (d.net_prefix) head.appendChild(badge(d.net_prefix + ".0/24"));
+                head.appendChild(badge(d.dc_count + " DC" + (d.dc_count === 1 ? "" : "s"),
+                                       d.dc_count ? "ok" : "warn"));
+                c.appendChild(head);
+                c.appendChild(tableOf(["DC", "ip", "state"], (d.dcs || []).map(function (x) {
+                    return [x.name, x.ip || "—", badge(x.state, x.state === "running" ? "ok" : "err")];
+                })));
+                var box = el("div", "al-actions");
+                var manage = el("button", "al-btn secondary", "Manage DCs");
+                manage.addEventListener("click", function () {
+                    currentDomain = d.primary ? null : d.realm;
+                    renderDomainSelector();
+                    goTab("dcs");
+                });
+                box.appendChild(manage);
+                box.appendChild(actionButton("Back up", "domain-backup", { realm: d.realm }));
+                if (!d.primary)
+                    box.appendChild(actionButton("Remove domain", "domain-remove", { realm: d.realm }, "danger"));
+                c.appendChild(box);
+                holder.appendChild(c);
+            });
+        });
+    }
+
     // ----------------------------------------------------------------- dcs
     function renderDcs() {
         var m = content();
+        var scope = currentDomain
+            ? ("Forest in view: " + currentDomain + " — promotes and decommissions act on this forest.")
+            : ("Forest in view: primary (" + (IDENT ? IDENT.realm : "") + ").");
+        m.appendChild(el("div", "hint", scope));
         var acts = el("div", "al-actions");
         acts.appendChild(actionButton("Promote new DC", "dc-promote", {}, ""));
         acts.appendChild(actionButton("Transfer FSMO role", "fsmo-transfer", {}));
@@ -2388,7 +2492,7 @@
                 var box = el("div", "al-actions");
                 [["logs", "dc-logs"], ["processes", "dc-processes"], ["rpc", "dc-rpc"],
                  ["trace level", "dc-debug"], ["shell", "dc-shell"], ["restart", "dc-restart"],
-                 ["demote", "dc-demote"]].forEach(function (p) {
+                 ["demote", "dc-demote"], ["decommission", "dc-decommission"]].forEach(function (p) {
                     box.appendChild(actionButton(p[0], p[1], { dc: d.dc }));
                 });
                 return [d.dc, d.ip, badge(d.state, d.state === "running" ? "ok" : "err"), roles, box];
@@ -2434,8 +2538,8 @@
     // ---------------------------------------------------------------- boot
     var RENDER = { overview: renderOverview,
                    objects: renderObjects, gpo: renderGpo,
-                   sites: renderSites, dns: renderDns, dcs: renderDcs,
-                   clients: renderClients, activity: renderActivity };
+                   sites: renderSites, dns: renderDns, domains: renderDomains,
+                   dcs: renderDcs, clients: renderClients, activity: renderActivity };
 
     function boot() {
         renderTabs();
@@ -2450,6 +2554,7 @@
             document.addEventListener("keydown", function (e) {
                 if (e.key === "Escape" && shownStack.length) closeModal();   // pop the top modal
             });
+            loadDomains();   // populate the header forest selector (best-effort)
             route();     // render whatever the URL says (deep-link friendly)
         }).catch(function (e) {
             var m = content();

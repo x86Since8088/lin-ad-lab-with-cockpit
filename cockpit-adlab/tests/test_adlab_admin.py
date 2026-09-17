@@ -237,10 +237,11 @@ class Base(unittest.TestCase):
 
 KNOWN_TYPES = {"str", "int", "bool", "enum", "password-stdin"}
 KNOWN_GROUPS = {"meta", "overview", "fsmo", "users", "groups", "gpo", "objects",
-                "sites", "dns", "dcs", "clients", "activity"}
+                "sites", "dns", "dcs", "clients", "activity", "domains"}
 DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "ou-delete", "gpo-delete", "gpo-unlink", "gpo-settings-remove",
                "dns-delete", "dc-restart", "dc-shell", "dc-promote", "dc-demote",
+               "dc-decommission", "domain-add", "domain-remove",
                "client-remove"}
 
 
@@ -261,6 +262,125 @@ class TestSchema(Base):
         for name in DESTRUCTIVE:
             self.assertTrue(mod.VERBS[name].get("danger"),
                             "%s must carry danger:true" % name)
+
+
+class TestDomains(Base):
+    """Multi-forest lifecycle: domain-list/add/remove/backup + dc-decommission."""
+
+    def _no_extra_domains(self):
+        # list_domains() discovery ('names\trealm') sees no additional forests.
+        self.fake.on(lambda a: a[:3] == ["podman", "ps", "-a"]
+                     and any("{{.Names}}\t" in x for x in a), out="")
+
+    def _one_extra_domain(self, realm="CORP.EXAMPLE.LAB", slug="corp",
+                          prefix="10.44.1", dcs=("corp-dc1",)):
+        self.fake.on(lambda a: a[:3] == ["podman", "ps", "-a"]
+                     and any("{{.Names}}\t" in x for x in a),
+                     out="%s\t%s\n" % (dcs[0], realm))
+        self.fake.on(lambda a: a[:3] == ["podman", "ps", "-a"]
+                     and ("label=adlab.realm=%s" % realm) in a,
+                     out="\n".join(dcs) + "\n")
+        labels = {"adlab.realm": realm, "adlab.slug": slug,
+                  "adlab.domain_nb": slug.upper(), "adlab.net": "adlab-" + slug,
+                  "adlab.net_prefix": prefix, "adlab.dc_base": "10"}
+        for k, v in labels.items():
+            self.fake.on(
+                (lambda key, val: (lambda a: a[:2] == ["podman", "inspect"]
+                                   and any(('"%s"' % key) in x for x in a)))(k, v),
+                out=v + "\n")
+
+    def test_domain_list_primary_only(self):
+        self.fake.lab_up()
+        self._no_extra_domains()
+        rc, out = self.call_main(["domain-list"])
+        self.assertEqual(rc, 0, out)
+        prim = [d for d in out["domains"] if d["primary"]]
+        self.assertEqual(len(prim), 1)
+        self.assertEqual(prim[0]["realm"], mod.PRIMARY_LAB["REALM"])
+        self.assertEqual(prim[0]["dc_count"], mod.PRIMARY_LAB["DC_COUNT"])
+
+    def test_domain_list_discovery_uses_ps_label_field(self):
+        # Regression: `podman ps --format` exposes labels as .Labels; .Config.Labels
+        # is an INSPECT-only field and comes back empty in ps, which silently hid
+        # every additional forest. Pin the discovery template to a ps-valid field.
+        self.fake.lab_up()
+        self._no_extra_domains()
+        self.call_main(["domain-list"])
+        disc = [a for a, _ in self.fake.calls
+                if a[:3] == ["podman", "ps", "-a"] and any("{{.Names}}" in x for x in a)]
+        self.assertTrue(disc, "domain-list must run a discovery `podman ps`")
+        for a in disc:
+            joined = " ".join(a)
+            self.assertNotIn(".Config.Labels", joined,
+                             "ps --format must use .Labels, not inspect's .Config.Labels")
+            self.assertIn(".Labels", joined)
+
+    def test_domain_add_creates_network_and_provisions(self):
+        self.fake.lab_up()
+        self._no_extra_domains()
+        self.fake.on(lambda a: a[:3] == ["podman", "network", "create"], out="net\n")
+        self.fake.on(lambda a: a[:2] == ["podman", "run"], out="ctrid\n")
+        rc, out = self.call_main(["domain-add", "--realm", "CORP.EXAMPLE.LAB",
+                                  "--domain_nb", "CORP"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["domain"], "CORP.EXAMPLE.LAB")
+        self.assertEqual(out["network"], "adlab-corp")
+        self.assertEqual(out["dc"], "corp-dc1")
+        self.assertEqual(out["subnet"], "10.44.1.0/24")
+        self.assertTrue(self.fake.argv_containing("network", "create", "adlab-corp", "10.44.1.0/24"))
+        self.assertTrue(self.fake.argv_containing("podman", "run", "ROLE=provision", "REALM=CORP.EXAMPLE.LAB"))
+        self.assertTrue(self.fake.argv_containing("adlab.realm=CORP.EXAMPLE.LAB"))
+        self.assertTrue(self.fake.argv_containing("--network", "adlab-corp"))
+
+    def test_domain_add_refuses_primary_realm(self):
+        self.fake.lab_up()
+        self._no_extra_domains()
+        rc, out = self.call_main(["domain-add", "--realm", mod.PRIMARY_LAB["REALM"],
+                                  "--domain_nb", "X"])
+        self.assertEqual(rc, 1)
+        self.assertIn("primary", out["error"])
+
+    def test_domain_add_refuses_duplicate(self):
+        self.fake.lab_up()
+        self._one_extra_domain()
+        rc, out = self.call_main(["domain-add", "--realm", "CORP.EXAMPLE.LAB",
+                                  "--domain_nb", "CORP"])
+        self.assertEqual(rc, 1)
+        self.assertIn("already exists", out["error"])
+
+    def test_dc_decommission_refuses_primary_dc1(self):
+        self.fake.lab_up()
+        self._no_extra_domains()
+        rc, out = self.call_main(["dc-decommission", "--dc", "dc1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("dc1", out["error"])
+
+    def test_dc_decommission_refuses_last_dc_of_forest(self):
+        self.fake.lab_up()
+        self._one_extra_domain(dcs=("corp-dc1",))
+        rc, out = self.call_main(["dc-decommission", "--dc", "corp-dc1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("last DC", out["error"])
+
+    def test_domain_remove_refuses_primary(self):
+        self.fake.lab_up()
+        self._no_extra_domains()
+        rc, out = self.call_main(["domain-remove", "--realm", mod.PRIMARY_LAB["REALM"]])
+        self.assertEqual(rc, 1)
+        self.assertIn("primary", out["error"])
+
+    def test_domain_remove_destroys_forest(self):
+        self.fake.lab_up()
+        self._one_extra_domain(dcs=("corp-dc1", "corp-dc2"))
+        self.fake.on(lambda a: a[:3] == ["podman", "rm", "-f"], out="")
+        self.fake.on(lambda a: a[:3] == ["podman", "network", "rm"], out="")
+        rc, out = self.call_main(["domain-remove", "--realm", "CORP.EXAMPLE.LAB"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(set(out["removed_dcs"]), {"corp-dc1", "corp-dc2"})
+        self.assertEqual(out["network_removed"], "adlab-corp")
+        self.assertNotIn("backup", out)
+        self.assertTrue(self.fake.argv_containing("podman", "rm", "-f", "corp-dc1"))
+        self.assertTrue(self.fake.argv_containing("podman", "network", "rm", "adlab-corp"))
 
     def test_password_args_never_travel_on_argv(self):
         for name, spec_ in mod.VERBS.items():

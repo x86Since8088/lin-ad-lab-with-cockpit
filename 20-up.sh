@@ -98,4 +98,75 @@ for i in $(seq 1 "$CLIENT_COUNT"); do
         echo "JOIN FAILED via $peer (see /tmp/join-$n.log)"
     fi
 done
+
+# --- additional forests (multi-domain) --------------------------------------
+# Each declared EXTRA_DOMAINS entry becomes an independent forest on its own
+# podman network. Idempotent: an existing network is reused (its subnet read
+# back), and a DC whose container already exists is left alone. Nothing here
+# runs when EXTRA_DOMAINS is empty (the default), so the single-domain lab is
+# unchanged.
+
+# First free ${EXTRA_NET_BASE}.N /24 not already claimed by a podman network.
+# Mirrors the plugin's _alloc_domain_subnet so both allocate the same way.
+extra_alloc_net() {
+    local used n=1
+    used=$(podman network ls --format '{{.Name}}' | while read -r net; do
+        podman network inspect "$net" \
+            --format '{{range .Subnets}}{{.Subnet}} {{end}}' 2>/dev/null
+    done | tr ' ' '\n' | sed -n "s#^${EXTRA_NET_BASE}\.\([0-9]\+\)\.0/24\$#\1#p")
+    while echo "$used" | grep -qx "$n"; do n=$((n + 1)); done
+    echo "$n"
+}
+
+if [[ ${#EXTRA_DOMAINS[@]} -gt 0 ]]; then
+    for spec in "${EXTRA_DOMAINS[@]}"; do
+        IFS=':' read -r xrealm xnb xslug xcount <<<"$spec"
+        [[ -n "$xrealm" && -n "$xnb" ]] || { echo "!! bad EXTRA_DOMAINS entry: '$spec'"; continue; }
+        xslug=${xslug:-$(echo "${xrealm%%.*}" | tr '[:upper:]' '[:lower:]')}
+        xcount=${xcount:-1}
+        xrealm=${xrealm^^}; xnb=${xnb^^}
+        net="adlab-$xslug"
+        echo "== domain $xrealm (forest on $net) =="
+        if podman network exists "$net" 2>/dev/null; then
+            prefix=$(podman network inspect "$net" \
+                --format '{{range .Subnets}}{{.Subnet}}{{end}}' 2>/dev/null | sed 's#\.0/24$##')
+            echo "  network $net exists ($prefix.0/24)"
+        else
+            n=$(extra_alloc_net); prefix="${EXTRA_NET_BASE}.${n}"
+            podman network create "$net" --subnet "$prefix.0/24" >/dev/null
+            echo "  created network $net ($prefix.0/24)"
+        fi
+        labels=( --label "adlab.realm=$xrealm" --label "adlab.domain_nb=$xnb"
+                 --label "adlab.net=$net" --label "adlab.net_prefix=$prefix"
+                 --label "adlab.dc_base=$EXTRA_DC_BASE" --label "adlab.slug=$xslug" )
+        for i in $(seq 1 "$xcount"); do
+            n=$(extra_dc_name "$xslug" "$i")
+            ip="$prefix.$((EXTRA_DC_BASE + i - 1))"
+            if [[ "$(podman inspect -f '{{.State.Status}}' "$n" 2>/dev/null)" == "running" ]]; then
+                echo "  $n already running — skipping"; continue
+            fi
+            podman rm -f "$n" >/dev/null 2>&1 || true
+            if [[ $i -eq 1 ]]; then
+                role=provision; peer_env=()
+                echo "== $xslug DC 1 (provision) =="
+            else
+                role=join; peer_env=( -e "PEER_IP=$prefix.$EXTRA_DC_BASE" )
+                echo "== $xslug DC $i (join) =="
+            fi
+            podman run -d --init --name "$n" --hostname "$n" \
+                --network "$net" --ip "$ip" \
+                --cap-add SYS_ADMIN,NET_ADMIN,SYS_TIME --security-opt seccomp=unconfined \
+                -v "$PASS_MOUNT" \
+                -e ROLE="$role" -e REALM="$xrealm" -e DOMAIN_NB="$xnb" \
+                -e DC_IP="$ip" -e FORWARDER="$FORWARDER" \
+                -e ADMIN_PASS_FILE=/run/adminpass "${peer_env[@]}" \
+                "${labels[@]}" --label "adlab.role=$role" \
+                "$IMG_DC" >/dev/null
+            echo "  $n at $ip — waiting for the directory"
+            wait_for_dc "$ip" "$n" && echo "  $n serving $xrealm" \
+                || { echo "  $n FAILED"; podman logs --tail 25 "$n"; }
+        done
+    done
+fi
+
 echo; echo "lab up. run ./30-verify.sh"
