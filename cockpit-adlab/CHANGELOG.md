@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.2.2 - 2026-09-17
+
+GPO preferences modal: sort the available policy by OS.
+
+- The **GPO preferences (CSEs)** modal (`modal=gpo-prefs`) gained an **OS
+  selector** (All OSes / Windows / Linux) and **subsystem chips**
+  (debian/redhat/ubuntu/…) that filter which CSE preference types are offered,
+  with a "N of M preference types shown" count. This is the same override-aware
+  faceting the full editor uses: the CSE list and its OS/subsystem tags come
+  from `gpo-catalog` (which applies operator tag overrides), not a hardcoded
+  list. Selecting Windows correctly shows none — the samba CSE preferences are
+  all Linux — so the operator immediately sees the platform scope instead of
+  scanning a flat list.
+- `adlab-admin gpo-catalog` gained an optional **`--source cse|admx`** filter.
+  `cse` SKIPS the ADMX parse entirely, which on a host with the full central
+  store loaded is thousands of policies / tens of seconds (~38s measured on
+  edt1). The prefs modal only needs the ten CSEs, so it calls
+  `gpo-catalog --source cse` and opens fast; the full editor still loads the
+  whole catalog as before. Backward compatible (the arg is optional).
+- If `gpo-catalog` is unavailable the modal falls back to the flat CSE list
+  (all types, no OS filter), so it never becomes unusable.
+
 ## 1.2.1 - 2026-09-17
 
 AD Objects console: GPOs in the tree, links viewable (UI only — no helper

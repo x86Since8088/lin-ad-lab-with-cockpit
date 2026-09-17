@@ -2465,14 +2465,56 @@
 
     function gpoPrefsModal(gpo) {
         if (!gpo) { return; }
+        // The samba CSE preferences ARE the "available policy" here; each targets
+        // an OS + subsystems (from the catalog, override-aware). An OS/subsystem
+        // filter lets the operator sort through them by platform instead of
+        // scanning one flat list — the same faceting the full editor uses.
+        var CSE_FALLBACK = ["smb_conf", "security", "motd", "issue", "sudoers",
+                            "files", "symlink", "openssh", "scripts", "access"];
         modal("GPO preferences (CSEs)", function (box) {
             box.appendChild(el("div", "hint", "GPO: ")).appendChild(el("kbd", "al", gpo));
+
+            var cses = [];            // [{cse, name, os_type, subsystems}]
+            var osTypes = [], subsystems = [];
+            var fOs = "", fSubs = {};
+
+            // ---- OS / subsystem filter bar --------------------------------
+            var filterBar = el("div", "al-tree-filters");
+            var osWrap = el("div", "al-facet-row");
+            osWrap.appendChild(el("span", "al-facet-lbl", "OS"));
+            var osSel = el("select", "al-dom-select");
+            var allOpt = el("option", null, "All OSes"); allOpt.value = ""; osSel.appendChild(allOpt);
+            osWrap.appendChild(osSel);
+            var subRow = el("div", "al-facet-row");
+            subRow.appendChild(el("span", "al-facet-lbl", "subsystems"));
+            filterBar.appendChild(osWrap); filterBar.appendChild(subRow);
+            box.appendChild(filterBar);
+
             var cse = el("select");
-            ["smb_conf", "security", "motd", "issue", "sudoers", "files", "symlink", "openssh", "scripts", "access"]
-                .forEach(function (x) { var o = el("option", null, x); o.value = x; cse.appendChild(o); });
-            var listOut = el("div");
+            var matchHint = el("div", "hint", "loading policy catalog…");
+            box.appendChild(el("label", null, "CSE")); box.appendChild(cse); box.appendChild(matchHint);
+
+            var entry = el("input"); entry.placeholder = "entry (per CSE)";
+            var value = el("input"); value.placeholder = "value (empty unsets)";
+            box.appendChild(el("label", null, "entry")); box.appendChild(entry);
+            box.appendChild(el("label", null, "value")); box.appendChild(value);
+            var setBtn = el("button", "al-btn", "Set preference");
+            var msg = el("span", "hint", "");
+            box.appendChild(setBtn); box.appendChild(msg);
+            var listOut = el("div"); box.appendChild(listOut);
+            var close = el("button", "al-btn secondary", "Close");
+            close.addEventListener("click", closeModal); box.appendChild(close);
+
+            function matches(c) {
+                if (fOs && c.os_type && c.os_type !== fOs) return false;
+                if (Object.keys(fSubs).length &&
+                    !(c.subsystems || []).some(function (s) { return fSubs[s]; })) return false;
+                return true;
+            }
             function listCse() {
-                clear(listOut); listOut.appendChild(el("div", "al-loading", "listing…"));
+                clear(listOut);
+                if (!cse.value) return;
+                listOut.appendChild(el("div", "al-loading", "listing…"));
                 run("gpo-pref-list", { gpo: gpo, cse: cse.value }).then(function (r) {
                     clear(listOut);
                     listOut.appendChild(tableOf([cse.value + " items"],
@@ -2480,25 +2522,58 @@
                     if (!(r.items || []).length) listOut.appendChild(el("div", "hint", "(none set)"));
                 }).catch(function (e) { clear(listOut); listOut.appendChild(el("div", "al-alert err", String(e))); });
             }
+            function rebuildCseOptions() {
+                var prev = cse.value;
+                clear(cse);
+                var shown = cses.filter(matches);
+                shown.forEach(function (c) { var o = el("option", null, c.cse); o.value = c.cse; cse.appendChild(o); });
+                if (!shown.length) {
+                    var o = el("option", null, "(no CSE for this OS / subsystem)"); o.value = ""; cse.appendChild(o);
+                }
+                if (prev && shown.some(function (c) { return c.cse === prev; })) cse.value = prev;
+                matchHint.textContent = shown.length + " of " + cses.length + " preference type" +
+                    (cses.length === 1 ? "" : "s") + " shown";
+                listCse();
+            }
+            function drawSubs() {
+                while (subRow.childNodes.length > 1) subRow.removeChild(subRow.lastChild);
+                var present = {};
+                cses.forEach(function (c) { (c.subsystems || []).forEach(function (s) { present[s] = true; }); });
+                (subsystems.length ? subsystems : Object.keys(present)).forEach(function (s) {
+                    if (!present[s]) return;
+                    var b = el("button", "al-chip" + (fSubs[s] ? " on" : ""), s); b.type = "button";
+                    b.addEventListener("click", function () {
+                        if (fSubs[s]) delete fSubs[s]; else fSubs[s] = true;
+                        drawSubs(); rebuildCseOptions();
+                    });
+                    subRow.appendChild(b);
+                });
+            }
             cse.addEventListener("change", listCse);
-            box.appendChild(el("label", null, "CSE")); box.appendChild(cse);
-            var entry = el("input"); entry.placeholder = "entry (per CSE)";
-            var value = el("input"); value.placeholder = "value (empty unsets)";
-            box.appendChild(el("label", null, "entry")); box.appendChild(entry);
-            box.appendChild(el("label", null, "value")); box.appendChild(value);
-            var setBtn = el("button", "al-btn", "Set preference");
-            var msg = el("span", "hint", "");
+            osSel.addEventListener("change", function () { fOs = osSel.value; rebuildCseOptions(); });
             setBtn.addEventListener("click", function () {
+                if (!cse.value) { msg.textContent = " pick a CSE"; return; }
                 setBtn.disabled = true; msg.textContent = " setting…";
                 run("gpo-pref-set", { gpo: gpo, cse: cse.value, entry: entry.value, value: value.value })
                     .then(function () { setBtn.disabled = false; msg.textContent = " set"; listCse(); })
                     .catch(function (e) { setBtn.disabled = false; msg.textContent = " " + e; });
             });
-            box.appendChild(setBtn); box.appendChild(msg);
-            box.appendChild(listOut);
-            var close = el("button", "al-btn secondary", "Close");
-            close.addEventListener("click", closeModal); box.appendChild(close);
-            listCse();
+
+            // Populate the CSE set + facets from the catalog (override-aware).
+            // source=cse skips the ADMX parse — the full catalog is thousands of
+            // policies / tens of seconds, and this modal only needs the CSEs.
+            run("gpo-catalog", { source: "cse" }).then(function (r) {
+                osTypes = r.os_types || [];
+                subsystems = r.subsystems || [];
+                cses = (r.entries || []).filter(function (e) { return e.source === "cse"; })
+                    .map(function (e) { return { cse: e.cse, name: e.name, os_type: e.os_type, subsystems: e.subsystems || [] }; });
+                osTypes.forEach(function (o) { var op = el("option", null, o); op.value = o; osSel.appendChild(op); });
+                drawSubs(); rebuildCseOptions();
+            }).catch(function () {
+                cses = CSE_FALLBACK.map(function (c) { return { cse: c, name: c, os_type: "", subsystems: [] }; });
+                matchHint.textContent = "(catalog unavailable — showing all preference types)";
+                rebuildCseOptions();
+            });
         });
     }
 

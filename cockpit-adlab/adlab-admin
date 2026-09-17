@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 
 def _require_config():
@@ -1928,38 +1928,47 @@ def v_gpo_catalog(a):
     type and subsystems (derived defaults + persisted overrides). Sources:
     ADMX policies in the central store, and the samba CSE preferences. The
     left pane auto-populates from this. Optional --os_type / --subsystem
-    filter server-side; the UI also filters client-side."""
+    filter server-side; the UI also filters client-side.
+
+    --source cse|admx limits WHICH source is built. `cse` is the important one:
+    it SKIPS the ADMX parse entirely (thousands of policies, tens of seconds),
+    so a caller that only needs the ten CSE preferences — e.g. the preferences
+    modal's OS filter — is not billed for the whole central store."""
     tags = _read_catalog_tags()
+    fsource = a.get("source")             # "cse" | "admx" | None (both)
     entries = []
-    admx = v_gpo_admx_list({})
-    for p in admx.get("policies", []):
-        af = p.get("admx", "")
-        eid = "admx:%s:%s" % (af, p.get("id", ""))
-        os_t, subs = _derive_tags("admx", af)
-        ov = tags.get(eid)
-        if ov:
-            os_t = ov.get("os_type", os_t)
-            subs = ov.get("subsystems", subs)
-        cls = (p.get("class") or "BOTH").upper()
-        if cls not in ("MACHINE", "USER"):
-            cls = "BOTH"
-        entries.append({
-            "id": eid, "name": p.get("display") or p.get("id", ""),
-            "source": "admx", "admx": af, "os_type": os_t, "subsystems": subs,
-            "unresolved": p.get("unresolved", False),
-            "keyname": p.get("key", ""), "valuename": p.get("valuename") or p.get("id", ""),
-            "class": cls, "type": p.get("enabled_type") or "REG_DWORD",
-            "enabled_type": p.get("enabled_type"), "enabled_data": p.get("enabled_data"),
-            "disabled_type": p.get("disabled_type"), "disabled_data": p.get("disabled_data")})
-    for cse in GPO_CSES:
-        eid = "cse:%s" % cse
-        os_t, subs = _derive_tags("cse", cse)
-        ov = tags.get(eid)
-        if ov:
-            os_t = ov.get("os_type", os_t)
-            subs = ov.get("subsystems", subs)
-        entries.append({"id": eid, "name": cse + " (preference)", "source": "cse",
-                        "cse": cse, "os_type": os_t, "subsystems": subs})
+    admx = {"loaded": None}               # None => ADMX not consulted this call
+    if fsource != "cse":
+        admx = v_gpo_admx_list({})
+        for p in admx.get("policies", []):
+            af = p.get("admx", "")
+            eid = "admx:%s:%s" % (af, p.get("id", ""))
+            os_t, subs = _derive_tags("admx", af)
+            ov = tags.get(eid)
+            if ov:
+                os_t = ov.get("os_type", os_t)
+                subs = ov.get("subsystems", subs)
+            cls = (p.get("class") or "BOTH").upper()
+            if cls not in ("MACHINE", "USER"):
+                cls = "BOTH"
+            entries.append({
+                "id": eid, "name": p.get("display") or p.get("id", ""),
+                "source": "admx", "admx": af, "os_type": os_t, "subsystems": subs,
+                "unresolved": p.get("unresolved", False),
+                "keyname": p.get("key", ""), "valuename": p.get("valuename") or p.get("id", ""),
+                "class": cls, "type": p.get("enabled_type") or "REG_DWORD",
+                "enabled_type": p.get("enabled_type"), "enabled_data": p.get("enabled_data"),
+                "disabled_type": p.get("disabled_type"), "disabled_data": p.get("disabled_data")})
+    if fsource != "admx":
+        for cse in GPO_CSES:
+            eid = "cse:%s" % cse
+            os_t, subs = _derive_tags("cse", cse)
+            ov = tags.get(eid)
+            if ov:
+                os_t = ov.get("os_type", os_t)
+                subs = ov.get("subsystems", subs)
+            entries.append({"id": eid, "name": cse + " (preference)", "source": "cse",
+                            "cse": cse, "os_type": os_t, "subsystems": subs})
     fos = a.get("os_type")
     fsub = a.get("subsystem")
     if fos:
@@ -3155,7 +3164,9 @@ VERBS = {
     "gpo-catalog":   {"fn": v_gpo_catalog, "group": "gpo",
                       "help": "All available settings, tagged with OS type + subsystems (the edit tree's source).",
                       "args": [arg("os_type", "enum", required=False, choices=OS_TYPES),
-                               arg("subsystem", "enum", required=False, choices=SUBSYSTEMS)]},
+                               arg("subsystem", "enum", required=False, choices=SUBSYSTEMS),
+                               arg("source", "enum", required=False, choices=["cse", "admx"],
+                                   help_="limit to one source; 'cse' skips the slow ADMX parse")]},
     "gpo-catalog-tag": {"fn": v_gpo_catalog_tag, "group": "gpo",
                       "help": "Assign a setting's OS type and subsystem array (persisted override).",
                       "args": [arg("id", help_="catalog entry id"),

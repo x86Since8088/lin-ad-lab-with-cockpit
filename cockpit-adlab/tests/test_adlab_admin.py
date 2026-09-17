@@ -1675,6 +1675,30 @@ class AdmxRetirementTranscription(unittest.TestCase):
         self.assertFalse((texts.get("LocalCat") or "").endswith("(2022)"))
 
 
+class TestGpoCatalog(Base):
+    def test_source_cse_skips_admx_parse(self):
+        # source=cse returns only the CSE preference entries and must NOT parse
+        # ADMX (no podman calls). The ADMX parse is the slow path (thousands of
+        # policies, tens of seconds) the prefs modal's OS filter must avoid.
+        rc, out = self.call_main(["gpo-catalog", "--source", "cse"])
+        self.assertEqual(rc, 0, out)
+        cse = [e for e in out["entries"] if e.get("source") == "cse"]
+        self.assertEqual(len(cse), len(mod.GPO_CSES))
+        self.assertEqual([e for e in out["entries"] if e.get("source") == "admx"], [])
+        self.assertTrue(all(e["os_type"] == "Linux" for e in cse))
+        self.assertTrue(all(e.get("subsystems") for e in cse))
+        self.assertIn("Windows", out["os_types"])
+        self.assertIn("Linux", out["os_types"])
+        # the whole point: nothing was shelled out to build the CSE catalog
+        self.assertEqual(self.fake.calls, [])
+
+    def test_source_cse_honours_os_filter(self):
+        # Every CSE is Linux, so an OS=Windows filter must yield none — this is
+        # exactly what the prefs modal shows when "Windows" is selected.
+        rc, out = self.call_main(["gpo-catalog", "--source", "cse", "--os_type", "Windows"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["entries"], [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
