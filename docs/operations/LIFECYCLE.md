@@ -29,12 +29,25 @@ lab is reproducible; create it before the first `20-up.sh`.
 
 ## Reboot / crash recovery
 
-The lab containers have no restart policy, so after a reboot all 17 are
-`exited` — but their state is on persistent bind mounts, so nothing is lost.
-Recovery is a single step:
+The lab containers have no restart policy on purpose: `podman-restart` would
+bring clients up in parallel, before LDAP is serving and with aardvark DNS
+(no AD zone). State lives on persistent bind mounts, so nothing is lost.
+
+`samba-ad-lab.service` runs `21-start.sh` at boot (ordered DC start, wait for
+LDAP, clients/RDP, restore AD DNS, bounce rdp1 sssd, reinstall agents).
+Install it once:
 
 ```bash
-./21-start.sh          # then, if a DC was destroyed, replication self-heals
+./install-start.sh     # enable --now; re-run after editing the unit
+```
+
+The unit is `KillMode=process`: the default `control-group` would SIGTERM
+conmon when the oneshot exits and kill every lab container. Manual recovery
+is still:
+
+```bash
+./21-start.sh          # or: systemctl restart samba-ad-lab
+# then, if a DC was destroyed, replication self-heals
 ```
 
 If a destroy/recreate briefly removed a DC, its replication partners may show a

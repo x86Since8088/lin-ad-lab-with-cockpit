@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Start an EXISTING lab after a host reboot or stop — no recreation, no
 # provisioning, no joins. 20-up.sh builds the lab; this only brings it back.
+# samba-ad-lab.service runs this at boot (install-start.sh); do not give the
+# containers a podman restart policy — clients need the DNS rewrite below.
 #
 # Why this script exists: podman regenerates /etc/resolv.conf on every
 # container (re)start, silently reverting clients and RDP targets to
