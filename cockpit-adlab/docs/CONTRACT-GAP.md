@@ -26,6 +26,38 @@ live: `status` (5 DCs), `domain-info` (dc1, forest ad.edt1.lab), 118 unit tests.
 Still open below: the sysvol-replicate units running off the share as root (a
 samba-ad-lab-side, DEV-unit concern outside this plugin's deploy path).
 
+## RESOLUTION-2 (2026-09-17, plugin 1.2.1) — the dev install could not be served
+
+The 2026-09-11 dev install above (per-file symlinks into the checkout on the SMB
+share) **loaded only when the Cockpit login user was a member of `smbusers`.**
+Cockpit serves a package's static files (`index.html`, `adlab.js`, `adlab.css`,
+`manifest.json`) as the **logged-in session user**, not root. The checkout lives
+under `/srv/smb/share/...`, whose parent directories are `drwxrws--- … smbusers`
+(mode 0770, no world bit). A login user outside `smbusers` — e.g. `cpadmin`, the
+plugin's own admin/test account — gets *Permission denied* traversing the share,
+so `cockpit-bridge --packages` never lists `adlab` and the browser's
+`GET /cockpit/@localhost/adlab/index.html` is blocked (package not found). The
+root helper was never affected: it runs as root (Cockpit's superuser channel or
+the job runner) and root bypasses the group bits — which is exactly why the
+plugin's *verbs* worked while its *page* would not load for cpadmin.
+
+Fixed by doing the contract's REAL deploy: `deploy.sh` → `/opt/cockpit-adlab/
+payload-1.2.1` (root-owned, world-readable), with the config relocated OFF the
+share to `/etc/samba-ad-lab/` (`lab.env`, `rdp.env`, `.secrets/administrator.pass`
+— a copy of the existing passphrase, placed by a deliberate root job, never
+printed) and `/usr/local/libexec/samba-ad-lab/` (the SYSVOL scripts). The
+deployed `.env` points at those `/etc` paths, so §4.4's audits and the "unmount
+the share and it still works" acceptance test now hold. The `/etc` files were
+placed by hand rather than by `samba-ad-lab/source/install.sh`, because that
+installer refuses while the live DEV `sysvol-replicate.{service,timer}` units are
+present in `/etc/systemd/system` (still the open item noted above) — so no
+systemd units were installed, only the files the plugin's `.env` names. Verified:
+cpadmin now reads the package and `cockpit-bridge` lists it; `adlab-admin`
+version 1.2.1, `config` (all paths resolve), `status` (17 containers), and
+`gpo-show` (the secret-backed path behind the `gpo-edit` modal) all work.
+Trade-off: a real deploy is not live-editable — ship checkout changes with
+`deploy.sh` (root), roll back by repointing `/opt/cockpit-adlab/payload`.
+
 ---
 
 # cockpit-adlab
