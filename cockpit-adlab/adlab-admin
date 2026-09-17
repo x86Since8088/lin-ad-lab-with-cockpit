@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 def _require_config():
@@ -171,14 +171,127 @@ def load_lab(path=LAB_ENV, rdp_path=RDP_ENV):
     return cfg
 
 LAB = load_lab()
+# The PRIMARY domain's config, pinned. main() reassigns LAB to the CURRENT
+# domain per invocation, so anything that must always mean the primary forest
+# (its identity, and the lab clients, which only ever join the primary) reads
+# PRIMARY_LAB, never the mutable LAB.
+PRIMARY_LAB = dict(LAB)
 
-def dc_name(i):  return "dc%d" % i
-def dc_ip(i):    return "%s.%d" % (LAB["NET_PREFIX"], LAB["DC_BASE"] + i - 1)
+# --------------------------------------------------------------------------
+# Domains. The lab was single-forest; it is now multi-forest. Each domain is an
+# INDEPENDENT Samba forest of DC containers on ITS OWN podman network. The
+# PRIMARY domain comes from lab.env (containers dc1..dcN on `static-edt`, and it
+# is the only one with NO adlab.* labels — that is how we tell it apart).
+# ADDITIONAL domains are created at runtime by `domain-add`; their DC containers
+# carry adlab.* labels and are named <slug>-dc<N> on network adlab-<slug>.
+#
+# "Which domain am I acting on" is the module global CUR, resolved once per
+# invocation from the global `--domain <realm>` option (default: primary). The
+# six shared helpers below default to CUR, so every existing verb becomes
+# domain-aware for free without touching its signature.
+# --------------------------------------------------------------------------
+DOM_LABEL = "adlab.realm"
+CUR = None  # current domain context; set by main(); None == primary.
+
+
+def _primary_domain():
+    d = dict(PRIMARY_LAB)
+    d["SLUG"] = ""
+    d["PRIMARY"] = True
+    return d
+
+
+def _cur():
+    return CUR if CUR is not None else _primary_domain()
+
+
+def _label(name, key):
+    rc, out, _ = RUN.run(["podman", "inspect", name, "--format",
+                          '{{ index .Config.Labels "%s" }}' % key])
+    return out.strip() if rc == 0 else ""
+
+
+def _live_dcs_of(realm):
+    # DC containers labelled with this realm, ordinal-sorted (<slug>-dc1, -dc2…).
+    rc, out, _ = RUN.run(["podman", "ps", "-a", "--filter",
+                          "label=%s=%s" % (DOM_LABEL, realm),
+                          "--format", "{{.Names}}"])
+    names = [n for n in out.split() if n] if rc == 0 else []
+    return sorted(names, key=lambda n: (len(n), n))
+
+
+def _domain_from_container(realm, ctr):
+    base = dict(PRIMARY_LAB)  # inherit shared fields: forwarder, images, admin-pass, clients
+    slug = _label(ctr, "adlab.slug") or realm.split(".")[0].lower()
+    base.update({
+        "REALM": realm,
+        "DOMAIN_NB": _label(ctr, "adlab.domain_nb") or realm.split(".")[0].upper()[:15],
+        "DOMAIN_DNS": realm.lower(),
+        "NET": _label(ctr, "adlab.net") or ("adlab-" + slug),
+        "NET_PREFIX": _label(ctr, "adlab.net_prefix") or "",
+        "DC_BASE": int(_label(ctr, "adlab.dc_base") or "10"),
+        "SLUG": slug,
+        "PRIMARY": False,
+    })
+    return base
+
+
+def list_domains():
+    doms = [_primary_domain()]
+    # NB: `podman ps` exposes labels as `.Labels` (a map); `.Config.Labels` is an
+    # INSPECT-only field and comes back empty here — which silently hid every
+    # additional forest until this was corrected.
+    rc, out, _ = RUN.run(["podman", "ps", "-a", "--filter", "label=" + DOM_LABEL,
+                          "--format", '{{.Names}}\t{{ index .Labels "%s" }}' % DOM_LABEL])
+    reps = {}
+    if rc == 0:
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[1] and parts[1] not in reps:
+                reps[parts[1]] = parts[0]
+    for realm, ctr in reps.items():
+        doms.append(_domain_from_container(realm, ctr))
+    return doms
+
+
+def resolve_domain(realm=None):
+    if not realm:
+        return _primary_domain()
+    for d in list_domains():
+        if d["REALM"].lower() == realm.lower():
+            return d
+    raise Fail("no such domain: %s (see domain-list)" % realm)
+
+
+def dc_name(i, dom=None):
+    d = dom or _cur()
+    s = d.get("SLUG", "")
+    return ("%s-dc%d" % (s, i)) if s else ("dc%d" % i)
+
+
+def dc_ip(i, dom=None):
+    d = dom or _cur()
+    return "%s.%d" % (d["NET_PREFIX"], d["DC_BASE"] + i - 1)
+
+
+# Clients only ever join the PRIMARY forest, so they always read PRIMARY_LAB.
 def client_name(i): return "client%d" % i
-def client_ip(i):   return "%s.%d" % (LAB["NET_PREFIX"], LAB["CLIENT_BASE"] + i - 1)
-def all_dcs():   return [dc_name(i) for i in range(1, LAB["DC_COUNT"] + 1)]
-def all_clients(): return [client_name(i) for i in range(1, LAB["CLIENT_COUNT"] + 1)]
-def domain_dn(): return "DC=" + ",DC=".join(LAB["DOMAIN_DNS"].split("."))
+def client_ip(i):   return "%s.%d" % (PRIMARY_LAB["NET_PREFIX"], PRIMARY_LAB["CLIENT_BASE"] + i - 1)
+
+
+def all_dcs(dom=None):
+    d = dom or _cur()
+    if d.get("PRIMARY", True):
+        return [dc_name(i, d) for i in range(1, d["DC_COUNT"] + 1)]
+    return _live_dcs_of(d["REALM"])
+
+
+def all_clients(): return [client_name(i) for i in range(1, PRIMARY_LAB["CLIENT_COUNT"] + 1)]
+
+
+def domain_dn(dom=None):
+    d = dom or _cur()
+    return "DC=" + ",DC=".join(d["DOMAIN_DNS"].split("."))
 
 SAM = "/var/lib/samba/private/sam.ldb"
 
@@ -217,11 +330,13 @@ def ctr_ip(name):
                           "{{range $k,$v := .NetworkSettings.Networks}}{{$v.IPAddress}}{{end}}"])
     return out.strip() if rc == 0 else ""
 
-def first_up_dc():
-    for d in all_dcs():
+def first_up_dc(dom=None):
+    for d in all_dcs(dom):
         if ctr_state(d) == "running":
             return d
-    raise Fail("no DC container is running")
+    raise Fail("no DC container is running%s" % (
+        "" if (dom or _cur()).get("PRIMARY", True)
+        else " for domain %s" % (dom or _cur())["REALM"]))
 
 def pdc_emulator():
     """Which DC holds the PDC emulator role — queried, never hardcoded."""
@@ -2179,40 +2294,200 @@ def v_dc_shell(a):
     rc, out, err = podman(a["dc"], ["bash", "-c", a["command"]], timeout=60)
     return {"dc": a["dc"], "rc": rc, "stdout": out[-8000:], "stderr": err[-4000:]}
 
+def _run_dc(dom, name, ip, role, peer_ip=None):
+    """podman run one DC container for `dom`. ROLE=provision (new forest) or
+    join (replication partner). Additional-domain containers carry adlab.*
+    labels so list_domains() can rediscover the forest from live state."""
+    pass_mount = PRIMARY_LAB["ADMIN_PASS_FILE"] + ":/run/adminpass:ro"
+    cmd = ["podman", "run", "-d", "--name", name, "--hostname", name,
+           "--network", dom["NET"], "--ip", ip,
+           "--cap-add", "SYS_ADMIN,NET_ADMIN,SYS_TIME",
+           "--security-opt", "seccomp=unconfined",
+           "-v", pass_mount,
+           "-e", "ROLE=" + role, "-e", "REALM=" + dom["REALM"],
+           "-e", "DOMAIN_NB=" + dom["DOMAIN_NB"], "-e", "DC_IP=" + ip,
+           "-e", "FORWARDER=" + dom.get("FORWARDER", PRIMARY_LAB["FORWARDER"]),
+           "-e", "ADMIN_PASS_FILE=/run/adminpass"]
+    if peer_ip:
+        cmd += ["-e", "PEER_IP=" + peer_ip]
+    if not dom.get("PRIMARY"):
+        cmd += ["--label", "adlab.realm=" + dom["REALM"],
+                "--label", "adlab.domain_nb=" + dom["DOMAIN_NB"],
+                "--label", "adlab.net=" + dom["NET"],
+                "--label", "adlab.net_prefix=" + dom["NET_PREFIX"],
+                "--label", "adlab.dc_base=%d" % dom["DC_BASE"],
+                "--label", "adlab.slug=" + dom["SLUG"],
+                "--label", "adlab.role=" + role]
+    cmd.append(PRIMARY_LAB["IMG_DC"])
+    return RUN.run(cmd, timeout=180)
+
+
+def _require_dc(name):
+    if ctr_state(name) == "missing":
+        raise Fail("no such DC container: %s" % name)
+
+
+def _domain_of_dc(name):
+    """Which domain a DC container belongs to — from its realm label, else the
+    primary forest."""
+    realm = _label(name, "adlab.realm")
+    return resolve_domain(realm) if realm else _primary_domain()
+
+
 def v_dc_promote(a):
-    """Bring up dcN+1 as a new replication partner — DC promotion."""
-    i = LAB["DC_COUNT"] + 1
-    while ctr_state(dc_name(i)) != "missing":
+    """Deploy an additional DC (replication partner) into the CURRENT domain
+    (select it with --domain; default is the primary forest)."""
+    dom = _cur()
+    i = len(all_dcs(dom)) + 1
+    while ctr_state(dc_name(i, dom)) != "missing":
         i += 1
-    n, ip = dc_name(i), dc_ip(i)
-    pass_mount = LAB["ADMIN_PASS_FILE"] + ":/run/adminpass:ro"
-    rc, out, err = RUN.run([
-        "podman", "run", "-d", "--name", n, "--hostname", n,
-        "--network", LAB["NET"], "--ip", ip,
-        "--cap-add", "SYS_ADMIN,NET_ADMIN,SYS_TIME",
-        "--security-opt", "seccomp=unconfined",
-        "-v", pass_mount,
-        "-e", "ROLE=join", "-e", "REALM=" + LAB["REALM"],
-        "-e", "DOMAIN_NB=" + LAB["DOMAIN_NB"],
-        "-e", "DC_IP=" + ip, "-e", "PEER_IP=" + dc_ip(1),
-        "-e", "FORWARDER=" + LAB["FORWARDER"],
-        "-e", "ADMIN_PASS_FILE=/run/adminpass",
-        LAB["IMG_DC"]], timeout=120)
+    n, ip = dc_name(i, dom), dc_ip(i, dom)
+    peer = ctr_ip(first_up_dc(dom)) or dc_ip(1, dom)
+    rc, out, err = _run_dc(dom, n, ip, "join", peer_ip=peer)
     if rc != 0:
         raise Fail(err.strip() or out.strip())
-    return {"promoting": n, "ip": ip,
-            "note": "join runs in the background; watch dc-logs %s" % n}
+    return {"promoting": n, "ip": ip, "domain": dom["REALM"],
+            "note": "join runs in the background; watch: dc-logs --dc %s%s" % (
+                n, "" if dom.get("PRIMARY") else " --domain " + dom["REALM"])}
+
 
 def v_dc_demote(a):
-    """samba-tool domain demote ON the DC, then remove its container."""
-    if a["dc"] == dc_name(1):
-        raise Fail("refusing to demote dc1 (provisioning DC and default peer)")
-    rc, out, err = podman_auth(a["dc"], "samba-tool domain demote", timeout=300)
+    """samba-tool domain demote ON the DC, then remove its container. Refuses
+    the primary provisioning DC and a domain's last DC."""
+    return _demote_or_decommission(a["dc"])
+
+
+def v_dc_decommission(a):
+    """Decommission any DC (any domain): demote + remove its container. Refuses
+    the primary dc1 and a domain's last DC — use domain-remove to destroy a
+    whole forest."""
+    return _demote_or_decommission(a["dc"])
+
+
+def _demote_or_decommission(name):
+    _require_dc(name)
+    if name == "dc1":
+        raise Fail("refusing to demote dc1 (primary provisioning DC and default peer)")
+    dom = _domain_of_dc(name)
+    alive = [d for d in all_dcs(dom) if ctr_state(d) != "missing"]
+    if len(alive) <= 1:
+        raise Fail("%s is the last DC of %s — use domain-remove "
+                   "(optionally --backup true) to destroy the forest" % (name, dom["REALM"]))
+    rc, out, err = podman_auth(name, "samba-tool domain demote", timeout=300)
     if rc != 0:
         raise Fail(err.strip() or out.strip())
-    RUN.run(["podman", "rm", "-f", a["dc"]])
-    return {"demoted": a["dc"], "container_removed": True,
+    RUN.run(["podman", "rm", "-f", name])
+    return {"demoted": name, "domain": dom["REALM"], "container_removed": True,
             "output": out.strip()[-600:]}
+
+
+# ---- domains (multi-forest lifecycle) -------------------------------------
+
+def v_domain_list(a):
+    """Every domain (forest) in the lab, primary first, with its DCs."""
+    out = []
+    for d in list_domains():
+        dcs = [{"name": x, "state": ctr_state(x), "ip": ctr_ip(x)} for x in all_dcs(d)]
+        out.append({
+            "realm": d["REALM"], "domain_nb": d["DOMAIN_NB"],
+            "primary": bool(d.get("PRIMARY")), "net": d["NET"],
+            "net_prefix": d.get("NET_PREFIX", ""), "slug": d.get("SLUG", ""),
+            "dcs": dcs, "dc_count": sum(1 for x in dcs if x["state"] != "missing")})
+    return {"domains": out}
+
+
+def _alloc_domain_subnet():
+    """Give each additional forest its own /24 under 10.44.x — first free x."""
+    used = set()
+    for d in list_domains():
+        p = d.get("NET_PREFIX", "")
+        if not d.get("PRIMARY") and p.startswith("10.44."):
+            try:
+                used.add(int(p.split(".")[2]))
+            except (ValueError, IndexError):
+                pass
+    n = 1
+    while n in used:
+        n += 1
+    return "10.44.%d" % n
+
+
+def v_domain_add(a):
+    """Create a new INDEPENDENT forest: its own podman network + first DC
+    (provisioned). This is how the initial DC of a new domain is deployed."""
+    realm = a["realm"].strip().upper()
+    nb = a["domain_nb"].strip().upper()
+    slug = (a.get("slug") or realm.split(".")[0]).strip().lower()
+    if "." not in realm:
+        raise Fail("realm must be a dotted DNS domain, e.g. CORP.EXAMPLE.LAB")
+    if realm.lower() == PRIMARY_LAB["REALM"].lower():
+        raise Fail("%s is the primary domain" % realm)
+    if any(d["REALM"].lower() == realm.lower() for d in list_domains() if not d.get("PRIMARY")):
+        raise Fail("domain %s already exists (see domain-list)" % realm)
+    net = "adlab-" + slug
+    prefix = _alloc_domain_subnet()
+    rc, out, err = RUN.run(["podman", "network", "create", net, "--subnet", prefix + ".0/24"])
+    if rc != 0 and "already" not in (err + out).lower():
+        raise Fail("network create failed: " + (err.strip() or out.strip()))
+    dom = {"REALM": realm, "DOMAIN_NB": nb, "DOMAIN_DNS": realm.lower(),
+           "NET": net, "NET_PREFIX": prefix, "DC_BASE": 10, "SLUG": slug,
+           "PRIMARY": False, "FORWARDER": PRIMARY_LAB["FORWARDER"]}
+    name, ip = dc_name(1, dom), dc_ip(1, dom)
+    rc, out, err = _run_dc(dom, name, ip, "provision")
+    if rc != 0:
+        RUN.run(["podman", "network", "rm", net])   # roll back the network we just made
+        raise Fail("provision failed: " + (err.strip() or out.strip()))
+    return {"domain": realm, "domain_nb": nb, "slug": slug, "network": net,
+            "subnet": prefix + ".0/24", "dc": name, "ip": ip,
+            "note": "provisioning runs in the background; watch: dc-logs --dc %s --domain %s. "
+                    "Add DCs with: dc-promote --domain %s" % (name, realm, realm)}
+
+
+def v_domain_backup(a):
+    """Offline AD backup of a domain (samba-tool domain backup offline) copied
+    to a tarball on the host. Works for any domain including the primary."""
+    dom = resolve_domain(a["realm"])
+    dc = first_up_dc(dom)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    indir = "/tmp/adlab-backup-%s" % stamp
+    rc, out, err = podman(dc, ["bash", "-lc",
+        "rm -rf %s && mkdir -p %s && samba-tool domain backup offline --targetdir=%s"
+        % (indir, indir, indir)], timeout=600)
+    if rc != 0:
+        raise Fail("backup failed on %s: %s" % (dc, err.strip() or out.strip()))
+    rc, ls, _ = podman(dc, ["bash", "-lc", "ls -1 %s/*.tar.bz2 2>/dev/null | head -1" % indir])
+    tar_in = ls.strip()
+    if not tar_in:
+        raise Fail("backup produced no tarball in %s" % indir)
+    hostdir = "/var/lib/adlab/backups"
+    os.makedirs(hostdir, exist_ok=True)
+    hostpath = os.path.join(hostdir, "%s-%s.tar.bz2" % (dom["SLUG"] or "primary", stamp))
+    rc, out, err = RUN.run(["podman", "cp", "%s:%s" % (dc, tar_in), hostpath], timeout=300)
+    podman(dc, ["rm", "-rf", indir])
+    if rc != 0:
+        raise Fail("copying backup out failed: " + (err.strip() or out.strip()))
+    return {"domain": dom["REALM"], "dc": dc, "backup": hostpath}
+
+
+def v_domain_remove(a):
+    """Destroy a whole forest: (optionally back it up first, --backup true),
+    then remove every DC container and the domain's podman network. Refuses the
+    primary domain — that is the lab's root forest."""
+    dom = resolve_domain(a["realm"])
+    if dom.get("PRIMARY"):
+        raise Fail("refusing to remove the primary domain (%s) — it is the lab's "
+                   "root forest; tear the whole lab down with 99-down.sh" % dom["REALM"])
+    result = {"domain": dom["REALM"]}
+    if str(a.get("backup", "")).lower() in ("true", "yes", "1", "on"):
+        result["backup"] = v_domain_backup({"realm": dom["REALM"]})["backup"]
+    removed = []
+    for d in all_dcs(dom):
+        if ctr_state(d) != "missing":
+            RUN.run(["podman", "rm", "-f", d])
+            removed.append(d)
+    RUN.run(["podman", "network", "rm", dom["NET"]])
+    result.update({"removed_dcs": removed, "network_removed": dom["NET"]})
+    return result
 
 # ---- clients & onboarding -------------------------------------------------
 
@@ -2960,6 +3235,24 @@ VERBS = {
     "dc-demote":     {"fn": v_dc_demote, "group": "dcs", "danger": True,
                       "help": "Gracefully demote a DC and remove its container.",
                       "args": [arg("dc", "enum", choices=DC_CHOICES)]},
+    "dc-decommission": {"fn": v_dc_decommission, "group": "dcs", "danger": True,
+                      "help": "Decommission a DC in ANY domain (demote + remove); refuses a forest's last DC.",
+                      "args": [arg("dc", help_="DC container to decommission (any domain)")]},
+    "domain-list":   {"fn": v_domain_list, "group": "domains",
+                      "help": "Every forest in the lab (primary first) with its DCs."},
+    "domain-add":    {"fn": v_domain_add, "group": "domains", "danger": True,
+                      "help": "Create a NEW independent forest: its own podman network + a provisioned first DC.",
+                      "args": [arg("realm", help_="realm / DNS domain, e.g. CORP.EXAMPLE.LAB"),
+                               arg("domain_nb", help_="NetBIOS name (<=15 chars)"),
+                               arg("slug", required=False, help_="short name for the containers/network (default: first realm label)")]},
+    "domain-backup": {"fn": v_domain_backup, "group": "domains",
+                      "help": "Offline AD backup of a domain to a host tarball.",
+                      "args": [arg("realm", help_="which domain to back up (see domain-list)")]},
+    "domain-remove": {"fn": v_domain_remove, "group": "domains", "danger": True,
+                      "help": "Destroy a whole forest: remove all its DCs + its network. Optionally back up first.",
+                      "args": [arg("realm", help_="domain to destroy"),
+                               arg("backup", "enum", required=False, choices=["true", "false"], default="false",
+                                   help_="run an offline AD backup before destroying")]},
     "client-list":   {"fn": v_client_list, "group": "clients",
                       "help": "Client containers with join state."},
     "client-onboard": {"fn": v_client_onboard, "group": "clients",
@@ -3026,9 +3319,32 @@ def audit(verb, args, ok):
     except OSError:
         pass
 
+def _extract_domain(argv):
+    # `--domain <realm>` is a GLOBAL selector, valid before or after the verb:
+    # it sets which forest the verb acts on. Pop it so per-verb parse_args never
+    # sees it. Returns (argv_without_domain, realm_or_None).
+    out, realm, i = [], None, 0
+    while i < len(argv):
+        if argv[i] == "--domain" and i + 1 < len(argv):
+            realm = argv[i + 1]
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out, realm
+
+
 def main(argv):
+    global CUR, LAB
+    argv, _dom_sel = _extract_domain(argv)
+    try:
+        CUR = resolve_domain(_dom_sel)   # default: primary (unchanged behavior)
+        LAB = CUR                        # every LAB["..."] read is now current-domain
+    except Fail as e:
+        print(json.dumps({"error": str(e)}))
+        return 2
     if len(argv) < 1 or argv[0] in ("-h", "--help"):
-        print(json.dumps({"error": "usage: adlab-admin VERB [--arg value ...]",
+        print(json.dumps({"error": "usage: adlab-admin [--domain REALM] VERB [--arg value ...]",
                           "verbs": sorted(VERBS)}))
         return 2
     verb = argv[0]
@@ -3037,6 +3353,19 @@ def main(argv):
         print(json.dumps({"error": "unknown verb %r" % verb,
                           "verbs": sorted(VERBS)}))
         return 2
+    # A --dc / --to_dc enum reflects the CURRENT domain's DCs (dynamic per
+    # --domain), so a DC in a non-primary forest is accepted while an invalid
+    # one is still rejected with "must be one of". The module VERBS spec (which
+    # v_schema dumps) is left untouched.
+    if spec.get("args") and any(
+            ar.get("type") == "enum" and ar.get("name") in ("dc", "to_dc")
+            for ar in spec["args"]):
+        cur_dcs = all_dcs()
+        spec = dict(spec, args=[
+            (dict(ar, choices=cur_dcs)
+             if ar.get("type") == "enum" and ar.get("name") in ("dc", "to_dc")
+             else ar)
+            for ar in spec["args"]])
     try:
         args = parse_args(spec, argv[1:])
     except Fail as e:
