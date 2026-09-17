@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.3.0 - 2026-09-17
+
+Persistent, differentially-refreshed ADMX catalog cache — the GPO editor's left
+pane now opens instantly instead of re-parsing the whole central store.
+
+- **The problem**: `gpo-catalog` re-read and re-parsed every `.admx`/`.adml` in
+  the central store on every editor open (a `podman exec` per file) — ~4004
+  policies, **~38s measured on edt1**.
+- **The cache**: `/var/lib/adlab/catalog-cache.json` (0644, world-readable)
+  stores each ADMX file's PARSED policies keyed by a `size:mtime` signature.
+  Serving from a warm cache is **~0.14s**. OS/subsystem facets and operator tag
+  overrides are applied at serve time (not cached), so retagging never needs a
+  re-parse.
+- **Differential refresh** (`gpo-catalog --refresh true`): stats the central
+  store once, re-ingests only ADMX whose file — or its ADML — is newer/changed,
+  and **keeps** the rest. Touching one file re-parses one file (~1s), not 4004.
+  `--rebuild true` forces a full re-parse.
+- **Delete detection**: entries whose backing ADMX no longer exists are purged
+  from the cache on refresh.
+- **Change events over a channel**: the cache file is rewritten atomically and
+  ONLY when something changed, so the mtime bump is a real "refreshed" event.
+  The editor subscribes to a Cockpit **fswatch** channel on the cache file, so a
+  refresh from any session (or the periodic tick) reloads every open editor's
+  tree. The session user can read the file, so the watch needs no elevation.
+- **UI**: the editor loads the tree from cache immediately, runs a background
+  differential refresh, polls one every 2 minutes while open, and tears down the
+  watch + timer when the modal closes. The plugin also warms the cache in the
+  background at load so the first editor open is fast too.
+- Unit tests: 134 (+5 — the pure refresh planner's reuse/reingest/delete/force
+  branches and cache-serving without any podman calls). Verified live on edt1:
+  cold build 39.6s → warm serve 0.14s; a one-file change re-ingests in 1.0s; an
+  unbacked entry is purged.
+
 ## 1.2.2 - 2026-09-17
 
 GPO preferences modal: sort the available policy by OS.
