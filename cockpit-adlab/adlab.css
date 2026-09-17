@@ -163,8 +163,26 @@ kbd.al { background: var(--al-code-bg); border: 1px solid var(--al-border);
 .al-edit-splitter { width: 6px; cursor: col-resize; background: var(--al-border);
     flex-shrink: 0; }
 .al-edit-splitter:hover { background: var(--al-accent); }
-.al-edit-list { flex: 1 1 auto; overflow: auto; padding: 0.6rem 0.8rem; min-width: 0; }
-.al-edit-keyhdr { margin-bottom: 0.4rem; }
+/* Right pane is a flex column: a fixed header + filter on top, then a scroll
+   region that takes the rest of the height. */
+.al-edit-list { flex: 1 1 auto; overflow: hidden; padding: 0.6rem 0.8rem; min-width: 0;
+    display: flex; flex-direction: column; }
+.al-edit-keyhdr { margin-bottom: 0.4rem; flex-shrink: 0; }
+.al-edit-list-tools { flex-shrink: 0; display: flex; gap: 0.4rem; align-items: center; margin-bottom: 0.3rem; }
+.al-edit-list-tools .al-edit-list-filter { flex: 1 1 auto; margin: 0; }
+.al-edit-list-tools .al-btn { flex-shrink: 0; width: auto; }
+.al-edit-list-count { flex-shrink: 0; color: var(--al-sub); font-size: 0.78rem; margin-bottom: 0.3rem; }
+/* The data region scrolls BOTH ways: rows vertically, wide columns horizontally.
+   min-height:0 lets a flex child actually scroll instead of growing the pane. */
+.al-edit-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; }
+.al-edit-scroll .al-scroll { overflow: visible; }   /* let al-edit-scroll own both axes */
+/* Column headers stay put while the rows scroll vertically. */
+.al-edit-scroll table.al th { position: sticky; top: 0; z-index: 1; background: var(--al-bg); }
+/* Short columns stay on one line (compact + readable); the long setting/key
+   columns wrap within their cap (.al-wrapcell). The table then grows past the
+   pane and scrolls horizontally rather than squishing every column. */
+.al-edit-scroll table.al th, .al-edit-scroll table.al td { white-space: nowrap; }
+.al-edit-scroll .al-wrapcell { white-space: normal; }
 
 .al-tree-row { display: flex; align-items: center; gap: 0.35rem; padding: 0.18rem 0.4rem;
     font-size: 0.85rem; cursor: pointer; white-space: nowrap; }
