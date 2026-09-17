@@ -2155,7 +2155,7 @@
     function gpoEditModal(target) {
         if (!target) { return; }
         var catalog = [], current = [], facets = { os_types: [], subsystems: [] };
-        var fSetting = "", fOs = "", fSubs = {};
+        var fSetting = "", fOs = "", fSubs = {}, listFilter = "", listCols = { key: true, ingpo: true };
         var expanded = {}, selGroup = null;
 
         modal("Edit Group Policy", function (box) {
@@ -2280,22 +2280,81 @@
                 }
                 return null;
             }
+            // The optional, selectable columns for the settings list. "setting"
+            // (name) and the actions column always show; these can be toggled.
+            function editListColumns() {
+                return [
+                    { id: "key", label: "key / cse", cell: function (e) {
+                        var c = el("div", "al-wrapcell");
+                        c.textContent = e.source === "cse" ? ("CSE: " + e.cse) : (e.class + " " + e.keyname + "\\" + e.valuename);
+                        return c; } },
+                    { id: "class", label: "class", cell: function (e) { return e.source === "cse" ? "—" : (e.class || ""); } },
+                    { id: "type", label: "type", cell: function (e, cur) { return e.source === "cse" ? "—" : (cur ? cur.type : (e.enabled_type || e.type || "")); } },
+                    { id: "admx", label: "ADMX", cell: function (e) { return e.source === "cse" ? "(preference)" : (e.admx || ""); } },
+                    { id: "ingpo", label: "in GPO", cell: function (e, cur) { return cur ? badge(dataPreview(cur.type, cur.data), "ok") : badge("no", "dim"); } },
+                ];
+            }
+            function editColumnsPicker(onApply) {
+                transientModal("Columns", function (box, close) {
+                    box.appendChild(el("div", "hint", "The setting name and actions always show."));
+                    var host = el("div", "al-facet-row"); host.style.flexWrap = "wrap";
+                    var chosen = {}; Object.keys(listCols).forEach(function (k) { if (listCols[k]) chosen[k] = true; });
+                    editListColumns().forEach(function (c) {
+                        var b = el("button", "al-chip" + (chosen[c.id] ? " on" : ""), c.label); b.type = "button";
+                        b.addEventListener("click", function () { if (chosen[c.id]) delete chosen[c.id]; else chosen[c.id] = true; b.className = "al-chip" + (chosen[c.id] ? " on" : ""); });
+                        host.appendChild(b);
+                    });
+                    box.appendChild(host);
+                    var ok = el("button", "al-btn", "Apply");
+                    ok.addEventListener("click", function () {
+                        listCols = {}; editListColumns().forEach(function (c) { if (chosen[c.id]) listCols[c.id] = true; });
+                        close(); onApply();
+                    });
+                    box.appendChild(ok);
+                });
+            }
             function drawList() {
                 clear(listPane);
                 if (!selGroup) { listPane.appendChild(el("div", "hint", "select a subsystem group in the tree to list its settings")); return; }
-                listPane.appendChild(el("div", "al-edit-keyhdr")).appendChild(el("kbd", "al", selGroup.os + " · " + selGroup.sub));
+                var hdr = el("div", "al-edit-keyhdr"); hdr.appendChild(el("kbd", "al", selGroup.os + " · " + selGroup.sub));
+                listPane.appendChild(hdr);
                 var g = groups();
                 var entries = (g[selGroup.os] && g[selGroup.os][selGroup.sub]) || [];
-                listPane.appendChild(tableOf(["setting", "key / cse", "in GPO", ""], entries.map(function (e) {
-                    var cur = curFor(e);
-                    var acts = el("div", "al-actions");
-                    var edit = el("button", "al-btn", cur ? "edit" : "compose");
-                    edit.addEventListener("click", function () { editSetting(e); });
-                    acts.appendChild(edit);
-                    var keycell = el("div", "al-wrapcell");
-                    keycell.textContent = e.source === "cse" ? ("CSE: " + e.cse) : (e.class + " " + e.keyname + "\\" + e.valuename);
-                    return [e.name, keycell, cur ? badge(dataPreview(cur.type, cur.data), "ok") : badge("no", "dim"), acts];
-                })));
+                // Fixed toolbar above the scrolling table: filter + column picker.
+                // A subsystem group can hold hundreds of settings.
+                var tools = el("div", "al-edit-list-tools");
+                var filt = el("input", "al-edit-list-filter"); filt.type = "search";
+                filt.placeholder = "filter settings…"; filt.value = listFilter;
+                var colsBtn = el("button", "al-btn secondary", "Columns…");
+                colsBtn.addEventListener("click", function () { editColumnsPicker(render); });
+                tools.appendChild(filt); tools.appendChild(colsBtn);
+                listPane.appendChild(tools);
+                var count = el("div", "al-edit-list-count", "");
+                listPane.appendChild(count);
+                var wrap = el("div", "al-edit-scroll"); listPane.appendChild(wrap);
+                function render() {
+                    clear(wrap);
+                    var cols = editListColumns().filter(function (c) { return listCols[c.id]; });
+                    var q = (listFilter || "").trim().toLowerCase();
+                    var shown = !q ? entries : entries.filter(function (e) {
+                        var hay = (e.name + " " + (e.source === "cse" ? ("cse " + e.cse)
+                            : (e.class + " " + e.keyname + " " + e.valuename)) + " " + (e.admx || "")).toLowerCase();
+                        return hay.indexOf(q) >= 0;
+                    });
+                    count.textContent = shown.length + " of " + entries.length + " setting" + (entries.length === 1 ? "" : "s");
+                    var headers = ["setting"].concat(cols.map(function (c) { return c.label; })).concat([""]);
+                    wrap.appendChild(tableOf(headers, shown.map(function (e) {
+                        var cur = curFor(e);
+                        var acts = el("div", "al-actions");
+                        var edit = el("button", "al-btn", cur ? "edit" : "compose");
+                        edit.addEventListener("click", function () { editSetting(e); });
+                        acts.appendChild(edit);
+                        var namecell = el("div", "al-wrapcell"); namecell.textContent = e.name;
+                        return [namecell].concat(cols.map(function (c) { return c.cell(e, cur); })).concat([acts]);
+                    })));
+                }
+                filt.addEventListener("input", function () { listFilter = filt.value; render(); });
+                render();
             }
 
             function tagEditor(e) {
@@ -2334,8 +2393,10 @@
 
             function editSetting(e) {
                 clear(listPane);
-                listPane.appendChild(el("div", "al-edit-keyhdr")).appendChild(el("kbd", "al", e.name));
-                listPane.appendChild(tagEditor(e));
+                var eh = el("div", "al-edit-keyhdr"); eh.appendChild(el("kbd", "al", e.name));
+                listPane.appendChild(eh);
+                var scroll = el("div", "al-edit-scroll"); listPane.appendChild(scroll);
+                scroll.appendChild(tagEditor(e));
                 var body = el("div", "al-card");
                 if (e.source === "cse") {
                     body.appendChild(el("h3", null, "Preference (" + e.cse + ")"));
@@ -2388,7 +2449,7 @@
                 var back = el("button", "al-btn secondary", "Back to list");
                 back.addEventListener("click", drawList);
                 body.appendChild(back);
-                listPane.appendChild(body);
+                scroll.appendChild(body);
             }
 
             var actions = el("div", "row");

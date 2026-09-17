@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.1 - 2026-09-17
+
+GPO editor right pane (`.al-edit-list`): filter, selectable columns, and proper
+scrolling. A subsystem group can hold hundreds of settings.
+
+- **Filter** — a search box above the table narrows the settings by name,
+  registry key/value, CSE, or ADMX file, with a live "N of M settings" count.
+- **Selectable columns** — a "Columns…" picker toggles optional columns
+  (key / cse, class, type, ADMX, in GPO); the setting name and the action
+  button always show. The choice persists while the modal is open.
+- **Scrolling** — the pane is now a fixed header + filter over a scroll region
+  that scrolls **both axes**: rows scroll vertically under a **sticky column
+  header**, and wide content (extra columns) scrolls horizontally instead of
+  squishing every column. Short columns stay single-line; the long
+  setting/key columns wrap within a cap. The setting detail/editor view scrolls
+  the same way.
+- UI only. Verified in a mock-bridge harness: 40-setting group scrolls
+  vertically (sticky header), filter narrows to 1 of 40, enabling class/type/
+  ADMX columns triggers horizontal scroll.
+
 ## 1.3.0 - 2026-09-17
 
 Persistent, differentially-refreshed ADMX catalog cache — the GPO editor's left
