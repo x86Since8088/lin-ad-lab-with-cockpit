@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.2.1 - 2026-09-17
+
+AD Objects console: GPOs in the tree, links viewable (UI only — no helper
+contract change; the version bump is a plugin build marker).
+
+- The "Users & Computers" tab is renamed **AD Objects** (it manages every
+  directory object, not just users and computers).
+- A synthetic **Group Policy Objects** folder now appears in the tree (the
+  GPMC "Group Policy Objects" container). Selecting it lists every GPO
+  (name / version / GUID) in the middle pane with a per-row actions menu
+  (edit settings, compose, details, preferences, link); selecting a GPO shows
+  its metadata and, crucially, its **Links** — the containers it is linked to,
+  each clickable to jump to that container in the tree.
+- **GPO links are viewable from both directions.** An OU/domain object's
+  preview gains a **Linked GPOs** section parsed from its `gPLink`: each linked
+  GPO is shown by display name (resolved via `gpo-list`), flagged `enforced` /
+  `disabled` per its link options, and clickable to jump to that GPO in the
+  Group Policy Objects folder.
+- No new verbs: the console reuses `object-tree` / `object-get` / `gpo-list` /
+  `gpo-show` (whose `links` come from `samba-tool gpo listcontainers`).
+  Verified live in a mock-bridge browser harness (tab rename, GPO folder + list,
+  per-GPO links, OU-side linked GPOs with enforced badge, no console errors).
+
 ## 1.2.0 - 2026-09-17
 
 Multi-domain (multi-forest) support. The lab can now run any number of

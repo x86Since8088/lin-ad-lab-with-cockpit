@@ -32,6 +32,8 @@ html, body { margin: 0; padding: 0; background: var(--al-bg); color: var(--al-in
 .al-dom-label { text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.72rem; }
 .al-dom-select { font-size: 0.85rem; padding: 0.15rem 0.4rem; background: var(--al-bg);
     color: var(--al-ink); border: 1px solid var(--al-border); border-radius: 3px; max-width: 260px; }
+.al-gpo-guid { font-family: Consolas, Monaco, monospace; font-size: 0.78rem; color: var(--al-sub); }
+.al-gpolink { display: flex; align-items: center; gap: 0.35rem; margin: 0.15rem 0; }
 
 .al-tabs { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 2px solid var(--al-border);
     margin-bottom: 1rem; }
