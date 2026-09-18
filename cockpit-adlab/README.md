@@ -89,7 +89,7 @@ sibling is therefore diagnosed at runtime instead:
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests      # 107 tests, no podman, no root
+python3 -m unittest discover -s tests      # 157 tests, no podman, no root
 ```
 
 The suite points `$ADLAB_ENV` at `tests/adlab.env.fixture`. That variable is the

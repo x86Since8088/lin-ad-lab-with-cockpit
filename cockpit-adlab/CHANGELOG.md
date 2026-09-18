@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.5.0 - 2026-09-18
+
+Linux administrative templates in Group Policy (adsys/Ubuntu ADMX).
+
+Windows ships no "Linux" ADMX; the Linux GPO clients define their own. The GP
+editor already read the SYSVOL ADMX **central store** (`PolicyDefinitions/`) and
+faceted every setting by OS type, but the store held only the Windows set plus
+samba's own `GNOME_Settings.admx`/`samba.admx` — there was no representation of
+the real Linux client-policy templates an operator sets (dconf, privilege/sudo,
+scripts, apparmor, mounts, proxy, certificate autoenrollment). This adds that.
+
+- **`gpo-linux-seed`** — generates a self-contained, lint-clean, adsys-faithful
+  `Ubuntu.admx` (namespace `Canonical.Policies.Ubuntu`, 23 policies across 9
+  categories, keys under `Software\Policies\Ubuntu`) and installs it into the
+  central store on the PDC emulator. Additive and idempotent. The generator is a
+  pure function in the helper (unit-tested lint-clean + self-contained), so the
+  lab always has a Linux template set with no network fetch and no cross-file
+  category dependency — the upstream `all/Ubuntu.admx` `<using>`s a base file and
+  is a 550 KB generated blob, unfit to vendor.
+- **`admx-import-apply`** — completes the ADMX import framework (which could
+  `stage`/`plan` but never write). It lands a staged batch in the central store:
+  **add + update by default**, and retirements (`admx_plan`'s `retire`) **only**
+  with `--retire true`. This is load-bearing: `admx_plan` treats a batch as
+  authoritative for the *whole* store, so an additive/partial batch (the Linux
+  seed, a single vendor ADMX) would otherwise "retire" every unrelated file.
+  Apply is idempotent (batch+store fingerprint). To install the full upstream
+  adsys tree instead of the generated subset, `admx-import-stage` it and
+  `admx-import-apply` it.
+- **`gpo-linux-report`** — which GPOs carry Linux-targeted settings: registry.pol
+  keys under a Linux ADMX namespace (`Software\Policies\{Ubuntu,Canonical,GNOME}`)
+  plus samba Unix/VGP CSE preference artifacts in the GPO's SYSVOL. Read-only.
+- **Faceting fix** — `_derive_tags` now tags `ubuntu`/`adsys`/`canonical` ADMX as
+  **Linux** (subsystems ubuntu/gnome/debian). Before, an `Ubuntu.admx` hit the
+  Windows default and every Linux setting was mis-tagged Windows and hidden from
+  the editor's Linux facet. The seeded 23 policies now show as Linux in the
+  catalog (verified live: 396 Linux ADMX entries, 23 Ubuntu).
+- **UI** — the "ADMX central store" modal now separates **Linux** from **Windows**
+  administrative templates, has a one-click **Install Linux (Ubuntu/adsys)
+  templates** button (calls `gpo-linux-seed`, then refreshes the catalog cache so
+  the editor's Linux facet updates), an OS column on the policy list (Linux rows
+  first), and a **GPOs with Linux settings** report.
+- Tests: 157 (+9). Verified live against the lab: seed installed `Ubuntu.admx`
+  (store 232 -> 233 files), 23 policies parsed with all names resolved, re-seed
+  reported "already applied", and the catalog listed the 23 as Linux.
+
 ## 1.4.2 - 2026-09-18
 
 RD/Terminal Server licensing helpers (`rds` verb group). AD-side support only.

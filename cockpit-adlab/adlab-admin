@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 
 
 def _require_config():
@@ -1837,6 +1837,12 @@ def _derive_tags(source, ref):
     'admx' | 'cse'; ref is the ADMX filename or the CSE name."""
     r = (ref or "").lower()
     if source == "admx":
+        # adsys (Ubuntu's AD GPO client) ships Ubuntu.admx in namespace
+        # Canonical.Policies.Ubuntu; without this branch it hit the Windows
+        # default below, so every Linux client-policy setting was mis-tagged
+        # Windows and hidden from the editor's Linux facet.
+        if "ubuntu" in r or "adsys" in r or "canonical" in r:
+            return "Linux", ["ubuntu", "gnome", "debian"]
         if "gnome" in r:  return "Linux", ["gnome", "kde", "wayland"]
         if "samba" in r:  return "Linux", ["debian", "ubuntu", "redhat"]
         return "Windows", ["WinPC", "WinServer"]
@@ -3282,19 +3288,23 @@ def admx_inventory(admx_dir):
     return out
 
 
+def admx_read_text(path):
+    """The file's DECODED text (BOM/UTF-16 tolerant). Used to push a staged
+    ADMX/ADML into the store as UTF-8 over base64."""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16")
+    if raw[:3] == b"\xef\xbb\xbf":
+        return raw.decode("utf-8-sig")
+    return raw.decode("utf-8", "replace")
+
+
 def admx_content_sha(path):
     """sha256 over the file's DECODED text, so a BOM or a UTF-16 encoding does not
     make identical content hash differently on the two sides of a comparison."""
     import hashlib as _hashlib
-    with open(path, "rb") as fh:
-        raw = fh.read()
-    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        text = raw.decode("utf-16")
-    elif raw[:3] == b"\xef\xbb\xbf":
-        text = raw.decode("utf-8-sig")
-    else:
-        text = raw.decode("utf-8", "replace")
-    return _hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return _hashlib.sha256(admx_read_text(path).encode("utf-8")).hexdigest()
 
 
 def admx_fingerprint(inv):
@@ -3473,38 +3483,50 @@ def v_admx_import_state(a):
     return st
 
 
-def v_admx_import_stage(a):
-    """Copy a validated ADMX tree into the working folder and record it. Refuses
-    a tree that does not lint, so a batch that would hide settings never lands."""
+def _stage_admx_dir(label, src, lang="en-US", force=False):
+    """Validate an ADMX tree and copy it into the staging folder as `label`.
+    Returns (result, staged_bool). Shared by admx-import-stage and the Linux
+    ADMX seed so a batch always lands the same way, with its ADML language
+    recorded (apply needs to know which <lang>/ dir to push)."""
     import glob as _glob
     import shutil as _shutil
-    label, src = a["label"], a["source"]
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", label):
         raise Fail("label must be 1-64 chars of [A-Za-z0-9._-] and start alphanumeric")
     if not os.path.isdir(src):
         raise Fail("source is not a directory: %s" % src)
-    lint = admx_lint(src, a.get("lang") or "en-US")
-    if lint["errors"] and (a.get("force") or "").lower() not in ("1", "yes", "true"):
-        return {"staged": False, "label": label, "lint": lint,
-                "note": "refused: fix the errors, or pass --force to stage anyway"}
+    lang = lang or "en-US"
+    lint = admx_lint(src, lang)
+    if lint["errors"] and str(force).lower() not in ("1", "yes", "true"):
+        return ({"staged": False, "label": label, "lint": lint,
+                 "note": "refused: fix the errors, or pass --force to stage anyway"},
+                False)
     dest = os.path.join(ADMX_STAGING, label)
     if os.path.isdir(dest):
         _shutil.rmtree(dest)
-    os.makedirs(os.path.join(dest, "en-US"), exist_ok=True)
+    os.makedirs(os.path.join(dest, lang), exist_ok=True)
     for f in _glob.glob(os.path.join(src, "*.admx")):
         _shutil.copy2(f, dest)
-    for f in _glob.glob(os.path.join(src, "en-US", "*.adml")):
-        _shutil.copy2(f, os.path.join(dest, "en-US"))
+    for f in _glob.glob(os.path.join(src, lang, "*.adml")):
+        _shutil.copy2(f, os.path.join(dest, lang))
     inv = admx_inventory(dest)
     st = admx_state_load()
     st.setdefault("batches", {})[label] = {
-        "path": dest, "fingerprint": admx_fingerprint(inv),
+        "path": dest, "lang": lang, "fingerprint": admx_fingerprint(inv),
         "staged_at": int(time.time()), "files": len(inv),
         "policies": sum(len(v["policies"]) for v in inv.values()),
         "lint": {"errors": len(lint["errors"]), "warnings": len(lint["warnings"])},
     }
     admx_state_save(st)
-    return {"staged": True, "label": label, "batch": st["batches"][label], "lint": lint}
+    return ({"staged": True, "label": label, "batch": st["batches"][label],
+             "lint": lint}, True)
+
+
+def v_admx_import_stage(a):
+    """Copy a validated ADMX tree into the working folder and record it. Refuses
+    a tree that does not lint, so a batch that would hide settings never lands."""
+    res, _ok = _stage_admx_dir(a["label"], a["source"], a.get("lang") or "en-US",
+                               a.get("force"))
+    return res
 
 
 def v_admx_import_plan(a):
@@ -3555,6 +3577,378 @@ def admx_already_applied(label, batch_fp, store_fp):
         return False
     return rec.get("batch_fp") == batch_fp and rec.get("store_fp") == store_fp
 
+
+def _push_file_to_store(dc, dest_path, text):
+    """Write one text file into the SYSVOL central store on `dc`, via base64 on
+    stdin so an encoding or a shell metacharacter cannot corrupt it. This is the
+    same PolicyDefinitions/ directory `samba-tool gpo admxload` populates; SYSVOL
+    replication (single-master, PDC) carries it to the other DCs."""
+    b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    rc, out, err = podman(dc, ["bash", "-c",
+        'd=%s; mkdir -p "$(dirname "$d")" && base64 -d > "$d"' % shq(dest_path)],
+        stdin=b64)
+    if rc != 0:
+        raise Fail("writing %s failed: %s" % (dest_path, (err or out).strip()[-300:]))
+
+
+def _apply_retirements(dc, root, lang, retire_map):
+    """For each store file that dropped policies, preserve those policies in a
+    `<stem>_retired.admx` (own `.Retired` namespace) so GPOs already referencing
+    them still resolve. The batch's own (already-written) file is what removes
+    them from the primary namespace."""
+    out = []
+    for fname, gone in sorted(retire_map.items()):
+        stem = fname[:-5] if fname.lower().endswith(".admx") else fname
+        src_admx_text = _read_b64(dc, "%s/%s" % (root, fname))
+        if not src_admx_text:
+            continue
+        try:
+            src_root = _admx_fromstring(src_admx_text)
+            r_admx, sids, pids, _disp = admx_build_retired(src_root, gone, stem)
+        except Exception:
+            continue
+        radmx_name, radml_name = admx_retired_names(fname)
+        _push_file_to_store(dc, "%s/%s" % (root, radmx_name),
+                            ET.tostring(r_admx, encoding="unicode"))
+        src_adml_text = _read_b64(dc, "%s/%s/%s.adml" % (root, lang, stem))
+        if src_adml_text:
+            try:
+                src_adml_root = _admx_fromstring(src_adml_text)
+                r_adml, _missing = admx_build_retired_adml(src_adml_root, sids, pids)
+                _push_file_to_store(dc, "%s/%s/%s" % (root, lang, radml_name),
+                                    ET.tostring(r_adml, encoding="unicode"))
+            except Exception:
+                pass
+        out.append({"file": fname, "retired_to": radmx_name, "policies": gone})
+    return out
+
+
+def _apply_admx_batch(label, retire=False, force=False):
+    """Copy a staged batch into the SYSVOL central store on the PDC emulator.
+
+    ADDITIVE by default: it adds new .admx (+ its <lang>/.adml) and updates
+    changed ones. Retirement (admx_plan's `retire`) is applied ONLY when
+    retire=True, because admx_plan treats the batch as authoritative for the
+    WHOLE store -- a partial/additive batch (the Linux ADMX seed is one) would
+    otherwise 'retire' every unrelated file. Idempotent: an unchanged
+    store+batch pair is a no-op."""
+    import glob as _glob
+    st = admx_state_load()
+    b = st.get("batches", {}).get(label)
+    if not b:
+        raise Fail("no staged batch %r (stage it first)" % label)
+    lang = b.get("lang", "en-US")
+    batch_inv = admx_inventory(b["path"])
+    store_inv, dc = admx_store_inventory()
+    plan = admx_plan(batch_inv, store_inv)
+    batch_fp = b.get("fingerprint") or admx_fingerprint(batch_inv)
+    force_b = str(force).lower() in ("1", "yes", "true")
+    retire_b = str(retire).lower() in ("1", "yes", "true")
+    if admx_already_applied(label, batch_fp, admx_fingerprint(store_inv)) and not force_b:
+        return {"applied": False, "label": label, "on": dc,
+                "reason": "already applied to this store state", "plan": plan}
+    root = "%s/PolicyDefinitions" % _pol_root(dc)
+    to_write = (set(m["file"] for m in batch_inv.values()) if force_b
+                else set(plan["add"]) | set(plan["update"]))
+    written = []
+    for f in sorted(_glob.glob(os.path.join(b["path"], "*.admx"))):
+        base = os.path.basename(f)
+        if base not in to_write:
+            continue
+        _push_file_to_store(dc, "%s/%s" % (root, base), admx_read_text(f))
+        stem = base[:-5]
+        adml = os.path.join(b["path"], lang, stem + ".adml")
+        if os.path.exists(adml):
+            _push_file_to_store(dc, "%s/%s/%s.adml" % (root, lang, stem),
+                                admx_read_text(adml))
+        written.append(base)
+    retired = _apply_retirements(dc, root, lang, plan["retire"]) if retire_b else []
+    store_inv2, _ = admx_store_inventory()
+    st = admx_state_load()
+    st.setdefault("applied", {})[label] = {
+        "batch_fp": batch_fp, "store_fp": admx_fingerprint(store_inv2),
+        "applied_at": int(time.time()), "written": written, "retired": retired}
+    admx_state_save(st)
+    return {"applied": True, "label": label, "on": dc, "written": written,
+            "retired": retired, "retire_requested": retire_b, "plan": plan,
+            "note": "central store updated; SYSVOL replicates within 5 minutes"}
+
+
+def v_admx_import_apply(a):
+    """Apply a staged batch to the SYSVOL central store (add + update; pass
+    --retire true to also act on retirements). See admx-import-plan first."""
+    return _apply_admx_batch(a["label"], retire=a.get("retire"), force=a.get("force"))
+
+
+
+# ---- Linux administrative templates (adsys-style Ubuntu ADMX) --------------
+# Windows ships no "Linux" ADMX; the Linux GPO clients define their own. adsys
+# (Ubuntu's AD GPO client) publishes Ubuntu.admx in namespace
+# Canonical.Policies.Ubuntu covering dconf, privilege, scripts, apparmor, mount,
+# proxy and certificate autoenrollment. This generator emits a SELF-CONTAINED,
+# lint-clean, adsys-faithful SUBSET so the lab always has a Linux template set to
+# represent in the GP editor with no network fetch and no cross-file category
+# dependency (the upstream all/Ubuntu.admx <using>s a base file). The FULL
+# upstream tree (github.com/ubuntu/adsys, policies/Ubuntu/all) can be dropped in
+# instead through admx-import-stage + admx-import-apply.
+LINUX_ADMX_NS = "Canonical.Policies.Ubuntu"
+LINUX_ADMX_PREFIX = "ubuntu"
+LINUX_ADMX_FILE = "Ubuntu.admx"
+LINUX_ADMX_KEYROOT = "Software\\Policies\\Ubuntu"
+# registry.pol key roots that mark a GPO setting as Linux-targeted.
+LINUX_REG_ROOTS = ("software\\policies\\ubuntu", "software\\policies\\canonical",
+                   "software\\policies\\gnome")
+
+# (name, displayName, parentCategory-or-None) -- a self-contained tree, root last-resolved
+_LINUX_CATS = [
+    ("Ubuntu",      "Ubuntu",                     None),
+    ("Dconf",       "Desktop - dconf settings",   "Ubuntu"),
+    ("Gdm",         "Login screen (GDM)",         "Ubuntu"),
+    ("Privilege",   "Privilege authorization",    "Ubuntu"),
+    ("Scripts",     "Client scripts",             "Ubuntu"),
+    ("AppArmor",    "AppArmor profiles",          "Ubuntu"),
+    ("Mount",       "Network shares (mount)",     "Ubuntu"),
+    ("Proxy",       "System proxy",               "Ubuntu"),
+    ("Certificate", "Certificate autoenrollment", "Ubuntu"),
+]
+
+def _lp(name, cls, cat, sub, valuename, kind, display, explain, label="Value"):
+    return {"name": name, "cls": cls, "cat": cat,
+            "key": LINUX_ADMX_KEYROOT + "\\" + sub, "valuename": valuename,
+            "kind": kind, "display": display, "explain": explain, "label": label}
+
+# A curated, real adsys policy set. kind: bool | text | decimal | multiText.
+_LINUX_POLS = [
+    _lp("DconfBackgroundPictureUri", "User", "Dconf", "dconf",
+        "/org/gnome/desktop/background/picture-uri", "text",
+        "Desktop background picture URI",
+        "Sets org.gnome.desktop.background picture-uri via dconf.",
+        "URI, e.g. file:///opt/corp/wallpaper.png"),
+    _lp("DconfScreensaverLock", "User", "Dconf", "dconf",
+        "/org/gnome/desktop/screensaver/lock-enabled", "bool",
+        "Lock the screen when the screensaver activates",
+        "Enables org.gnome.desktop.screensaver lock-enabled."),
+    _lp("DconfIdleDelay", "User", "Dconf", "dconf",
+        "/org/gnome/desktop/session/idle-delay", "decimal",
+        "Session idle delay",
+        "Sets org.gnome.desktop.session idle-delay in seconds.",
+        "Idle delay (seconds)"),
+    _lp("DconfFavoriteApps", "User", "Dconf", "dconf",
+        "/org/gnome/shell/favorite-apps", "multiText",
+        "GNOME Shell favourite apps",
+        "Sets org.gnome.shell favorite-apps; one .desktop id per line."),
+    _lp("DconfDisableLockScreen", "User", "Dconf", "dconf",
+        "/org/gnome/desktop/lockdown/disable-lock-screen", "bool",
+        "Disable the lock screen",
+        "Enables org.gnome.desktop.lockdown disable-lock-screen."),
+    _lp("GdmDisableUserList", "Machine", "Gdm", "gdm",
+        "/org/gnome/login-screen/disable-user-list", "bool",
+        "Hide the user list on the login screen",
+        "Enables org.gnome.login-screen disable-user-list (GDM greeter, all users)."),
+    _lp("GdmBannerMessage", "Machine", "Gdm", "gdm",
+        "/org/gnome/login-screen/banner-message-text", "text",
+        "Login-screen banner message",
+        "Sets the GDM greeter banner-message-text (banner-message-enable is implied).",
+        "Banner text"),
+    _lp("PrivilegeAllowLocalAdmins", "Machine", "Privilege", "privilege",
+        "allow-local-admins", "bool",
+        "Allow local administrators",
+        "When disabled, local sudo/admin rights are removed and only AD-granted "
+        "admins remain (adsys privilege manager)."),
+    _lp("PrivilegeClientAdmins", "Machine", "Privilege", "privilege",
+        "client-admins", "multiText",
+        "AD users/groups granted administrator rights",
+        "One AD principal per line, e.g. %domain%\\\\linux-admins."),
+    _lp("ScriptsStartup", "Machine", "Scripts", "scripts",
+        "startup", "multiText", "Machine startup scripts",
+        "One SYSVOL-relative script path per line (adsys scripts manager)."),
+    _lp("ScriptsShutdown", "Machine", "Scripts", "scripts",
+        "shutdown", "multiText", "Machine shutdown scripts",
+        "One SYSVOL-relative script path per line."),
+    _lp("ScriptsLogon", "User", "Scripts", "scripts",
+        "logon", "multiText", "User logon scripts",
+        "One SYSVOL-relative script path per line."),
+    _lp("ScriptsLogoff", "User", "Scripts", "scripts",
+        "logoff", "multiText", "User logoff scripts",
+        "One SYSVOL-relative script path per line."),
+    _lp("AppArmorMachineProfiles", "Machine", "AppArmor", "apparmor",
+        "apparmor-machine", "multiText", "Machine AppArmor profiles",
+        "One SYSVOL-relative AppArmor profile path per line (adsys apparmor manager)."),
+    _lp("MountSystemMounts", "Machine", "Mount", "mount",
+        "system-mounts", "multiText", "System network shares to mount",
+        "One entry per line, e.g. smb://server/share (adsys mount manager)."),
+    _lp("MountUserMounts", "User", "Mount", "mount",
+        "user-mounts", "multiText", "User network shares to mount",
+        "One entry per line, e.g. smb://server/home; prefix with [krb5] to require Kerberos."),
+    _lp("ProxyHttp", "Machine", "Proxy", "proxy", "http", "text",
+        "HTTP proxy", "System HTTP proxy URL (adsys proxy manager).",
+        "http:// proxy URL"),
+    _lp("ProxyHttps", "Machine", "Proxy", "proxy", "https", "text",
+        "HTTPS proxy", "System HTTPS proxy URL.", "https:// proxy URL"),
+    _lp("ProxyFtp", "Machine", "Proxy", "proxy", "ftp", "text",
+        "FTP proxy", "System FTP proxy URL.", "ftp:// proxy URL"),
+    _lp("ProxySocks", "Machine", "Proxy", "proxy", "socks", "text",
+        "SOCKS proxy", "System SOCKS proxy URL.", "socks:// proxy URL"),
+    _lp("ProxyNo", "Machine", "Proxy", "proxy", "no-proxy", "multiText",
+        "Proxy exceptions (no_proxy)", "One host or domain per line."),
+    _lp("ProxyAuto", "Machine", "Proxy", "proxy", "auto", "text",
+        "Automatic proxy configuration URL", "PAC file URL.", "PAC URL"),
+    _lp("CertAutoenroll", "Machine", "Certificate", "certificate",
+        "autoenroll", "bool", "Enable certificate autoenrollment",
+        "Enables adsys certificate autoenrollment against AD CS."),
+]
+
+def _xesc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+def linux_admx_generate():
+    """Return (admx_text, adml_text): a self-contained, lint-clean Ubuntu Linux
+    ADMX (namespace Canonical.Policies.Ubuntu) plus its en-US ADML. Pure."""
+    etag = {"text": "text", "decimal": "decimal", "multiText": "multiText"}
+    cats_xml, pols_xml, strings, presentations = [], [], [], []
+    for name, disp, parent in _LINUX_CATS:
+        sid = "Cat_" + name
+        if parent:
+            cats_xml.append(
+                '    <category name="%s" displayName="$(string.%s)">\n'
+                '      <parentCategory ref="%s"/>\n    </category>' % (name, sid, parent))
+        else:
+            cats_xml.append('    <category name="%s" displayName="$(string.%s)"/>' % (name, sid))
+        strings.append('    <string id="%s">%s</string>' % (sid, _xesc(disp)))
+    for p in _LINUX_POLS:
+        n = p["name"]
+        strings.append('    <string id="%s">%s</string>' % (n, _xesc(p["display"])))
+        strings.append('    <string id="%s_Explain">%s</string>' % (n, _xesc(p["explain"])))
+        head = ('    <policy name="%s" class="%s" displayName="$(string.%s)" '
+                'explainText="$(string.%s_Explain)" key="%s"'
+                % (n, p["cls"], n, n, _xesc(p["key"])))
+        if p["kind"] == "bool":
+            pols_xml.append(
+                head + ' valueName="%s">\n'
+                '      <parentCategory ref="%s"/>\n'
+                '      <enabledValue><decimal value="1"/></enabledValue>\n'
+                '      <disabledValue><decimal value="0"/></disabledValue>\n'
+                '    </policy>' % (_xesc(p["valuename"]), p["cat"]))
+        else:
+            eid = n + "_Elem"
+            pols_xml.append(
+                head + ' presentation="$(presentation.%s)">\n'
+                '      <parentCategory ref="%s"/>\n'
+                '      <elements>\n'
+                '        <%s id="%s" valueName="%s"/>\n'
+                '      </elements>\n    </policy>'
+                % (n, p["cat"], etag[p["kind"]], eid, _xesc(p["valuename"])))
+            if p["kind"] == "text":
+                ctl = '<textBox refId="%s"><label>%s</label></textBox>' % (eid, _xesc(p["label"]))
+            elif p["kind"] == "decimal":
+                ctl = '<decimalTextBox refId="%s">%s</decimalTextBox>' % (eid, _xesc(p["label"]))
+            else:
+                ctl = '<multiTextBox refId="%s"/>' % eid
+            presentations.append('    <presentation id="%s">%s</presentation>' % (n, ctl))
+    admx = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<!-- adlab: adsys-style Ubuntu Linux administrative templates (generated) -->\n'
+        '<policyDefinitions revision="1.0" schemaVersion="1.0"\n'
+        '    xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">\n'
+        '  <policyNamespaces>\n'
+        '    <target prefix="%s" namespace="%s"/>\n'
+        '  </policyNamespaces>\n'
+        '  <resources minRequiredRevision="1.0"/>\n'
+        '  <categories>\n%s\n  </categories>\n'
+        '  <policies>\n%s\n  </policies>\n'
+        '</policyDefinitions>\n'
+        % (LINUX_ADMX_PREFIX, LINUX_ADMX_NS, "\n".join(cats_xml), "\n".join(pols_xml)))
+    adml = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<policyDefinitionResources revision="1.0" schemaVersion="1.0"\n'
+        '    xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">\n'
+        '  <displayName>Ubuntu Linux administrative templates</displayName>\n'
+        '  <description>adsys-style Linux client policy: dconf, privilege, scripts, '
+        'apparmor, mount, proxy, certificate.</description>\n'
+        '  <resources>\n'
+        '    <stringTable>\n%s\n    </stringTable>\n'
+        '    <presentationTable>\n%s\n    </presentationTable>\n'
+        '  </resources>\n'
+        '</policyDefinitionResources>\n'
+        % ("\n".join(strings), "\n".join(presentations)))
+    return admx, adml
+
+def v_gpo_linux_seed(a):
+    """Generate a self-contained Ubuntu (adsys-style) Linux ADMX and install it
+    into the SYSVOL central store, so the GP editor represents Linux-targeted
+    administrative templates alongside the Windows ones. Additive + idempotent.
+    Install the FULL upstream adsys tree instead with admx-import-stage +
+    admx-import-apply."""
+    import tempfile as _tf
+    import shutil as _sh
+    admx_text, adml_text = linux_admx_generate()
+    src = _tf.mkdtemp(prefix="adlab-linux-admx-")
+    try:
+        with open(os.path.join(src, LINUX_ADMX_FILE), "w") as fh:
+            fh.write(admx_text)
+        os.makedirs(os.path.join(src, "en-US"), exist_ok=True)
+        with open(os.path.join(src, "en-US", LINUX_ADMX_FILE[:-5] + ".adml"), "w") as fh:
+            fh.write(adml_text)
+        lint = admx_lint(src, "en-US")
+        if lint["errors"]:
+            raise Fail("generated Linux ADMX did not lint: %s"
+                       % "; ".join(lint["errors"][:4]))
+        label = a.get("label") or "linux-ubuntu"
+        res, ok = _stage_admx_dir(label, src, "en-US")
+        if not ok:
+            return res
+        out = _apply_admx_batch(label, retire=False)
+        out["seeded"] = True
+        out["admx"] = LINUX_ADMX_FILE
+        out["namespace"] = LINUX_ADMX_NS
+        out["policies"] = res["batch"]["policies"]
+        out["categories"] = len(_LINUX_CATS)
+        out["lint_warnings"] = len(lint["warnings"])
+        return out
+    finally:
+        _sh.rmtree(src, ignore_errors=True)
+
+def _is_linux_regkey(keyname):
+    """True when a registry.pol key targets a Linux ADMX namespace (adsys/GNOME).
+    Pure: slash/backslash- and case-insensitive, matches a root or a child."""
+    k = (keyname or "").lower().replace("/", "\\")
+    return any(k == r or k.startswith(r + "\\") for r in LINUX_REG_ROOTS)
+
+def _gpo_linux_evidence(dc, gpo):
+    """Linux-targeted evidence for one GPO: registry.pol keys under a Linux ADMX
+    namespace, plus samba Unix/VGP CSE preference artifacts in its SYSVOL."""
+    lin_keys = []
+    for e in _read_registry_pol(dc, gpo):
+        if _is_linux_regkey(e.get("keyname")):
+            lin_keys.append({"key": e.get("keyname"), "valuename": e.get("valuename"),
+                             "class": e.get("class")})
+    base = _sysvol_gpo_dir(gpo)
+    rc, out, _ = podman(dc, ["bash", "-c",
+        "find %s -maxdepth 4 \\( -ipath '*VGP*' -o -iname 'manifest.xml' \\) "
+        "-printf '%%P\\n' 2>/dev/null | head -20" % shq(base)])
+    cse = [x for x in (out or "").split("\n") if x.strip()]
+    return {"gpo": gpo, "registry_keys": lin_keys, "cse_artifacts": cse,
+            "linux": bool(lin_keys or cse)}
+
+def v_gpo_linux_report(a):
+    """Which GPOs carry Linux-targeted settings -- adsys/GNOME registry policy or
+    samba Unix CSE preferences. Read-only; answers 'which GPOs apply Linux
+    templates' next to the ADMX central-store view."""
+    d = pdc_emulator()
+    rc, out, err = podman_auth(d, "samba-tool gpo listall")
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    gpos = parse_gpo_listall(out)
+    rows = []
+    for g in gpos:
+        guid = g.get("gpo", "")
+        ev = _gpo_linux_evidence(d, guid)
+        ev["display_name"] = g.get("display_name", "")
+        rows.append(ev)
+    return {"on": d, "gpos": rows,
+            "linux_count": sum(1 for r in rows if r["linux"]),
+            "total": len(rows), "reg_roots": list(LINUX_REG_ROOTS)}
 
 
 VERBS = {
@@ -3696,6 +4090,17 @@ VERBS = {
     "admx-import-plan": {"fn": v_admx_import_plan, "group": "gpo",
                       "help": "Dry run: what applying a staged batch would add, update and retire.",
                       "args": [arg("label", help_="staged batch label")]},
+    "admx-import-apply": {"fn": v_admx_import_apply, "group": "gpo", "danger": True,
+                      "help": "Install a staged ADMX batch into the SYSVOL central store (add + update; --retire true also acts on retirements). Idempotent.",
+                      "args": [arg("label", help_="staged batch label"),
+                               arg("retire", "enum", required=False, choices=["true", "false"],
+                                   help_="also retire dropped policies (full-set re-imports only)"),
+                               arg("force", required=False, help_="write every file even if unchanged")]},
+    "gpo-linux-seed": {"fn": v_gpo_linux_seed, "group": "gpo",
+                      "help": "Generate and install a self-contained Ubuntu (adsys-style) Linux ADMX into the SYSVOL central store, so the GP editor represents Linux administrative templates. Additive + idempotent.",
+                      "args": [arg("label", required=False, help_="batch label (default linux-ubuntu)")]},
+    "gpo-linux-report": {"fn": v_gpo_linux_report, "group": "gpo",
+                      "help": "Which GPOs carry Linux-targeted settings (adsys/GNOME registry policy or samba Unix CSE preferences)."},
     "gpo-admxload":  {"fn": v_gpo_admxload, "group": "gpo",
                       "help": "Load samba ADMX templates into the SYSVOL central store."},
     "gpo-admx-list": {"fn": v_gpo_admx_list, "group": "gpo",
