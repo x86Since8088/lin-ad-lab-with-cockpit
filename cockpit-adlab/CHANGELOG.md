@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.4.2 - 2026-09-18
+
+RD/Terminal Server licensing helpers (`rds` verb group). AD-side support only.
+
+- Research + live verification confirmed the AD Lab **already has** the complete
+  "Terminal Server License Servers" support structure by Samba default: the
+  built-in group (SID S-1-5-32-561, CN=Builtin), the per-user-CAL + RDS-profile
+  `msTS*` schema, and — stamped onto every user object at creation — the
+  delegation ACE granting the group RPWP on the "Terminal Server License Server"
+  property set (5805bc62). Nothing needed creating.
+- Added three read-mostly `adlab-admin` verbs so the lab can verify/manage it:
+  - `rds-status` — the group, its members, the per-user-CAL schema, whether user
+    objects carry the CAL-write delegation, and any site license-server SCP.
+  - `rds-ensure` — verifies the support structure; remediates only a genuine gap
+    (an inherited ACE on the domain head). A no-op on a healthy Samba lab.
+  - `rds-add-server --server <computer$>` — join an RD Licensing server's
+    computer account to the group (the one operational step, done when a real
+    license server is deployed); verifies the delegation first.
+- Tests: +6 (TestRds).
+
 ## 1.4.1 — 2026-09-18
 
 ### Offline-join blobs are validated as structures, not just as base64
