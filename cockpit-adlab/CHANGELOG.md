@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.3.2 - 2026-09-18
+## 1.4.2 - 2026-09-18
 
 RD/Terminal Server licensing helpers (`rds` verb group). AD-side support only.
 
@@ -18,7 +18,73 @@ RD/Terminal Server licensing helpers (`rds` verb group). AD-side support only.
   - `rds-add-server --server <computer$>` — join an RD Licensing server's
     computer account to the group (the one operational step, done when a real
     license server is deployed); verifies the delegation first.
-- Tests: +6 (TestRds), 140 total.
+- Tests: +6 (TestRds).
+
+## 1.4.1 — 2026-09-18
+
+### Offline-join blobs are validated as structures, not just as base64
+
+`_decode_odj` proved only that the blob was base64 before handing it to an
+answer file. That is not enough to catch the failure it exists to catch.
+
+Windows Setup's `offlineServicing` pass logs `Successfully applied settings
+override to component Microsoft-Windows-UnattendedJoin` for having **written**
+the settings into the image, not for having joined anything. A blob the OS later
+rejects produces no error on the machine and no error in AD — the machine simply
+boots into a workgroup with a clean install log, while every signal an operator
+would check still looks right, because provisioning created the account and set
+its password itself. There is no downstream diagnostic, so the blob has to be
+checked here or nowhere.
+
+It is now parsed as the NDR type-serialization v1 stream it is (MS-RPCE 2.2.6):
+the private header must be `version=1`, `endianness=0x10`, `header_len=8`,
+filler `0xCCCCCCCC`, and the declared object-buffer length must fit in the bytes
+present. A malformed blob fails at the point of generation, naming what was
+wrong with it.
+
+`_decode_odj` had no test coverage at all; it has eight cases now, including the
+BOM/NUL/wrapping round trip and both boundaries of the length check.
+
+## 1.4.0 — 2026-09-17
+
+### Member servers (offline domain join)
+
+New `members` verb group and a **Member Servers** tab.
+
+A Windows machine built by an unattended installer cannot join the way the
+lab's `clientN` containers do. The containers run `edy-domain-install` with the
+administrator password mounted at `/run/adminpass`; an unattended Setup has no
+such mount, and the only credential it can use is one written into its answer
+file — which is, by construction, readable by whatever fetched it. The online
+join (`Microsoft-Windows-UnattendedJoin/Identification`) therefore means a
+domain administrator password in cleartext on the provisioning network.
+
+Offline domain join removes the credential. The machine account is created on
+the PDC emulator and its provisioning data is packaged into a blob that
+authenticates exactly one computer account and is consumed by the join.
+
+- `member-provision` — create/refresh a machine account, return its blob.
+  Samba's `net offlinejoin provision` (4.16+; this host runs 4.23) produces
+  output byte-compatible with `djoin.exe /provision`, which is what makes it
+  consumable by a stock Windows answer file. `savefile=` is used rather than
+  `printblob` because `printblob` writes its success banner and the blob to the
+  same stream, so a parser cannot separate the credential from the chatter.
+- `member-list` / `member-verify` — distinguish **provisioned** from **joined**.
+  `operatingSystem` and `dNSHostName` are written by the machine itself at join
+  time, so a populated value is evidence the join completed rather than merely
+  that an account exists. After an unattended install that "looked fine", this
+  is the distinction an operator actually needs.
+- `member-deprovision` — delete the account; refuses DCs and `clientN`.
+
+The blob is a credential: it is returned once on stdout, never written to a host
+path, and never enters the audit log (only argument names and non-secret values
+are logged, and the blob is a result, not an argument).
+
+New `podman_auth_body()` alongside `podman_auth()`. `AUTH_WRAP` appends
+`-A "$af"` to its command and then immediately exits, which fits one
+`samba-tool` call and nothing else; provisioning has to read and delete the
+blob file *inside* the authfile's lifetime, so it needs a wrapper that hands the
+body `$af` and lets it choose its own exit status.
 
 ## 1.3.1 - 2026-09-17
 

@@ -10,11 +10,13 @@ root needed.
 Run:  python3 -m unittest discover -s tests -v          (from source/)
 """
 
+import base64
 import importlib.machinery
 import importlib.util
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -237,12 +239,13 @@ class Base(unittest.TestCase):
 
 KNOWN_TYPES = {"str", "int", "bool", "enum", "password-stdin"}
 KNOWN_GROUPS = {"meta", "overview", "fsmo", "users", "groups", "gpo", "objects",
-                "sites", "dns", "dcs", "clients", "activity", "domains", "rds"}
+                "sites", "dns", "dcs", "clients", "activity", "domains",
+                "members", "rds"}
 DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "ou-delete", "gpo-delete", "gpo-unlink", "gpo-settings-remove",
                "dns-delete", "dc-restart", "dc-shell", "dc-promote", "dc-demote",
                "dc-decommission", "domain-add", "domain-remove",
-               "client-remove"}
+               "client-remove", "member-deprovision"}
 
 
 class TestSchema(Base):
@@ -1841,6 +1844,87 @@ class TestRds(Base):
         self.assertEqual(out["added"], "RDLIC01$")
         self.assertTrue(self.fake.argv_containing("group", "addmembers",
                                                   "Terminal Server License Servers", "RDLIC01$"))
+
+
+class DecodeOdjTests(unittest.TestCase):
+    """_decode_odj is the last place a bad offline-join blob can be caught.
+
+    Windows Setup's offlineServicing pass logs "Successfully applied settings
+    override to component Microsoft-Windows-UnattendedJoin" for having WRITTEN
+    the settings into the image, not for having joined anything. A blob the OS
+    later rejects produces no error on the machine and no error in AD — it just
+    boots into a workgroup — so every assertion about blob validity has to
+    happen here or nowhere.
+    """
+
+    @staticmethod
+    def _ndr(payload=b"\x01\x02\x03\x04", objlen=None, ver=1, endian=0x10,
+             hdrlen=8, filler=b"\xcc\xcc\xcc\xcc"):
+        """Build an NDR type-serialization v1 stream (MS-RPCE 2.2.6)."""
+        if objlen is None:
+            objlen = len(payload)
+        return (bytes([ver, endian]) + struct.pack("<H", hdrlen) + filler
+                + struct.pack("<I", objlen) + b"\x00\x00\x00\x00" + payload)
+
+    @staticmethod
+    def _savefile(blob_b64):
+        """Wrap as djoin/samba write it: UTF-16LE, BOM, NUL-terminated, wrapped."""
+        wrapped = "\r\n".join(blob_b64[i:i + 64] for i in range(0, len(blob_b64), 64))
+        return base64.b64encode((b"\xff\xfe"
+                                 + (wrapped + "\x00").encode("utf-16-le"))).decode()
+
+    def test_round_trip_strips_bom_nul_and_wrapping(self):
+        inner = base64.b64encode(self._ndr(b"A" * 200)).decode()
+        self.assertEqual(mod._decode_odj(self._savefile(inner)), inner)
+
+    def test_empty_blob_rejected(self):
+        empty = base64.b64encode(b"\xff\xfe" + "\x00".encode("utf-16-le")).decode()
+        with self.assertRaises(mod.Fail) as c:
+            mod._decode_odj(empty)
+        self.assertIn("empty", str(c.exception))
+
+    def test_not_base64_rejected(self):
+        with self.assertRaises(mod.Fail) as c:
+            mod._decode_odj(self._savefile("not!valid!base64!"))
+        self.assertIn("not valid base64", str(c.exception))
+
+    def test_too_short_rejected(self):
+        short = base64.b64encode(b"\x01\x10\x08\x00").decode()
+        with self.assertRaises(mod.Fail) as c:
+            mod._decode_odj(self._savefile(short))
+        self.assertIn("too short", str(c.exception))
+
+    def test_wrong_ndr_header_rejected(self):
+        # Valid base64, right length, wrong structure: the case that used to
+        # sail through and fail invisibly inside Windows Setup.
+        bad = base64.b64encode(self._ndr(filler=b"\x00\x00\x00\x00")).decode()
+        with self.assertRaises(mod.Fail) as c:
+            mod._decode_odj(self._savefile(bad))
+        self.assertIn("not NDR type-serialization v1", str(c.exception))
+
+    def test_truncated_payload_rejected(self):
+        # objlen claims more than the stream carries.
+        bad = base64.b64encode(self._ndr(b"A" * 8, objlen=64)).decode()
+        with self.assertRaises(mod.Fail) as c:
+            mod._decode_odj(self._savefile(bad))
+        self.assertIn("truncated", str(c.exception))
+
+    def test_truncated_by_exactly_eight_bytes_rejected(self):
+        """Pins an off-by-eight: the payload begins at 16, not 8.
+
+        The object header (2.2.6.3) is eight bytes and objlen is its first
+        field, so comparing objlen against len(raw)-8 counts the header itself
+        as payload and accepts a stream that is short by exactly the header.
+        """
+        bad = base64.b64encode(self._ndr(b"A" * 8, objlen=16)).decode()
+        with self.assertRaises(mod.Fail) as c:
+            mod._decode_odj(self._savefile(bad))
+        self.assertIn("truncated", str(c.exception))
+
+    def test_exact_length_payload_accepted(self):
+        """The boundary the check must NOT reject: objlen == bytes present."""
+        inner = base64.b64encode(self._ndr(b"A" * 32, objlen=32)).decode()
+        self.assertEqual(mod._decode_odj(self._savefile(inner)), inner)
 
 
 if __name__ == "__main__":
