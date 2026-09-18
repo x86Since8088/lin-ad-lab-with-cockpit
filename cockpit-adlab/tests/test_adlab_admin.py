@@ -237,12 +237,13 @@ class Base(unittest.TestCase):
 
 KNOWN_TYPES = {"str", "int", "bool", "enum", "password-stdin"}
 KNOWN_GROUPS = {"meta", "overview", "fsmo", "users", "groups", "gpo", "objects",
-                "sites", "dns", "dcs", "clients", "activity", "domains"}
+                "sites", "dns", "dcs", "clients", "activity", "domains",
+                "members"}
 DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "ou-delete", "gpo-delete", "gpo-unlink", "gpo-settings-remove",
                "dns-delete", "dc-restart", "dc-shell", "dc-promote", "dc-demote",
                "dc-decommission", "domain-add", "domain-remove",
-               "client-remove"}
+               "client-remove", "member-deprovision"}
 
 
 class TestSchema(Base):

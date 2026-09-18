@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.4.0 — 2026-09-17
+
+### Member servers (offline domain join)
+
+New `members` verb group and a **Member Servers** tab.
+
+A Windows machine built by an unattended installer cannot join the way the
+lab's `clientN` containers do. The containers run `edy-domain-install` with the
+administrator password mounted at `/run/adminpass`; an unattended Setup has no
+such mount, and the only credential it can use is one written into its answer
+file — which is, by construction, readable by whatever fetched it. The online
+join (`Microsoft-Windows-UnattendedJoin/Identification`) therefore means a
+domain administrator password in cleartext on the provisioning network.
+
+Offline domain join removes the credential. The machine account is created on
+the PDC emulator and its provisioning data is packaged into a blob that
+authenticates exactly one computer account and is consumed by the join.
+
+- `member-provision` — create/refresh a machine account, return its blob.
+  Samba's `net offlinejoin provision` (4.16+; this host runs 4.23) produces
+  output byte-compatible with `djoin.exe /provision`, which is what makes it
+  consumable by a stock Windows answer file. `savefile=` is used rather than
+  `printblob` because `printblob` writes its success banner and the blob to the
+  same stream, so a parser cannot separate the credential from the chatter.
+- `member-list` / `member-verify` — distinguish **provisioned** from **joined**.
+  `operatingSystem` and `dNSHostName` are written by the machine itself at join
+  time, so a populated value is evidence the join completed rather than merely
+  that an account exists. After an unattended install that "looked fine", this
+  is the distinction an operator actually needs.
+- `member-deprovision` — delete the account; refuses DCs and `clientN`.
+
+The blob is a credential: it is returned once on stdout, never written to a host
+path, and never enters the audit log (only argument names and non-secret values
+are logged, and the blob is a result, not an argument).
+
+New `podman_auth_body()` alongside `podman_auth()`. `AUTH_WRAP` appends
+`-A "$af"` to its command and then immediately exits, which fits one
+`samba-tool` call and nothing else; provisioning has to read and delete the
+blob file *inside* the authfile's lifetime, so it needs a wrapper that hands the
+body `$af` and lets it choose its own exit status.
+
 ## 1.3.1 - 2026-09-17
 
 GPO editor right pane (`.al-edit-list`): filter, selectable columns, and proper
