@@ -1630,7 +1630,7 @@
         var m = content();
         var acts = el("div", "al-actions");
         acts.appendChild(actionButton("New GPO", "gpo-create", {}, ""));
-        var admxBtn = el("button", "al-btn secondary", "ADMX central store");
+        var admxBtn = el("button", "al-btn secondary", "ADMX central store (Windows + Linux)");
         admxBtn.addEventListener("click", function () { openModal("gpo-admx"); });
         acts.appendChild(admxBtn);
         var tplBtn = el("button", "al-btn secondary", "Templates");
@@ -1641,7 +1641,9 @@
         m.appendChild(el("div", "al-alert warn",
             "All GPO writes land on the PDC emulator (queried live). Administrative-" +
             "Template settings become registry.pol via `gpo load`; preferences use " +
-            "samba CSEs (`gpo manage`); SYSVOL replicates within 5 minutes."));
+            "samba CSEs (`gpo manage`); SYSVOL replicates within 5 minutes. " +
+            "The ADMX central store carries both Windows and Linux (Ubuntu/adsys) " +
+            "administrative templates — open it to install or review Linux policy."));
         var holder = el("div", "al-grid"); m.appendChild(holder);
         var fGpo = slotCard(holder, "Group Policy objects", true);
         run("gpo-list").then(function (r) {
@@ -2517,28 +2519,102 @@
         }, true);
     }
 
+    // Classify an ADMX file by OS the same way adlab-admin's _derive_tags does,
+    // so the central-store view can separate Windows from Linux templates.
+    function admxOs(name) {
+        var r = (name || "").toLowerCase();
+        if (r.indexOf("ubuntu") >= 0 || r.indexOf("adsys") >= 0 || r.indexOf("canonical") >= 0) return "Linux";
+        if (r.indexOf("gnome") >= 0 || r.indexOf("samba") >= 0) return "Linux";
+        return "Windows";
+    }
+
     function gpoAdmxModal() {
-        modal("ADMX central store", function (box) {
-            var loadBtn = el("button", "al-btn", "Load samba ADMX into SYSVOL");
+        modal("ADMX central store — Windows & Linux templates", function (box) {
+            var actions = el("div", "al-actions");
+            var loadBtn = el("button", "al-btn secondary", "Load samba ADMX into SYSVOL");
+            var seedBtn = el("button", "al-btn", "Install Linux (Ubuntu/adsys) templates");
+            var reportBtn = el("button", "al-btn secondary", "GPOs with Linux settings");
+            actions.appendChild(loadBtn); actions.appendChild(seedBtn); actions.appendChild(reportBtn);
+            box.appendChild(actions);
+            var msg = el("div", "hint", ""); box.appendChild(msg);
             var out = el("div"); out.appendChild(el("div", "al-loading", "listing central store…"));
+            box.appendChild(out);
+            var reportOut = el("div"); box.appendChild(reportOut);
+
             function refresh() {
                 run("gpo-admx-list").then(function (r) {
                     clear(out);
-                    out.appendChild(el("div", "hint", "ADMX files: " + (r.admx_files || []).join(", ") || "(none loaded)"));
-                    out.appendChild(el("div", "hint", "Policies available: " + (r.policy_count || 0)));
-                    out.appendChild(tableOf(["policy", "class", "key"],
-                        (r.policies || []).slice(0, 300).map(function (p) {
-                            return [p.display || p.id, p.class, p.key + "\\" + p.valuename];
+                    var files = (r.admx_files || []);
+                    var lin = files.filter(function (f) { return admxOs(f) === "Linux"; });
+                    var win = files.filter(function (f) { return admxOs(f) === "Windows"; });
+                    var sum = el("div", "al-grid");
+                    var lc = card("Linux administrative templates (" + lin.length + ")");
+                    lc.appendChild(el("div", "hint", lin.length ? lin.join(", ")
+                        : "none yet — click ‘Install Linux (Ubuntu/adsys) templates’"));
+                    sum.appendChild(lc);
+                    var wc = card("Windows administrative templates (" + win.length + ")");
+                    wc.appendChild(el("div", "hint", win.length
+                        ? (win.slice(0, 14).join(", ") + (win.length > 14 ? " …" : ""))
+                        : "none yet — click ‘Load samba ADMX into SYSVOL’"));
+                    sum.appendChild(wc);
+                    out.appendChild(sum);
+                    out.appendChild(el("div", "hint", "Policies available: " + (r.policy_count || 0) +
+                        " (" + (r.resolved_count || 0) + " named). Linux rows first."));
+                    var pols = (r.policies || []).slice();
+                    pols.sort(function (a, b) {
+                        return (admxOs(a.admx) === "Linux" ? 0 : 1) - (admxOs(b.admx) === "Linux" ? 0 : 1);
+                    });
+                    out.appendChild(tableOf(["OS", "policy", "class", "ADMX", "key"],
+                        pols.slice(0, 400).map(function (p) {
+                            return [admxOs(p.admx), p.display || p.id, p.class, p.admx,
+                                    p.key + "\\" + p.valuename];
                         })));
                 }).catch(function (e) { clear(out); out.appendChild(el("div", "al-alert err", String(e))); });
             }
             loadBtn.addEventListener("click", function () {
-                loadBtn.disabled = true;
-                run("gpo-admxload").then(function () { loadBtn.disabled = false; refresh(); })
-                    .catch(function (e) { loadBtn.disabled = false; clear(out); out.appendChild(el("div", "al-alert err", String(e))); });
+                loadBtn.disabled = true; msg.textContent = " loading samba ADMX…";
+                run("gpo-admxload").then(function () {
+                    loadBtn.disabled = false; msg.textContent = " samba ADMX loaded."; refresh();
+                }).catch(function (e) {
+                    loadBtn.disabled = false; msg.textContent = ""; clear(out);
+                    out.appendChild(el("div", "al-alert err", String(e)));
+                });
             });
-            box.appendChild(loadBtn);
-            box.appendChild(out);
+            seedBtn.addEventListener("click", function () {
+                seedBtn.disabled = true; msg.textContent = " generating + installing Ubuntu Linux ADMX…";
+                run("gpo-linux-seed").then(function (r) {
+                    seedBtn.disabled = false;
+                    msg.textContent = (r.applied === false)
+                        ? " Linux templates already installed (" + (r.policies || "?") + " policies)."
+                        : " installed " + (r.admx || "Ubuntu.admx") + " — " + (r.policies || "?") +
+                          " policies across " + (r.categories || "?") + " categories on " + (r.on || "the PDC") + ".";
+                    refresh();
+                    // rebuild the catalog cache so the editor's Linux facet shows the new policies
+                    run("gpo-catalog", { source: "admx", refresh: "true" }).catch(function () {});
+                }).catch(function (e) {
+                    seedBtn.disabled = false; msg.textContent = ""; clear(out);
+                    out.appendChild(el("div", "al-alert err", String(e)));
+                });
+            });
+            reportBtn.addEventListener("click", function () {
+                clear(reportOut);
+                reportOut.appendChild(el("div", "al-loading", "scanning GPOs for Linux settings…"));
+                run("gpo-linux-report").then(function (r) {
+                    clear(reportOut);
+                    var c = card("GPOs with Linux settings (" + r.linux_count + " of " + r.total + ")");
+                    c.appendChild(tableOf(["Linux?", "GPO", "display name", "reg keys", "CSE"],
+                        (r.gpos || []).map(function (g) {
+                            return [g.linux ? "yes" : "—", el("kbd", "al", g.gpo), g.display_name,
+                                    String((g.registry_keys || []).length),
+                                    String((g.cse_artifacts || []).length)];
+                        })));
+                    c.appendChild(el("div", "hint", "Linux key roots: " + (r.reg_roots || []).join(", ") +
+                        "; CSE = samba Unix preference artifacts in the GPO's SYSVOL."));
+                    reportOut.appendChild(c);
+                }).catch(function (e) {
+                    clear(reportOut); reportOut.appendChild(el("div", "al-alert err", String(e)));
+                });
+            });
             var close = el("button", "al-btn secondary", "Close");
             close.addEventListener("click", closeModal); box.appendChild(close);
             refresh();

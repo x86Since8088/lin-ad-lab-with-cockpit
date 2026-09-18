@@ -1927,5 +1927,141 @@ class DecodeOdjTests(unittest.TestCase):
         self.assertEqual(mod._decode_odj(self._savefile(inner)), inner)
 
 
+class LinuxAdmx(unittest.TestCase):
+    """The generated adsys-style Ubuntu Linux ADMX + its faceting."""
+
+    def setUp(self):
+        self.admx, self.adml = mod.linux_admx_generate()
+        self.d = tempfile.mkdtemp()
+        open(os.path.join(self.d, "Ubuntu.admx"), "w").write(self.admx)
+        os.makedirs(os.path.join(self.d, "en-US"))
+        open(os.path.join(self.d, "en-US", "Ubuntu.adml"), "w").write(self.adml)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_generated_admx_is_lint_clean_and_self_contained(self):
+        # No external category dependency (upstream all/Ubuntu.admx <using>s a base
+        # file -- ours must stand alone), single namespace, zero lint errors.
+        r = mod.admx_lint(self.d, "en-US")
+        self.assertEqual(r["errors"], [], r["errors"])
+        self.assertEqual(r["namespaces"], 1)
+        self.assertEqual(r["files"], 1)
+
+    def test_policies_parse_and_every_name_resolves(self):
+        pols = mod.parse_admx(self.admx)
+        self.assertGreaterEqual(len(pols), 20)
+        strings = mod.parse_adml(self.adml)
+        for p in pols:
+            self.assertIn(p["id"], strings, "no ADML string for %s" % p["id"])
+            self.assertTrue(strings[p["id"]], p["id"])
+
+    def test_every_key_is_under_the_ubuntu_root(self):
+        for p in mod.parse_admx(self.admx):
+            self.assertTrue(p["key"].startswith("Software\\Policies\\Ubuntu"),
+                            "%s -> %s" % (p["id"], p["key"]))
+
+    def test_mix_of_machine_and_user_and_element_kinds(self):
+        pols = {p["id"]: p for p in mod.parse_admx(self.admx)}
+        self.assertEqual(pols["ScriptsStartup"]["class"], "Machine")
+        self.assertEqual(pols["ScriptsLogon"]["class"], "User")
+        self.assertTrue(pols["DconfScreensaverLock"]["has_enabled"])   # bool toggle
+        kinds = {e["kind"] for p in pols.values() for e in p["elements"]}
+        self.assertTrue({"text", "decimal", "multiText"} <= kinds, kinds)
+
+    def test_derive_tags_recognises_ubuntu_adsys_as_linux(self):
+        self.assertEqual(mod._derive_tags("admx", "Ubuntu.admx")[0], "Linux")
+        self.assertIn("ubuntu", mod._derive_tags("admx", "Ubuntu.admx")[1])
+        self.assertEqual(mod._derive_tags("admx", "adsys-custom.admx")[0], "Linux")
+        self.assertEqual(mod._derive_tags("admx", "Canonical.Foo.admx")[0], "Linux")
+        # regression: Windows ADMX still Windows
+        self.assertEqual(mod._derive_tags("admx", "Explorer.admx")[0], "Windows")
+
+    def test_is_linux_regkey(self):
+        self.assertTrue(mod._is_linux_regkey("Software\\Policies\\Ubuntu\\dconf"))
+        self.assertTrue(mod._is_linux_regkey("software/policies/ubuntu"))   # fwd slash + case
+        self.assertTrue(mod._is_linux_regkey("SOFTWARE\\POLICIES\\GNOME\\x"))
+        self.assertFalse(mod._is_linux_regkey("Software\\Policies\\Microsoft\\Windows"))
+        self.assertFalse(mod._is_linux_regkey(""))
+
+
+MINI_WIN_ADMX = ('<policyDefinitions revision="1.0" schemaVersion="1.0" '
+    'xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">'
+    '<policyNamespaces><target prefix="win" namespace="MS.Win"/></policyNamespaces>'
+    '<resources minRequiredRevision="1.0"/><categories/>'
+    '<policies><policy name="PolWin" class="Machine" displayName="$(string.x)" '
+    'key="Software\\Policies\\MS" valueName="v"/></policies></policyDefinitions>')
+
+
+class AdmxApply(Base):
+    """The import-apply step that lands a staged batch in the SYSVOL central
+    store. Its load-bearing property: additive by default -- it must NOT act on
+    admx_plan's retirements (which treat the batch as authoritative for the WHOLE
+    store) unless retirement is explicitly requested."""
+
+    def setUp(self):
+        super().setUp()
+        self.work = tempfile.mkdtemp()
+        self._ow = (mod.ADMX_WORK, mod.ADMX_STATE, mod.ADMX_STAGING)
+        mod.ADMX_WORK = self.work
+        mod.ADMX_STATE = os.path.join(self.work, "state.json")
+        mod.ADMX_STAGING = os.path.join(self.work, "staging")
+        # a store holding ONE Windows file, so the Ubuntu-only batch's plan would
+        # (wrongly, if acted on) retire it.
+        self.fake.lab_up()
+        b64win = _base64.b64encode(MINI_WIN_ADMX.encode()).decode()
+        self.fake.on(lambda a: "ls" in " ".join(map(str, a)) and "*.admx" in " ".join(map(str, a)),
+                     out="/var/lib/samba/sysvol/ad.edt1.lab/Policies/PolicyDefinitions/Explorer.admx\n")
+        self.fake.on(lambda a: "base64 -w0" in " ".join(map(str, a)) and "Explorer.admx" in " ".join(map(str, a)),
+                     out=b64win + "\n")
+        self.fake.on(lambda a: "base64 -w0" in " ".join(map(str, a)), out="")   # adml reads: none
+        self.fake.on(lambda a: "base64 -d" in " ".join(map(str, a)), out="")    # writes succeed
+
+    def tearDown(self):
+        import shutil
+        mod.ADMX_WORK, mod.ADMX_STATE, mod.ADMX_STAGING = self._ow
+        shutil.rmtree(self.work, ignore_errors=True)
+        super().tearDown()
+
+    def _stage_ubuntu(self):
+        admx, adml = mod.linux_admx_generate()
+        src = tempfile.mkdtemp()
+        open(os.path.join(src, "Ubuntu.admx"), "w").write(admx)
+        os.makedirs(os.path.join(src, "en-US"))
+        open(os.path.join(src, "en-US", "Ubuntu.adml"), "w").write(adml)
+        res, ok = mod._stage_admx_dir("lin", src, "en-US")
+        self.assertTrue(ok, res)
+        return res
+
+    def test_additive_apply_writes_batch_and_never_retires(self):
+        self._stage_ubuntu()
+        res = mod._apply_admx_batch("lin", retire=False)
+        self.assertTrue(res["applied"])
+        self.assertEqual(res["written"], ["Ubuntu.admx"])
+        self.assertEqual(res["retired"], [])
+        # the plan DID compute a retirement for the unrelated Windows file...
+        self.assertIn("Explorer.admx", res["plan"]["retire"])
+        # ...but additive apply must not have written any *_retired file.
+        self.assertEqual(self.fake.argv_containing("Explorer_retired"), [])
+        # it DID push the Ubuntu ADMX into the store.
+        self.assertTrue(self.fake.argv_containing("base64 -d", "Ubuntu.admx"))
+
+    def test_apply_is_idempotent(self):
+        self._stage_ubuntu()
+        mod._apply_admx_batch("lin", retire=False)
+        again = mod._apply_admx_batch("lin", retire=False)
+        self.assertFalse(again["applied"])
+        self.assertIn("already applied", again.get("reason", ""))
+
+    def test_seed_verb_generates_stages_and_applies(self):
+        rc, out = self.call_main(["gpo-linux-seed"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out.get("seeded"))
+        self.assertEqual(out["admx"], "Ubuntu.admx")
+        self.assertEqual(out["retired"], [])
+        self.assertGreaterEqual(out["policies"], 20)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
