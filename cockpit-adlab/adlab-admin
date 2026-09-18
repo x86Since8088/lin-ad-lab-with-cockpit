@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 
 def _require_config():
@@ -1428,6 +1428,115 @@ def _verify_changes(dc, dn, changes, meta_lc):
         applied.append({"attr": attr, "op": op, "requested": ch.get("values") or [],
                         "observed": obs, "ok": ok})
     return applied, all_ok
+
+# ---- Remote Desktop Services (Terminal Server) licensing ------------------
+# An RD Licensing server must join the built-in "Terminal Server License
+# Servers" group (well-known SID S-1-5-32-561) to ISSUE and TRACK Per-User RDS
+# CALs. Per-user tracking works by the license server writing the per-user CAL
+# attributes (msTSExpireDate / msTSManagingLS / msTSLicenseVersion) onto each
+# USER object; the permission is delegated by ACEs granting the group Read/Write
+# on the "Terminal Server License Server" property set (5805bc62). Samba stamps
+# these ACEs onto every user object at creation by default (verified: a fresh
+# user carries (OA;;RPWP;5805bc62-...;;S-1-5-32-561)), so on this lab the group,
+# the schema attributes AND the delegation are all present out of the box.
+# rds-ensure therefore just verifies; it remediates (an inherited ACE on the
+# domain head, applying to all users) only in the unlikely event a user object
+# is found lacking the delegation.
+RDS_LS_GROUP_SID = "S-1-5-32-561"
+RDS_LS_GROUP_NAME = "Terminal Server License Servers"
+RDS_CAL_PROPSET = "5805bc62-bdc9-4428-a5e2-856a0f4c185e"      # "Terminal Server License Server" property set (per-user CAL attrs)
+RDS_USER_CLASS_GUID = "bf967aba-0de6-11d0-a285-00aa003049e2"  # user classSchema (inherited-object-type)
+# Remediation ACE only (Samba's per-user default is the normal source of the
+# delegation): (OA)=object, (CIIO)=container-inherit + inherit-only onto user
+# objects, (RPWP)=read+write property on the set.
+RDS_CAL_ACE = "(OA;CIIO;RPWP;%s;%s;%s)" % (RDS_CAL_PROPSET, RDS_USER_CLASS_GUID, RDS_LS_GROUP_SID)
+
+
+def _rds_group_dn(d):
+    rc, out, _ = podman(d, ["ldbsearch", "-H", SAM, "(objectSid=%s)" % RDS_LS_GROUP_SID, "dn"])
+    for line in out.splitlines():
+        if line.lower().startswith("dn:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _rds_delegation_present(d):
+    """True if a sample USER object grants the group RPWP on the TS-license
+    property set -- Samba stamps this per-user by default, so this is the correct
+    place to check (not the domain head). None when there are no users to sample."""
+    rc, out, _ = podman(d, ["ldbsearch", "-H", SAM,
+                            "(&(objectClass=user)(objectCategory=person))", "dn"])
+    dn = None
+    for line in out.splitlines():
+        if line.lower().startswith("dn:"):
+            dn = line.split(":", 1)[1].strip()
+            break
+    if not dn:
+        return None
+    rc, sd, _ = podman(d, ["samba-tool", "dsacl", "get", "--objectdn", dn])
+    return bool(rc == 0 and RDS_LS_GROUP_SID in sd and RDS_CAL_PROPSET in sd)
+
+
+def v_rds_status(a):
+    """Report the Remote Desktop / Terminal Server licensing support structure in
+    AD: the built-in license-servers group, its members, the per-user-CAL schema
+    attributes, whether user objects carry the CAL-write delegation for the
+    group, and any site license-server SCP."""
+    d = pdc_emulator()
+    gdn = _rds_group_dn(d)
+    members = []
+    if gdn:
+        rc, out, _ = podman(d, ["ldbsearch", "-H", SAM, "-b", gdn, "-s", "base", "member"])
+        members = [l.split(":", 1)[1].strip() for l in out.splitlines() if l.lower().startswith("member:")]
+    rc, so, _ = podman(d, ["ldbsearch", "-H", SAM, "--cross-ncs",
+                           "(lDAPDisplayName=msTSExpireDate)", "lDAPDisplayName"])
+    schema_ok = "msTSExpireDate" in so
+    rc, sc, _ = podman(d, ["ldbsearch", "-H", SAM, "--cross-ncs",
+                           "(objectClass=licensingSiteSettings)", "dn"])
+    scps = [l.split(":", 1)[1].strip() for l in sc.splitlines() if l.lower().startswith("dn:")]
+    return {"group": RDS_LS_GROUP_NAME, "group_sid": RDS_LS_GROUP_SID, "group_dn": gdn,
+            "group_present": bool(gdn), "members": members,
+            "per_user_cal_schema": schema_ok,
+            "per_user_delegation": _rds_delegation_present(d),
+            "site_license_scps": scps, "on": d}
+
+
+def v_rds_ensure(a):
+    """Ensure the RDS Per-User CAL support structure. The built-in group and the
+    per-user delegation are provisioned by Samba, so this is normally a verifying
+    no-op; if a user object is found LACKING the delegation, it is remediated by
+    adding an inherited ACE for the group on the domain head. Idempotent."""
+    d = pdc_emulator()
+    gdn = _rds_group_dn(d)
+    if not gdn:
+        raise Fail("%s (%s) is missing -- re-provision the domain; a builtin "
+                   "well-known group is not something to recreate by hand"
+                   % (RDS_LS_GROUP_NAME, RDS_LS_GROUP_SID))
+    present = _rds_delegation_present(d)
+    added = False
+    if present is False:
+        rc, out, err = podman(d, ["samba-tool", "dsacl", "set",
+                                  "--objectdn", domain_dn(), "--sddl", RDS_CAL_ACE])
+        if rc != 0:
+            raise Fail(err.strip() or out.strip() or "dsacl set failed")
+        added = True
+        present = True
+    return {"group_dn": gdn, "per_user_delegation": present,
+            "delegation_ace_added": added, "on": d}
+
+
+def v_rds_add_server(a):
+    """Add a computer (an RD Licensing server) to the Terminal Server License
+    Servers group so it can issue/track Per-User CALs -- verifying the per-user
+    delegation is in place first."""
+    d = pdc_emulator()
+    v_rds_ensure({})
+    member = a["server"].strip()
+    rc, out, err = podman(d, ["samba-tool", "group", "addmembers", RDS_LS_GROUP_NAME, member])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"group": RDS_LS_GROUP_NAME, "added": member, "on": d}
+
 
 # ---- object protection (protect from accidental deletion) -----------------
 PROTECT_SDDL = "(D;;SDDT;;;WD)"   # Deny Everyone (WD): Delete + Delete-Tree
@@ -3232,6 +3341,13 @@ VERBS = {
     "group-remove-member": {"fn": v_group_remove_member, "group": "groups",
                       "help": "Remove a member.", "args": [arg("group"), arg("member")]},
     "computer-list": {"fn": v_computer_list, "group": "users", "help": "All computer accounts."},
+    "rds-status":    {"fn": v_rds_status, "group": "rds",
+                      "help": "RD/Terminal Server licensing support: the license-servers group, its members, per-user-CAL schema, delegation ACE, site SCPs."},
+    "rds-ensure":    {"fn": v_rds_ensure, "group": "rds",
+                      "help": "Verify the Per-User RDS CAL support structure (group + per-user delegation); remediate only a genuine gap. Normally a no-op on Samba. Idempotent."},
+    "rds-add-server": {"fn": v_rds_add_server, "group": "rds",
+                      "help": "Add a computer (RD Licensing server) to the Terminal Server License Servers group; ensures the delegation ACE first.",
+                      "args": [arg("server", help_="computer account, e.g. RDLIC01$ or its DN")]},
     "ou-list":       {"fn": v_ou_list, "group": "users", "help": "All organizational units."},
     "ou-create":     {"fn": v_ou_create, "group": "users", "help": "Create an OU by DN.",
                       "args": [arg("dn", help_="e.g. OU=Workstations")]},

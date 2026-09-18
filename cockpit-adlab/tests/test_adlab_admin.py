@@ -237,7 +237,7 @@ class Base(unittest.TestCase):
 
 KNOWN_TYPES = {"str", "int", "bool", "enum", "password-stdin"}
 KNOWN_GROUPS = {"meta", "overview", "fsmo", "users", "groups", "gpo", "objects",
-                "sites", "dns", "dcs", "clients", "activity", "domains"}
+                "sites", "dns", "dcs", "clients", "activity", "domains", "rds"}
 DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "ou-delete", "gpo-delete", "gpo-unlink", "gpo-settings-remove",
                "dns-delete", "dc-restart", "dc-shell", "dc-promote", "dc-demote",
@@ -1766,6 +1766,81 @@ class TestCatalogCache(Base):
         self.assertEqual(out["cached_at"], "2026-01-01T00:00:00Z")
         # serving a warm cache shells out to nothing (this is the whole point)
         self.assertEqual(self.fake.calls, [])
+
+
+class TestRds(Base):
+    USER_DN = "CN=alice,CN=Users,DC=ad,DC=edt1,DC=lab"
+    GROUP_DN = "CN=Terminal Server License Servers,CN=Builtin,DC=ad,DC=edt1,DC=lab"
+
+    def _group_found(self):
+        self.fake.on(lambda a: "ldbsearch" in a and any("objectSid=S-1-5-32-561" in x for x in a),
+                     out="dn: %s\n" % self.GROUP_DN)
+
+    def _user_found(self):
+        self.fake.on(lambda a: "ldbsearch" in a and any("(objectCategory=person)" in x for x in a),
+                     out="dn: %s\n" % self.USER_DN)
+
+    def _dsacl_get(self, has_ace):
+        # The delegation Samba stamps per-user: RPWP on the TS-license property set.
+        ace = "(OA;;RPWP;5805bc62-bdc9-4428-a5e2-856a0f4c185e;;S-1-5-32-561)" if has_ace else ""
+        self.fake.on(lambda a: "dsacl" in a and "get" in a,
+                     out="descriptor for %s:\nO:BAG:BAD:(A;;RPWP;;;WD)%s\n" % (self.USER_DN, ace))
+
+    def _schema_and_scp(self):
+        self.fake.on(lambda a: "ldbsearch" in a and "-b" in a and "member" in a, out="")
+        self.fake.on(lambda a: "ldbsearch" in a and any("msTSExpireDate" in x for x in a),
+                     out="lDAPDisplayName: msTSExpireDate\n")
+        self.fake.on(lambda a: "ldbsearch" in a and any("licensingSiteSettings" in x for x in a), out="")
+
+    def test_ace_constant_targets_the_right_objects(self):
+        # The remediation ACE targets the "Terminal Server License Server"
+        # property set, inherited onto user objects, for the group SID.
+        self.assertIn("5805bc62-bdc9-4428-a5e2-856a0f4c185e", mod.RDS_CAL_ACE)   # property set
+        self.assertIn("bf967aba-0de6-11d0-a285-00aa003049e2", mod.RDS_CAL_ACE)   # user class
+        self.assertIn("S-1-5-32-561", mod.RDS_CAL_ACE)                            # the group
+        self.assertTrue(mod.RDS_CAL_ACE.startswith("(OA;CIIO;RPWP;"))
+
+    def test_status_reports_group_schema_and_per_user_delegation(self):
+        self.fake.lab_up(); self._group_found(); self._user_found(); self._dsacl_get(True); self._schema_and_scp()
+        rc, out = self.call_main(["rds-status"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["group_present"])
+        self.assertEqual(out["group_sid"], "S-1-5-32-561")
+        self.assertTrue(out["per_user_cal_schema"])
+        self.assertTrue(out["per_user_delegation"])       # Samba stamps it per-user by default
+        self.assertEqual(out["site_license_scps"], [])
+
+    def test_ensure_is_a_noop_when_delegation_present(self):
+        self.fake.lab_up(); self._group_found(); self._user_found(); self._dsacl_get(True)
+        rc, out = self.call_main(["rds-ensure"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(out["delegation_ace_added"])
+        self.assertTrue(out["per_user_delegation"])
+        self.assertEqual(self.fake.argv_containing("dsacl", "set"), [])   # no SD write on a healthy lab
+
+    def test_ensure_remediates_only_a_genuine_gap(self):
+        self.fake.lab_up(); self._group_found(); self._user_found(); self._dsacl_get(False)
+        self.fake.on(lambda a: "dsacl" in a and "set" in a, out="")
+        rc, out = self.call_main(["rds-ensure"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["delegation_ace_added"])
+        self.assertTrue(self.fake.argv_containing("dsacl", "set", "--sddl", mod.RDS_CAL_ACE))
+
+    def test_ensure_refuses_if_group_missing(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a and any("objectSid=S-1-5-32-561" in x for x in a), out="")
+        rc, out = self.call_main(["rds-ensure"])
+        self.assertEqual(rc, 1)
+        self.assertIn("561", out["error"])
+
+    def test_add_server_verifies_then_joins_group(self):
+        self.fake.lab_up(); self._group_found(); self._user_found(); self._dsacl_get(True)
+        self.fake.on(lambda a: "group" in a and "addmembers" in a, out="Added members")
+        rc, out = self.call_main(["rds-add-server", "--server", "RDLIC01$"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["added"], "RDLIC01$")
+        self.assertTrue(self.fake.argv_containing("group", "addmembers",
+                                                  "Terminal Server License Servers", "RDLIC01$"))
 
 
 if __name__ == "__main__":
