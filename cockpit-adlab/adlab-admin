@@ -2796,12 +2796,38 @@ def _decode_odj(b64_of_file):
     text = "".join(text.split())          # the tools wrap; the XML element must not
     if not text:
         raise Fail("offline-join blob came back empty")
-    # Prove it is base64 before handing it on, so a malformed blob fails here
-    # rather than inside Windows Setup with no diagnostic.
+    # Prove it is base64 AND structurally an ODJ blob before handing it on.
+    #
+    # This matters more than it looks. Windows Setup's offlineServicing pass
+    # reports "Successfully applied settings override to component
+    # Microsoft-Windows-UnattendedJoin" for having WRITTEN the settings into the
+    # image, whether or not the blob is usable — a bad one produces no error
+    # anywhere and the machine simply boots into a workgroup. There is no
+    # downstream diagnostic, so the check has to happen here.
     try:
-        base64.b64decode(text, validate=True)
+        raw = base64.b64decode(text, validate=True)
     except Exception as e:
         raise Fail("offline-join blob is not valid base64: %s" % e)
+
+    # The blob is an NDR type-serialization v1 stream (MS-RPCE 2.2.6): a
+    # 16-byte private header of version=1, endianness=0x10, common-header
+    # length=8, filler 0xCCCCCCCC, then a 4-byte object buffer length.
+    if len(raw) < 16:
+        raise Fail("offline-join blob is too short to be an ODJ structure (%d bytes)" % len(raw))
+    ver, endian, hdrlen = raw[0], raw[1], struct.unpack_from("<H", raw, 2)[0]
+    filler = raw[4:8]
+    objlen = struct.unpack_from("<I", raw, 8)[0]
+    if not (ver == 1 and endian == 0x10 and hdrlen == 8 and filler == b"\xcc\xcc\xcc\xcc"):
+        raise Fail("offline-join blob is not NDR type-serialization v1 "
+                   "(version=%d endianness=0x%02x header_len=%d filler=%s)"
+                   % (ver, endian, hdrlen, filler.hex()))
+    # The payload starts at 16: an 8-byte private header (2.2.6.2) followed by
+    # an 8-byte object header (2.2.6.3) whose first field is objlen itself.
+    # Comparing against len(raw)-8 instead would accept a blob truncated by up
+    # to eight bytes, which is the case this check exists to catch.
+    if objlen > len(raw) - 16:
+        raise Fail("offline-join blob is truncated: header claims %d payload bytes, %d present"
+                   % (objlen, len(raw) - 16))
     return text
 
 

@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.4.1 — 2026-09-18
+
+### Offline-join blobs are validated as structures, not just as base64
+
+`_decode_odj` proved only that the blob was base64 before handing it to an
+answer file. That is not enough to catch the failure it exists to catch.
+
+Windows Setup's `offlineServicing` pass logs `Successfully applied settings
+override to component Microsoft-Windows-UnattendedJoin` for having **written**
+the settings into the image, not for having joined anything. A blob the OS later
+rejects produces no error on the machine and no error in AD — the machine simply
+boots into a workgroup with a clean install log, while every signal an operator
+would check still looks right, because provisioning created the account and set
+its password itself. There is no downstream diagnostic, so the blob has to be
+checked here or nowhere.
+
+It is now parsed as the NDR type-serialization v1 stream it is (MS-RPCE 2.2.6):
+the private header must be `version=1`, `endianness=0x10`, `header_len=8`,
+filler `0xCCCCCCCC`, and the declared object-buffer length must fit in the bytes
+present. A malformed blob fails at the point of generation, naming what was
+wrong with it.
+
+`_decode_odj` had no test coverage at all; it has eight cases now, including the
+BOM/NUL/wrapping round trip and both boundaries of the length check.
+
 ## 1.4.0 — 2026-09-17
 
 ### Member servers (offline domain join)
