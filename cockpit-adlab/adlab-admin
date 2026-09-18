@@ -374,6 +374,28 @@ def podman_auth(ctr, cmd_str, timeout=120, stdin=None):
     script = AUTH_WRAP.format(nb=LAB["DOMAIN_NB"], cmd=cmd_str)
     return podman(ctr, ["bash", "-c", script], timeout=timeout, stdin=stdin)
 
+
+# AUTH_WRAP appends `-A "$af"` to its command and then immediately exits, which
+# fits a single samba-tool invocation and nothing else. A verb that must read a
+# file the credentialed command produced — and delete it — needs the read to
+# happen INSIDE the authfile's lifetime and before that exit.
+#
+# AUTH_BODY_WRAP gives the body the authfile path in $af and lets it decide its
+# own exit status. The body is responsible for using "$af"; the wrapper remains
+# responsible for creating it 0600 and removing it on every path.
+AUTH_BODY_WRAP = (
+    "umask 077; af=$(mktemp /run/adlab.auth.XXXXXX); "
+    'printf "username=Administrator\\npassword=%s\\ndomain={nb}\\n" '
+    '"$(cat /run/adminpass)" > "$af"; '
+    "{body}; rc=$?; rm -f \"$af\"; exit $rc"
+)
+
+
+def podman_auth_body(ctr, body, timeout=120, stdin=None):
+    """Run an arbitrary shell body with a credential authfile at "$af"."""
+    script = AUTH_BODY_WRAP.format(nb=LAB["DOMAIN_NB"], body=body)
+    return podman(ctr, ["bash", "-c", script], timeout=timeout, stdin=stdin)
+
 def shq(s):
     """Shell-quote one word for embedding in a bash -c string."""
     return "'" + str(s).replace("'", "'\\''") + "'"
@@ -2714,6 +2736,220 @@ def v_client_remove(a):
         pass
     return {"removed": a["name"]}
 
+# ---- Windows member servers (offline domain join) -------------------------
+#
+# The lab's clientN containers join online: the container runs edy-domain-install
+# with the administrator password mounted at /run/adminpass. A Windows machine
+# built by an unattended installer cannot do that. The only credential an
+# unattended Setup can use is one written into its answer file, and an answer
+# file is, by construction, readable by whatever fetched it — so the online form
+# of the join (Microsoft-Windows-UnattendedJoin/Identification) means putting a
+# domain administrator password in cleartext on the provisioning network.
+#
+# Offline domain join removes the credential entirely. The machine account is
+# created here, on the PDC emulator, and its provisioning data — domain name and
+# SID, the DC to contact, and a machine password generated for that one account
+# — is packaged into a blob the installer consumes. What the blob grants is
+# exactly one computer account, and the join consumes it.
+#
+# Samba implements the provisioning side as `net offlinejoin provision`
+# (4.16+); this host runs 4.23. The output is byte-compatible with djoin.exe
+# /provision, which is what makes it consumable by a stock Windows answer file.
+#
+# THE BLOB IS A CREDENTIAL. It never enters the audit log and is never written
+# to a host path by these verbs — it is returned once, on stdout, to the caller
+# that asked for it, exactly like user-create's generated password.
+
+MEMBER_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]{0,14}$')
+
+
+def _member_check_name(name):
+    """A machine account name that Windows can actually carry.
+
+    15 characters is the NetBIOS limit, and it is the binding constraint: a
+    longer name provisions happily here and then mismatches the ComputerName
+    Windows truncates it to, leaving a machine that is renamed and NOT joined.
+    """
+    if not MEMBER_NAME_RE.match(name or ""):
+        raise Fail("machine name must be 1-15 characters of A-Z, 0-9 or '-', "
+                   "and must not start with '-' (NetBIOS limit)")
+    return name
+
+
+def _decode_odj(b64_of_file):
+    """podman exec gives us text, so the UTF-16LE savefile comes out base64ed.
+
+    Returns the ASCII base64 blob that belongs in an answer file's
+    <Provisioning> element — i.e. the file's CONTENT decoded from UTF-16,
+    not a re-encoding of its bytes. Getting this wrong yields a document that
+    parses and a join that silently does nothing.
+    """
+    raw = base64.b64decode(b64_of_file)
+    if raw[:2] == b"\xff\xfe":
+        raw = raw[2:]
+    text = raw.decode("utf-16-le", errors="strict")
+    # djoin.exe and samba both write the blob as a C wide string, so the file
+    # ends with a NUL terminator. It is part of the file, not part of the
+    # base64, and leaving it in produces an answer file whose <Provisioning>
+    # element Windows rejects. strip() does not remove it.
+    text = text.replace("\x00", "")
+    text = "".join(text.split())          # the tools wrap; the XML element must not
+    if not text:
+        raise Fail("offline-join blob came back empty")
+    # Prove it is base64 before handing it on, so a malformed blob fails here
+    # rather than inside Windows Setup with no diagnostic.
+    try:
+        base64.b64decode(text, validate=True)
+    except Exception as e:
+        raise Fail("offline-join blob is not valid base64: %s" % e)
+    return text
+
+
+def v_member_provision(a):
+    """Create/refresh a machine account and return its offline-join blob."""
+    name = _member_check_name(a["name"])
+    reuse = str(a.get("reuse", "")).lower() in ("yes", "true", "1")
+    ou = (a.get("ou") or "").strip()
+
+    pdc = pdc_emulator()
+    # The savefile is written, read back and removed inside ONE bash -c, so the
+    # blob never outlives the call even if this process dies mid-verb. The name
+    # is random per invocation for the same reason AUTH_WRAP's authfile is: two
+    # concurrent provisions must not have one's cleanup delete the other's file.
+    dest = "/run/adlab.odj.%s" % secrets.token_hex(6)
+    errf = "/run/adlab.odj.%s.err" % secrets.token_hex(6)
+
+    cmd = ("net offlinejoin provision domain=%s machine_name=%s dcname=%s"
+           % (shq(LAB["DOMAIN_DNS"]), shq(name), shq(pdc)))
+    if ou:
+        cmd += " machine_account_ou=%s" % shq(ou)
+    if reuse:
+        cmd += " reuse"
+    cmd += " savefile=%s" % shq(dest)
+
+    # The blob read has to run inside the authfile's lifetime, so the whole
+    # sequence is one body rather than a command followed by a separate read.
+    #
+    # net's own output goes to the error file, never to stdout: stdout carries
+    # ONLY the base64 blob, so a chatty samba build cannot prepend a success
+    # banner to the credential the caller is about to parse. (`printblob` does
+    # exactly that — it writes "Successfully provisioned computer ..." and the
+    # blob to the same stream — which is why savefile is used here instead.)
+    body = (cmd + ' -A "$af" >/dev/null 2>' + shq(errf) +
+            "; nrc=$?; "
+            "if [ $nrc -eq 0 ]; then base64 -w0 < " + shq(dest) +
+            "; else cat " + shq(errf) + " >&2; fi; "
+            "rm -f " + shq(dest) + " " + shq(errf) + "; "
+            "(exit $nrc)")
+    rc, out, err = podman_auth_body(pdc, body, timeout=180)
+    if rc != 0:
+        raise Fail("offlinejoin provision failed on %s: %s"
+                   % (pdc, (err.strip() or out.strip())[:400]))
+
+    blob = _decode_odj(out.strip())
+    return {
+        "machine": name,
+        "domain": LAB["DOMAIN_DNS"],
+        "realm": LAB["REALM"],
+        "domain_nb": LAB["DOMAIN_NB"],
+        "dc": pdc,
+        "ou": ou,
+        "reused": reuse,
+        "blob_bytes": len(blob),
+        # Named to match the autounattend template's variable so an operator
+        # can paste it straight into the deployment form.
+        "odj_blob": blob,
+        "note": ("This blob authenticates one machine account and is consumed "
+                 "by the join. Treat it as a credential."),
+    }
+
+
+def v_member_list(a):
+    """Computer accounts that are member servers, with their join evidence."""
+    d = first_up_dc()
+    rc, out, err = podman(d, ["samba-tool", "computer", "list"])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    names = [x.rstrip("$") for x in parse_name_list(out)]
+
+    dcs = set(x.lower() for x in all_dcs())
+    rows = []
+    for n in sorted(names):
+        low = n.lower()
+        if low in dcs or re.match(r'^client\d+$', low) or re.match(r'^rdp\d+$', low):
+            continue          # lab containers and DCs have their own tabs
+        info = {"name": n, "os": "", "os_version": "", "dns": "", "last_logon": ""}
+        rc2, out2, _ = podman(d, ["samba-tool", "computer", "show", n])
+        if rc2 == 0:
+            for line in out2.splitlines():
+                if ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                k, v = k.strip().lower(), v.strip()
+                if k == "operatingsystem":
+                    info["os"] = v
+                elif k == "operatingsystemversion":
+                    info["os_version"] = v
+                elif k == "dnshostname":
+                    info["dns"] = v
+                elif k == "lastlogontimestamp":
+                    info["last_logon"] = v
+        # operatingSystem is the ONLY one of these written by the machine
+        # itself, at join time. dNSHostName is not: `net offlinejoin provision`
+        # sets it when it creates the account, so treating it as evidence
+        # reports every provisioned-but-never-booted machine as joined — which
+        # is precisely the case this column exists to expose.
+        info["joined"] = bool(info["os"])
+        rows.append(info)
+    return {"members": rows, "queried_on": d}
+
+
+def v_member_verify(a):
+    """Has this machine actually joined, or is it only provisioned?"""
+    name = _member_check_name(a["name"])
+    d = first_up_dc()
+    rc, out, err = podman(d, ["samba-tool", "computer", "show", name])
+    if rc != 0:
+        return {"machine": name, "account_exists": False, "joined": False,
+                "detail": (err.strip() or out.strip())[:300]}
+    attrs = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            attrs[k.strip().lower()] = v.strip()
+    # operatingSystem is written by the machine when it joins. dNSHostName is
+    # set by `net offlinejoin provision` at account-creation time, so it proves
+    # only that someone staged this machine — not that the machine ever booted.
+    joined = bool(attrs.get("operatingsystem"))
+    return {
+        "machine": name,
+        "account_exists": True,
+        # The distinction between "we made it an account" and "the machine
+        # joined" is exactly what an operator needs after an unattended install
+        # that appeared to succeed.
+        "joined": joined,
+        "provisioned_only": (not joined),
+        "operating_system": attrs.get("operatingsystem", ""),
+        "operating_system_version": attrs.get("operatingsystemversion", ""),
+        "dns_hostname": attrs.get("dnshostname", ""),
+        "last_logon": attrs.get("lastlogontimestamp", ""),
+        "queried_on": d,
+    }
+
+
+def v_member_deprovision(a):
+    """Delete a member server's machine account."""
+    name = _member_check_name(a["name"])
+    if name.lower() in set(x.lower() for x in all_dcs()):
+        raise Fail("%s is a domain controller; use dc-demote" % name)
+    if re.match(r'^client\d+$', name.lower()):
+        raise Fail("%s is a lab client container; use client-remove" % name)
+    rc, out, err = podman(pdc_emulator(), ["samba-tool", "computer", "delete", name])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip())
+    return {"deprovisioned": name}
+
+
 # ---- activity / audit -----------------------------------------------------
 
 def v_audit_log(a):
@@ -3437,6 +3673,20 @@ VERBS = {
     "client-remove": {"fn": v_client_remove, "group": "clients", "danger": True,
                       "help": "Remove a client container and its computer account.",
                       "args": [arg("name", help_="clientN")]},
+    "member-list":   {"fn": v_member_list, "group": "members",
+                      "help": "Windows member servers, with evidence of whether they actually joined."},
+    "member-provision": {"fn": v_member_provision, "group": "members",
+                      "help": "Create a machine account and return its offline-join blob (a credential, returned once).",
+                      "args": [arg("name", help_="machine account name, <=15 chars"),
+                               arg("ou", required=False, help_="OU DN to place the account in"),
+                               arg("reuse", "enum", required=False, choices=["yes", "no"], default="no",
+                                   help_="yes = re-provision an existing account (invalidates the previous blob)")]},
+    "member-verify": {"fn": v_member_verify, "group": "members",
+                      "help": "Distinguish 'account provisioned' from 'machine actually joined'.",
+                      "args": [arg("name")]},
+    "member-deprovision": {"fn": v_member_deprovision, "group": "members", "danger": True,
+                      "help": "Delete a member server's machine account.",
+                      "args": [arg("name")]},
     "audit-log":     {"fn": v_audit_log, "group": "activity",
                       "help": "Recent adlab-admin invocations (the API activity log).",
                       "args": [arg("lines", "int", required=False, default=100)]},

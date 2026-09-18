@@ -468,7 +468,8 @@
         ["objects", "AD Objects"],
         ["gpo", "Group Policy"], ["sites", "Sites & Replication"],
         ["dns", "DNS"], ["domains", "Domains"], ["dcs", "Domain Controllers"],
-        ["clients", "Clients"], ["activity", "Activity"],
+        ["clients", "Clients"], ["members", "Member Servers"],
+        ["activity", "Activity"],
     ];
 
     function renderTabs() {
@@ -2871,6 +2872,61 @@
         }).catch(function (e) { holder.appendChild(failCard("Clients", e)); });
     }
 
+    // ------------------------------------------------------- member servers
+    /* Windows member servers joined by OFFLINE domain join.
+     *
+     * The blob member-provision returns is a credential: it authenticates one
+     * machine account until the join consumes it. It is therefore shown once,
+     * in a modal the operator must copy from, and never stored by this page or
+     * re-fetchable afterwards -- the same handling as a generated user password.
+     */
+    function renderMembers() {
+        var m = content();
+        var acts = el("div", "al-actions");
+        acts.appendChild(actionButton("Provision machine account", "member-provision", {}, ""));
+        m.appendChild(acts);
+
+        var intro = el("div", "hint",
+            "Offline domain join: the machine account is created here and its provisioning " +
+            "blob is consumed by an unattended installer, so no domain credential is ever " +
+            "written into an answer file. Paste the blob into the edy netboot deployment's " +
+            "odj_blob variable.");
+        intro.style.marginBottom = "0.6rem";
+        m.appendChild(intro);
+
+        var holder = el("div", "al-grid"); m.appendChild(holder);
+        run("member-list").then(function (r) {
+            var c = card("Member servers", true);
+            if (!r.members || !r.members.length) {
+                c.appendChild(el("div", "hint",
+                    "No member servers yet. Provision a machine account above, then deploy the " +
+                    "machine with that blob."));
+            } else {
+                c.appendChild(tableOf(
+                    ["machine", "joined", "operating system", "dns name", "actions"],
+                    r.members.map(function (x) {
+                        var box = el("div", "al-actions");
+                        box.appendChild(actionButton("verify", "member-verify", { name: x.name }));
+                        box.appendChild(actionButton("re-provision", "member-provision",
+                                                     { name: x.name, reuse: "yes" }));
+                        box.appendChild(actionButton("delete account", "member-deprovision",
+                                                     { name: x.name }));
+                        return [x.name,
+                                /* "provisioned" is not "joined": an account with no
+                                 * operatingSystem/dNSHostName was created here and never
+                                 * used by a machine. That distinction is the whole point
+                                 * of this column. */
+                                badge(x.joined ? "joined" : "provisioned only",
+                                      x.joined ? "ok" : "warn"),
+                                x.os ? (x.os + " " + (x.os_version || "")).trim() : "-",
+                                x.dns || "-",
+                                box];
+                    })));
+            }
+            holder.appendChild(c);
+        }).catch(function (e) { holder.appendChild(failCard("Member servers", e)); });
+    }
+
     // ------------------------------------------------------------ activity
     function renderActivity() {
         var m = content();
@@ -2890,7 +2946,8 @@
     var RENDER = { overview: renderOverview,
                    objects: renderObjects, gpo: renderGpo,
                    sites: renderSites, dns: renderDns, domains: renderDomains,
-                   dcs: renderDcs, clients: renderClients, activity: renderActivity };
+                   dcs: renderDcs, clients: renderClients, members: renderMembers,
+                   activity: renderActivity };
 
     function boot() {
         renderTabs();
