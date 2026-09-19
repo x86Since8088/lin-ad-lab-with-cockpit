@@ -1514,13 +1514,23 @@ def v_rds_status(a):
                            "(lDAPDisplayName=msTSExpireDate)", "lDAPDisplayName"])
     schema_ok = "msTSExpireDate" in so
     rc, sc, _ = podman(d, ["ldbsearch", "-H", SAM, "--cross-ncs",
-                           "(objectClass=licensingSiteSettings)", "dn"])
-    scps = [l.split(":", 1)[1].strip() for l in sc.splitlines() if l.lower().startswith("dn:")]
+                           "(objectClass=licensingSiteSettings)", "dn", "siteServer"])
+    lss = parse_ldif_full(sc)
+    scps = [e["dn"] for e in lss]
+    # Each published site's license server: the siteServer value on its
+    # licensingSiteSettings object. Attribute names come back in schema case, so
+    # match case-insensitively.
+    site_servers = []
+    for e in lss:
+        lc = {k.lower(): v for k, v in e["attrs"].items()}
+        for v in lc.get("siteserver", []):
+            site_servers.append({"site_settings_dn": e["dn"], "site_server": v})
     return {"group": RDS_LS_GROUP_NAME, "group_sid": RDS_LS_GROUP_SID, "group_dn": gdn,
             "group_present": bool(gdn), "members": members,
             "per_user_cal_schema": schema_ok,
             "per_user_delegation": _rds_delegation_present(d),
-            "site_license_scps": scps, "on": d}
+            "site_license_scps": scps,
+            "site_license_servers": site_servers, "on": d}
 
 
 def v_rds_ensure(a):
@@ -1558,6 +1568,205 @@ def v_rds_add_server(a):
     if rc != 0:
         raise Fail(err.strip() or out.strip())
     return {"group": RDS_LS_GROUP_NAME, "added": member, "on": d}
+
+
+# ---- RDS site-level publishing (Enterprise license server) ----------------
+# Session hosts discover their site's Enterprise license server through a
+# licensingSiteSettings object published directly under the site, whose
+# `siteServer` attribute is the license server's computer DN. The class is
+# structural (governsID 1.2.840.113556.1.5.78, subClassOf applicationSiteSettings,
+# rDNAttID cn, NO mustContain — only systemMayContain siteServer), so the object
+# needs nothing but its objectClass, cn and siteServer; the RDN, by exact analogy
+# with the "NTDS Site Settings" object, is "Licensing Site Settings". The
+# site-level PERMISSION is an ACE letting the license server's computer account
+# write the siteServer property on that object, so it can maintain (re-register)
+# its own registration — the same delegation pattern as RDS_CAL_ACE, but a
+# write-property on one object rather than an inherited property-set grant.
+RDS_SITE_SETTINGS_CN = "Licensing Site Settings"
+RDS_SITESERVER_ATTR_GUID = "1be8f17c-a9ff-11d0-afe2-00c04fd930c9"  # siteServer attributeSchema schemaIDGUID
+
+
+def _rds_site_permission_ace(sid):
+    """SDDL ACE granting `sid` write-property on the siteServer attribute of the
+    Licensing Site Settings object. (OA)=object ACE, no inheritance (applies to
+    the object itself), (WP)=write-property, object-type = the siteServer attr."""
+    return "(OA;;WP;%s;;%s)" % (RDS_SITESERVER_ATTR_GUID, sid)
+
+
+def _sites_container_dn():
+    return "CN=Sites," + config_dn()
+
+
+def _rds_resolve_site(d, name=None):
+    """Resolve a site to its DN. With no name, the (only/first) site; if there is
+    more than one, require --site to disambiguate."""
+    base = _sites_container_dn()
+    n = (name or "").strip()
+    if n:
+        if "=" in n:                                    # already a DN
+            ents = _ldb(d, n, "base", "(objectClass=site)", ["cn"])
+            if not ents:
+                raise Fail("no site at %s" % n)
+            return ents[0]["dn"]
+        ents = _ldb(d, base, "one",
+                    "(&(objectClass=site)(cn=%s))" % _ldap_escape(n), ["cn"])
+        if not ents:
+            raise Fail("site %r not found under %s" % (n, base))
+        return ents[0]["dn"]
+    ents = _ldb(d, base, "one", "(objectClass=site)", ["cn"])
+    if not ents:
+        raise Fail("no site found under %s" % base)
+    if len(ents) > 1:
+        names = ", ".join(sorted(e["dn"].split(",", 1)[0][3:] for e in ents))
+        raise Fail("multiple sites (%s) — pass --site to choose one" % names)
+    return ents[0]["dn"]
+
+
+def _rds_resolve_computer(d, name):
+    """Resolve a computer account (short name, NAME$, or a full DN) to
+    (dn, objectSid) — the same name→object resolution rds-add-server delegates to
+    samba-tool, done here because we need both the DN (for siteServer) and the SID
+    (for the ACE). ldbsearch decodes objectSid to its S-1-5-… string form."""
+    nm = (name or "").strip()
+    if not nm:
+        raise Fail("server is required")
+    if "=" in nm:                                        # a DN
+        ents = _ldb(d, nm, "base", "(objectClass=computer)", ["objectSid"])
+        if not ents:
+            raise Fail("no computer object at %s" % nm)
+    else:
+        sam = nm if nm.endswith("$") else nm + "$"
+        ents = _ldb(d, domain_dn(), "sub",
+                    "(&(objectClass=computer)(sAMAccountName=%s))" % _ldap_escape(sam),
+                    ["objectSid"])
+        if not ents:
+            raise Fail("computer %r not found" % nm)
+    dn = ents[0]["dn"]
+    lc = {k.lower(): v for k, v in ents[0]["attrs"].items()}
+    sids = lc.get("objectsid", [])
+    if not sids:
+        raise Fail("could not read objectSid of %s" % dn)
+    return dn, sids[0]
+
+
+def _rds_find_site_settings(d, site_dn):
+    """The licensingSiteSettings object under a site, or None — matched by class,
+    not name, so a differently-named object is still found."""
+    ents = _ldb(d, site_dn, "one", "(objectClass=licensingSiteSettings)",
+                ["siteServer", "cn"])
+    return ents[0] if ents else None
+
+
+def _rds_site_permission_present(d, ss_dn, sid):
+    """True if `sid` already has an allow ACE on ss_dn granting write to the
+    siteServer property (WP on the attr GUID, or WP/generic-write on the whole
+    object)."""
+    rc, sd, _ = podman(d, ["samba-tool", "dsacl", "get", "--objectdn", ss_dn])
+    if rc != 0:
+        return False
+    for ace in re.findall(r'\(([^)]*)\)', sd):
+        parts = ace.split(";")
+        if len(parts) != 6:
+            continue
+        atype, _flags, rights, objtype, _inh, trustee = parts
+        if atype not in ("A", "OA") or trustee != sid:
+            continue
+        if "WP" not in rights and "GA" not in rights and "GW" not in rights:
+            continue
+        if objtype == "" or objtype.lower() == RDS_SITESERVER_ATTR_GUID.lower():
+            return True
+    return False
+
+
+def _rds_grant_site_permission(d, ss_dn, sid):
+    """Idempotently add the write-siteServer ACE for the computer SID. Returns
+    True if it was added, False if already present."""
+    if _rds_site_permission_present(d, ss_dn, sid):
+        return False
+    rc, out, err = podman(d, ["samba-tool", "dsacl", "set", "--objectdn", ss_dn,
+                              "--sddl", _rds_site_permission_ace(sid)])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip() or "dsacl set failed")
+    return True
+
+
+def v_rds_publish_site(a):
+    """Publish an RD Licensing server as a site's Enterprise license server:
+    create the CN=Licensing Site Settings licensingSiteSettings object under the
+    site if absent, set siteServer to the server's computer DN, and grant that
+    computer write-property on siteServer so it can maintain its own registration.
+    Idempotent — re-running is a no-op when already correct."""
+    d = pdc_emulator()
+    site_dn = _rds_resolve_site(d, a.get("site"))
+    comp_dn, comp_sid = _rds_resolve_computer(d, a["server"])
+    obj = _rds_find_site_settings(d, site_dn)
+    created = False
+    if obj is None:
+        ss_dn = "CN=%s,%s" % (RDS_SITE_SETTINGS_CN, site_dn)
+        ldif = ("dn: %s\nobjectClass: licensingSiteSettings\ncn: %s\n%s\n"
+                % (ss_dn, RDS_SITE_SETTINGS_CN, _ldif_value_line("siteServer", comp_dn)))
+        rc, out, err = podman(d, ["ldbadd", "-H", SAM], stdin=ldif)
+        if rc != 0:
+            raise Fail(err.strip() or out.strip() or "ldbadd failed")
+        created = True
+        cur = [comp_dn]
+    else:
+        ss_dn = obj["dn"]
+        lc = {k.lower(): v for k, v in obj["attrs"].items()}
+        cur = lc.get("siteserver", [])
+    server_changed = False
+    if [_norm_dn(v) for v in cur] != [_norm_dn(comp_dn)]:
+        ldif = ("dn: %s\nchangetype: modify\nreplace: siteServer\n%s\n-\n"
+                % (ss_dn, _ldif_value_line("siteServer", comp_dn)))
+        rc, out, err = podman(d, ["ldbmodify", "-H", SAM], stdin=ldif)
+        if rc != 0:
+            raise Fail(err.strip() or out.strip() or "ldbmodify failed")
+        server_changed = True
+    perm_added = _rds_grant_site_permission(d, ss_dn, comp_sid)
+    return {"site": site_dn.split(",", 1)[0][3:], "site_dn": site_dn,
+            "site_settings_dn": ss_dn, "site_server": comp_dn,
+            "site_server_sid": comp_sid, "created": created,
+            "site_server_changed": server_changed,
+            "permission_ace": _rds_site_permission_ace(comp_sid),
+            "permission_added": perm_added, "on": d}
+
+
+def v_rds_site_permission(a):
+    """Grant (idempotently) the license server's computer account write access to
+    the siteServer property on the site's Licensing Site Settings object, so it
+    can maintain its own registration. The object must already exist
+    (rds-publish-site creates it)."""
+    d = pdc_emulator()
+    site_dn = _rds_resolve_site(d, a.get("site"))
+    comp_dn, comp_sid = _rds_resolve_computer(d, a["server"])
+    obj = _rds_find_site_settings(d, site_dn)
+    if obj is None:
+        raise Fail("no Licensing Site Settings object under %s — run "
+                   "rds-publish-site first" % site_dn)
+    ss_dn = obj["dn"]
+    added = _rds_grant_site_permission(d, ss_dn, comp_sid)
+    return {"site": site_dn.split(",", 1)[0][3:], "site_settings_dn": ss_dn,
+            "site_server": comp_dn, "site_server_sid": comp_sid,
+            "permission_ace": _rds_site_permission_ace(comp_sid),
+            "permission_added": added, "on": d}
+
+
+def v_rds_unpublish_site(a):
+    """Remove a site's Enterprise license-server publication: delete the
+    licensingSiteSettings object under the site (which carries the siteServer
+    value and its ACE). Idempotent — a no-op when nothing is published."""
+    d = pdc_emulator()
+    site_dn = _rds_resolve_site(d, a.get("site"))
+    obj = _rds_find_site_settings(d, site_dn)
+    if obj is None:
+        return {"site": site_dn.split(",", 1)[0][3:], "site_dn": site_dn,
+                "removed": False, "on": d}
+    ss_dn = obj["dn"]
+    rc, out, err = podman(d, ["ldbdel", "-H", SAM, ss_dn])
+    if rc != 0:
+        raise Fail(err.strip() or out.strip() or "ldbdel failed")
+    return {"site": site_dn.split(",", 1)[0][3:], "site_dn": site_dn,
+            "site_settings_dn": ss_dn, "removed": True, "on": d}
 
 
 # ---- object protection (protect from accidental deletion) -----------------
@@ -4004,6 +4213,17 @@ VERBS = {
     "rds-add-server": {"fn": v_rds_add_server, "group": "rds",
                       "help": "Add a computer (RD Licensing server) to the Terminal Server License Servers group; ensures the delegation ACE first.",
                       "args": [arg("server", help_="computer account, e.g. RDLIC01$ or its DN")]},
+    "rds-publish-site": {"fn": v_rds_publish_site, "group": "rds",
+                      "help": "Publish an RD Licensing server as the site's Enterprise license server (licensingSiteSettings.siteServer) and grant it write-siteServer so it can maintain its own registration. Idempotent.",
+                      "args": [arg("server", help_="computer account, e.g. ws2025-mem2 / ws2025-mem2$ / its DN"),
+                               arg("site", required=False, help_="site name (default: the only/first site)")]},
+    "rds-site-permission": {"fn": v_rds_site_permission, "group": "rds",
+                      "help": "Grant the license server's computer account write access to siteServer on the site's Licensing Site Settings object (requires it to exist). Idempotent.",
+                      "args": [arg("server", help_="computer account or DN"),
+                               arg("site", required=False, help_="site name (default: the only/first site)")]},
+    "rds-unpublish-site": {"fn": v_rds_unpublish_site, "group": "rds", "danger": True,
+                      "help": "Remove a site's Enterprise license-server publication (delete the licensingSiteSettings object). Idempotent.",
+                      "args": [arg("site", required=False, help_="site name (default: the only/first site)")]},
     "ou-list":       {"fn": v_ou_list, "group": "users", "help": "All organizational units."},
     "ou-create":     {"fn": v_ou_create, "group": "users", "help": "Create an OU by DN.",
                       "args": [arg("dn", help_="e.g. OU=Workstations")]},
