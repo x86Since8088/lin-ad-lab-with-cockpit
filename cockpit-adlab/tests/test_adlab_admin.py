@@ -1846,6 +1846,179 @@ class TestRds(Base):
                                                   "Terminal Server License Servers", "RDLIC01$"))
 
 
+class TestRdsSitePublish(Base):
+    """rds-publish-site / rds-site-permission / rds-unpublish-site: register a
+    site's Enterprise license server (licensingSiteSettings.siteServer) and grant
+    the server write-siteServer so it can maintain its own registration."""
+
+    SITE_DN = "CN=Default-First-Site-Name,CN=Sites,CN=Configuration,DC=ad,DC=edt1,DC=lab"
+    SS_DN = "CN=Licensing Site Settings," + SITE_DN
+    COMP_DN = "CN=ws2025-mem2,CN=Computers,DC=ad,DC=edt1,DC=lab"
+    COMP_SID = "S-1-5-21-1299215473-3033484451-2070441001-3769"
+
+    def _site_found(self):
+        # site resolution: (objectClass=site) under CN=Sites
+        self.fake.on(lambda a: "ldbsearch" in a and any("(objectClass=site)" in x for x in a),
+                     out="dn: %s\nname: Default-First-Site-Name\n" % self.SITE_DN)
+
+    def _computer_found(self):
+        self.fake.on(lambda a: "ldbsearch" in a and any("objectClass=computer" in x for x in a),
+                     out="dn: %s\nobjectSid: %s\n" % (self.COMP_DN, self.COMP_SID))
+
+    def _no_site_settings(self):
+        self.fake.on(lambda a: "ldbsearch" in a and any("licensingSiteSettings" in x for x in a),
+                     out="")
+
+    def _site_settings(self, site_server=None):
+        ldif = "dn: %s\ncn: Licensing Site Settings\n" % self.SS_DN
+        if site_server:
+            ldif += "siteServer: %s\n" % site_server
+        self.fake.on(lambda a: "ldbsearch" in a and any("licensingSiteSettings" in x for x in a),
+                     out=ldif)
+
+    def _dsacl_perm(self, present):
+        ace = "(OA;;WP;%s;;%s)" % (mod.RDS_SITESERVER_ATTR_GUID, self.COMP_SID) if present else ""
+        self.fake.on(lambda a: "dsacl" in a and "get" in a,
+                     out="descriptor for %s:\nO:BAG:BAD:(A;;RPWP;;;WD)%s\n" % (self.SS_DN, ace))
+
+    def _writes_ok(self):
+        self.fake.on(lambda a: "ldbadd" in a, out="")
+        self.fake.on(lambda a: "ldbmodify" in a, out="")
+        self.fake.on(lambda a: "dsacl" in a and "set" in a, out="")
+        self.fake.on(lambda a: "ldbdel" in a, out="")
+
+    def _stdin_of(self, *words):
+        for argv, stdin in self.fake.calls:
+            if all(w in " ".join(map(str, argv)) for w in words):
+                return stdin
+        return None
+
+    # -- publish ----------------------------------------------------------
+    def test_publish_creates_object_sets_siteserver_and_grants_permission(self):
+        self.fake.lab_up(); self._site_found(); self._computer_found()
+        self._no_site_settings(); self._dsacl_perm(False); self._writes_ok()
+        rc, out = self.call_main(["rds-publish-site", "--server", "ws2025-mem2"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["created"])
+        self.assertEqual(out["site"], "Default-First-Site-Name")
+        self.assertEqual(out["site_settings_dn"], self.SS_DN)
+        self.assertEqual(out["site_server"], self.COMP_DN)
+        self.assertTrue(out["permission_added"])
+        # the object was created with class, cn and siteServer, in one ldbadd
+        add = self._stdin_of("ldbadd")
+        self.assertIn("objectClass: licensingSiteSettings", add)
+        self.assertIn("cn: Licensing Site Settings", add)
+        self.assertIn("siteServer: %s" % self.COMP_DN, add)
+        # and the site-level permission is a WP-on-siteServer ACE for the computer SID
+        self.assertTrue(self.fake.argv_containing(
+            "dsacl", "set", "--sddl", mod._rds_site_permission_ace(self.COMP_SID)))
+        self.assertTrue(out["permission_ace"].startswith("(OA;;WP;%s;;" % mod.RDS_SITESERVER_ATTR_GUID))
+
+    def test_publish_accepts_dollar_and_dn_forms(self):
+        for server in ("ws2025-mem2$", self.COMP_DN):
+            self.setUp()
+            self.fake.lab_up(); self._site_found(); self._computer_found()
+            self._no_site_settings(); self._dsacl_perm(False); self._writes_ok()
+            rc, out = self.call_main(["rds-publish-site", "--server", server])
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(out["site_server"], self.COMP_DN)
+
+    def test_publish_is_idempotent_when_already_correct(self):
+        self.fake.lab_up(); self._site_found(); self._computer_found()
+        self._site_settings(self.COMP_DN); self._dsacl_perm(True); self._writes_ok()
+        rc, out = self.call_main(["rds-publish-site", "--server", "ws2025-mem2"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(out["created"])
+        self.assertFalse(out["site_server_changed"])
+        self.assertFalse(out["permission_added"])
+        # a no-op writes nothing
+        self.assertEqual(self.fake.argv_containing("ldbadd"), [])
+        self.assertEqual(self.fake.argv_containing("ldbmodify"), [])
+        self.assertEqual(self.fake.argv_containing("dsacl", "set"), [])
+
+    def test_publish_repoints_siteserver_when_wrong(self):
+        self.fake.lab_up(); self._site_found(); self._computer_found()
+        self._site_settings("CN=old-ls,CN=Computers,DC=ad,DC=edt1,DC=lab")
+        self._dsacl_perm(True); self._writes_ok()
+        rc, out = self.call_main(["rds-publish-site", "--server", "ws2025-mem2"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(out["created"])                 # object already existed
+        self.assertTrue(out["site_server_changed"])
+        self.assertEqual(self.fake.argv_containing("ldbadd"), [])
+        mod_ldif = self._stdin_of("ldbmodify")
+        self.assertIn("replace: siteServer", mod_ldif)
+        self.assertIn("siteServer: %s" % self.COMP_DN, mod_ldif)
+
+    def test_publish_site_by_name(self):
+        self.fake.lab_up(); self._site_found(); self._computer_found()
+        self._no_site_settings(); self._dsacl_perm(False); self._writes_ok()
+        rc, out = self.call_main(["rds-publish-site", "--server", "ws2025-mem2",
+                                  "--site", "Default-First-Site-Name"])
+        self.assertEqual(rc, 0, out)
+        # the site filter carried the requested name
+        self.assertTrue(any("(cn=Default-First-Site-Name)" in x
+                            for argv, _ in self.fake.calls for x in argv))
+
+    # -- status -----------------------------------------------------------
+    def test_status_reports_published_server(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a and any("objectSid=S-1-5-32-561" in x for x in a),
+                     out="dn: CN=Terminal Server License Servers,CN=Builtin,DC=ad,DC=edt1,DC=lab\n")
+        self.fake.on(lambda a: "ldbsearch" in a and "-b" in a and "member" in a, out="")
+        self.fake.on(lambda a: "ldbsearch" in a and any("msTSExpireDate" in x for x in a),
+                     out="lDAPDisplayName: msTSExpireDate\n")
+        self.fake.on(lambda a: "ldbsearch" in a and any("(objectCategory=person)" in x for x in a),
+                     out="dn: CN=alice,CN=Users,DC=ad,DC=edt1,DC=lab\n")
+        self.fake.on(lambda a: "dsacl" in a and "get" in a,
+                     out="O:BAG:BAD:(A;;RPWP;;;WD)(OA;;RPWP;5805bc62-bdc9-4428-a5e2-856a0f4c185e;;S-1-5-32-561)\n")
+        self.fake.on(lambda a: "ldbsearch" in a and any("licensingSiteSettings" in x for x in a),
+                     out="dn: %s\nsiteServer: %s\n" % (self.SS_DN, self.COMP_DN))
+        rc, out = self.call_main(["rds-status"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["site_license_scps"], [self.SS_DN])
+        self.assertEqual(out["site_license_servers"],
+                         [{"site_settings_dn": self.SS_DN, "site_server": self.COMP_DN}])
+
+    # -- site-permission --------------------------------------------------
+    def test_site_permission_requires_object(self):
+        self.fake.lab_up(); self._site_found(); self._computer_found(); self._no_site_settings()
+        rc, out = self.call_main(["rds-site-permission", "--server", "ws2025-mem2"])
+        self.assertEqual(rc, 1)
+        self.assertIn("rds-publish-site", out["error"])
+
+    def test_site_permission_grants_and_is_idempotent(self):
+        self.fake.lab_up(); self._site_found(); self._computer_found()
+        self._site_settings(self.COMP_DN); self._dsacl_perm(False); self._writes_ok()
+        rc, out = self.call_main(["rds-site-permission", "--server", "ws2025-mem2"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["permission_added"])
+        self.assertTrue(self.fake.argv_containing(
+            "dsacl", "set", "--sddl", mod._rds_site_permission_ace(self.COMP_SID)))
+        # already present -> no dsacl set
+        self.setUp()
+        self.fake.lab_up(); self._site_found(); self._computer_found()
+        self._site_settings(self.COMP_DN); self._dsacl_perm(True); self._writes_ok()
+        rc, out = self.call_main(["rds-site-permission", "--server", "ws2025-mem2"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(out["permission_added"])
+        self.assertEqual(self.fake.argv_containing("dsacl", "set"), [])
+
+    # -- unpublish --------------------------------------------------------
+    def test_unpublish_deletes_object(self):
+        self.fake.lab_up(); self._site_found(); self._site_settings(self.COMP_DN); self._writes_ok()
+        rc, out = self.call_main(["rds-unpublish-site"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["removed"])
+        self.assertTrue(self.fake.argv_containing("ldbdel", self.SS_DN))
+
+    def test_unpublish_is_noop_when_absent(self):
+        self.fake.lab_up(); self._site_found(); self._no_site_settings(); self._writes_ok()
+        rc, out = self.call_main(["rds-unpublish-site"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(out["removed"])
+        self.assertEqual(self.fake.argv_containing("ldbdel"), [])
+
+
 class DecodeOdjTests(unittest.TestCase):
     """_decode_odj is the last place a bad offline-join blob can be caught.
 
