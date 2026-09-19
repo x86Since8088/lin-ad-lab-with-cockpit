@@ -213,10 +213,19 @@ class Base(unittest.TestCase):
         self._audit.close()
         self._old_audit = mod.AUDIT_LOG
         mod.AUDIT_LOG = self._audit.name
+        # isolate the per-GPO OS-scope store so no test writes to /var/lib/adlab
+        self._gpo_os = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        self._gpo_os.close()
+        os.unlink(self._gpo_os.name)          # start with no file
+        self._old_gpo_os = mod.GPO_OS_FILE
+        mod.GPO_OS_FILE = self._gpo_os.name
 
     def tearDown(self):
         mod.RUN = self._old_run
         mod.AUDIT_LOG = self._old_audit
+        mod.GPO_OS_FILE = self._old_gpo_os
+        if os.path.exists(self._gpo_os.name):
+            os.unlink(self._gpo_os.name)
         os.unlink(self._audit.name)
 
     def call_main(self, argv, stdin=""):
@@ -595,10 +604,13 @@ class TestHandlers(Base):
         self.fake.lab_up()
         self.fake.on(lambda a: any("gpo create" in str(x) for x in a),
                      out="GPO 'test' created as {AAAAAAAA-1111-2222-3333-444455556666}\n")
-        rc, out = self.call_main(["gpo-create", "--name", "test"])
+        rc, out = self.call_main(["gpo-create", "--name", "test", "--os", "Windows"])
         self.assertEqual(rc, 0)
         self.assertEqual(out["on"], "dc1")
         self.assertTrue(out["gpo"].startswith("{AAAAAAAA"))
+        self.assertEqual(out["os"], "Windows")
+        # the OS scope is recorded, keyed by the created GUID (upper-cased)
+        self.assertEqual(mod._declared_gpo_os(out["gpo"]), "Windows")
         argv = self.fake.argv_containing("gpo create")[0]
         joined = " ".join(argv)
         self.assertIn("/run/adminpass", joined)      # password read in-container
@@ -977,6 +989,203 @@ class TestGpoVerbs(Base):
 import base64 as _base64
 def _b64(blob):
     return _base64.b64encode(blob).decode()
+
+
+class TestGpoOsScope(Base):
+    """OS-exclusive GPOs: a GPO is created Windows- or Linux-exclusive and the
+    write verbs refuse a setting whose OS crosses that scope."""
+    WGPO = "{31B2F340-016D-11D2-945F-00C04FB984F9}"
+    LGPO = "{6AC1786C-016F-11D2-945F-00C04FB984F9}"
+
+    def _win_entries(self):
+        return ('[{"keyname":"Software\\\\Policies\\\\Microsoft\\\\Windows",'
+                '"valuename":"X","class":"MACHINE","type":"REG_DWORD","data":1}]')
+
+    def _lnx_entries(self):
+        return ('[{"keyname":"Software\\\\Policies\\\\Ubuntu\\\\dconf",'
+                '"valuename":"Y","class":"USER","type":"REG_SZ","data":"z"}]')
+
+    def _shared_entries(self):
+        # certificate auto-enrollment: Microsoft-rooted but consumed on both OSes
+        return ('[{"keyname":"Software\\\\Policies\\\\Microsoft\\\\Cryptography'
+                '\\\\AutoEnrollment","valuename":"AEPolicy","class":"MACHINE",'
+                '"type":"REG_DWORD","data":7}]')
+
+    def _mock_source_preg(self, entries):
+        """Make the source GPO's registry.pol read (Machine) return `entries`."""
+        b64 = _b64(_preg(entries))
+        self.fake.on(lambda a: "bash" in a and any("/Machine" in str(x) for x in a),
+                     out=b64)
+        self.fake.on(lambda a: "bash" in a and any("/User" in str(x) for x in a),
+                     out="")
+
+    # -- classifier / normalizer units ------------------------------------
+    def test_setting_os_classifies_by_root(self):
+        self.assertEqual(mod._setting_os("Software\\Policies\\Ubuntu\\dconf"), "Linux")
+        self.assertEqual(mod._setting_os("software/policies/gnome/x"), "Linux")
+        self.assertEqual(mod._setting_os("Software\\Policies\\Microsoft\\Windows"), "Windows")
+        self.assertEqual(mod._setting_os(""), "Windows")
+        # cert auto-enrollment is shared (applies on Windows AND Linux)
+        self.assertEqual(mod._setting_os(
+            "Software\\Policies\\Microsoft\\Cryptography\\AutoEnrollment"), "shared")
+        self.assertEqual(mod._setting_os(
+            "software\\policies\\microsoft\\cryptography\\policyservers\\x"), "shared")
+
+    def test_norm_gpo_os(self):
+        self.assertEqual(mod._norm_gpo_os("windows"), "Windows")
+        self.assertEqual(mod._norm_gpo_os("LINUX"), "Linux")
+        with self.assertRaises(mod.Fail):
+            mod._norm_gpo_os("plan9")
+
+    # -- create records scope; list reflects it ---------------------------
+    def test_create_requires_os(self):
+        self.fake.lab_up()
+        rc, out = self.call_main(["gpo-create", "--name", "x"])
+        self.assertEqual(rc, 2)              # required enum missing -> parse error
+        self.assertIn("os", out["error"])
+
+    def test_create_records_scope_and_list_reflects_it(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: any("gpo create" in str(x) for x in a),
+                     out="GPO 'l' created as %s\n" % self.LGPO)
+        rc, out = self.call_main(["gpo-create", "--name", "l", "--os", "Linux"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["os"], "Linux")
+        self.assertEqual(mod._declared_gpo_os(self.LGPO), "Linux")
+        self.fake.on(lambda a: any("gpo listall" in str(x) for x in a), out=GPO_LISTALL)
+        rc, lst = self.call_main(["gpo-list"])
+        self.assertEqual(rc, 0)
+        scopes = {g["gpo"]: g["os_scope"] for g in lst["gpos"]}
+        self.assertEqual(scopes[self.LGPO], "Linux")
+        self.assertEqual(scopes[self.WGPO], "")          # undeclared -> blank
+
+    # -- settings-apply enforcement ---------------------------------------
+    def test_settings_apply_refuses_cross_os(self):
+        self.fake.lab_up()
+        mod._set_gpo_os(self.WGPO, "Windows")
+        self.fake.on(lambda a: any("gpo load" in str(x) for x in a), out="ok\n")
+        rc, out = self.call_main(["gpo-settings-apply", "--gpo", self.WGPO,
+                                  "--entries", self._lnx_entries()])
+        self.assertEqual(rc, 1)
+        self.assertIn("Windows-exclusive", out["error"])
+        self.assertIn("Ubuntu", out["error"])
+        self.assertEqual(self.fake.argv_containing("gpo load"), [])   # never ran
+
+    def test_settings_apply_allows_matching_os(self):
+        self.fake.lab_up()
+        mod._set_gpo_os(self.WGPO, "Windows")
+        self.fake.on(lambda a: any("gpo load" in str(x) for x in a), out="ok\n")
+        rc, out = self.call_main(["gpo-settings-apply", "--gpo", self.WGPO,
+                                  "--entries", self._win_entries()])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["applied"], 1)
+        self.assertEqual(out["os_scope"], "Windows")
+
+    def test_settings_apply_allows_shared_setting_on_either_scope(self):
+        self.fake.lab_up()
+        mod._set_gpo_os(self.LGPO, "Linux")
+        self.fake.on(lambda a: any("gpo load" in str(x) for x in a), out="ok\n")
+        rc, out = self.call_main(["gpo-settings-apply", "--gpo", self.LGPO,
+                                  "--entries", self._shared_entries()])
+        self.assertEqual(rc, 0, out)         # cert auto-enroll allowed on a Linux GPO
+        self.assertEqual(out["applied"], 1)
+
+    def test_settings_apply_undeclared_gpo_not_enforced(self):
+        # back-compat: a GPO the plugin did not create carries no scope, so any
+        # setting is accepted (no inference on the write path, no extra reads).
+        self.fake.lab_up()
+        self.fake.on(lambda a: any("gpo load" in str(x) for x in a), out="ok\n")
+        rc, out = self.call_main(["gpo-settings-apply", "--gpo", self.WGPO,
+                                  "--entries", self._lnx_entries()])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["applied"], 1)
+        self.assertEqual(out["os_scope"], "")
+
+    # -- preferences (samba Unix CSEs are Linux-only) ---------------------
+    def test_pref_set_refused_on_windows_gpo(self):
+        self.fake.lab_up()
+        mod._set_gpo_os(self.WGPO, "Windows")
+        rc, out = self.call_main(["gpo-pref-set", "--gpo", self.WGPO,
+                                  "--cse", "motd", "--value", "hi"])
+        self.assertEqual(rc, 1)
+        self.assertIn("Linux-only", out["error"])
+        self.assertEqual(self.fake.argv_containing("gpo manage"), [])
+
+    def test_pref_set_allowed_on_linux_gpo(self):
+        self.fake.lab_up()
+        mod._set_gpo_os(self.LGPO, "Linux")
+        self.fake.on(lambda a: any("gpo manage motd set" in str(x) for x in a), out="")
+        rc, out = self.call_main(["gpo-pref-set", "--gpo", self.LGPO,
+                                  "--cse", "motd", "--value", "hi"])
+        self.assertEqual(rc, 0, out)
+
+    # -- template-stack enforcement ---------------------------------------
+    def test_template_stack_refuses_cross_os(self):
+        self.fake.lab_up()
+        mod._set_gpo_os(self.WGPO, "Windows")           # target is Windows
+        self._mock_source_preg([("Software\\Policies\\Ubuntu\\dconf", "On", 4,
+                                 _struct.pack("<I", 1))])
+        self.fake.on(lambda a: any("gpo load" in str(x) for x in a), out="ok\n")
+        rc, out = self.call_main(["gpo-template-stack", "--target", self.WGPO,
+                                  "--sources", self.LGPO])
+        self.assertEqual(rc, 1)
+        self.assertIn("Windows-exclusive", out["error"])
+        self.assertEqual(self.fake.argv_containing("gpo load"), [])
+
+    # -- gpo-set-os --------------------------------------------------------
+    def test_set_os_persists_and_verifies_existence(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: any("gpo show" in str(x) for x in a),
+                     out="GPO          : %s\ndisplay name : t\n" % self.WGPO)
+        rc, out = self.call_main(["gpo-set-os", "--gpo", self.WGPO, "--os", "Linux"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["os"], "Linux")
+        self.assertEqual(mod._declared_gpo_os(self.WGPO), "Linux")
+
+    def test_set_os_rejects_bad_os(self):
+        rc, out = self.call_main(["gpo-set-os", "--gpo", self.WGPO, "--os", "BeOS"])
+        self.assertEqual(rc, 2)             # enum validated at parse time
+
+    def test_set_os_fails_when_gpo_missing(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: any("gpo show" in str(x) for x in a), rc=1,
+                     err="GPO does not exist\n")
+        rc, out = self.call_main(["gpo-set-os", "--gpo", self.WGPO, "--os", "Windows"])
+        self.assertEqual(rc, 1)
+        self.assertIsNone(mod._declared_gpo_os(self.WGPO))   # not recorded
+
+    def test_delete_clears_scope(self):
+        self.fake.lab_up()
+        mod._set_gpo_os(self.WGPO, "Windows")
+        self.fake.on(lambda a: any("gpo del" in str(x) for x in a), out="Deleted\n")
+        rc, out = self.call_main(["gpo-delete", "--gpo", self.WGPO])
+        self.assertEqual(rc, 0, out)
+        self.assertIsNone(mod._declared_gpo_os(self.WGPO))
+
+    # -- gpo-show inference (display only) ---------------------------------
+    def test_show_infers_linux_from_settings(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: any("gpo show" in str(x) for x in a),
+                     out="GPO : %s\nversion : 1\n" % self.WGPO)
+        self.fake.on(lambda a: any("listcontainers" in str(x) for x in a), out="")
+        self._mock_source_preg([("Software\\Policies\\Ubuntu\\x", "On", 4,
+                                 _struct.pack("<I", 1))])
+        rc, out = self.call_main(["gpo-show", "--gpo", self.WGPO])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["os_scope"], "Linux")
+        self.assertEqual(out["os_source"], "inferred")
+
+    def test_show_uses_declared_scope(self):
+        self.fake.lab_up()
+        mod._set_gpo_os(self.WGPO, "Windows")
+        self.fake.on(lambda a: any("gpo show" in str(x) for x in a),
+                     out="GPO : %s\n" % self.WGPO)
+        self.fake.on(lambda a: any("listcontainers" in str(x) for x in a), out="")
+        self.fake.on(lambda a: "bash" in a, out="")     # registry read empty
+        rc, out = self.call_main(["gpo-show", "--gpo", self.WGPO])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["os_scope"], "Windows")
+        self.assertEqual(out["os_source"], "declared")
 
 
 class TestCatalog(Base):

@@ -65,6 +65,8 @@ table.al tr:last-child td { border-bottom: none; }
 .badge.warn { background: var(--al-warn-bg); color: var(--al-warn); }
 .badge.err  { background: var(--al-err-bg);  color: var(--al-err); }
 .badge.dim  { background: var(--al-code-bg); color: var(--al-sub); }
+.badge.win  { background: var(--al-accent-soft); color: var(--al-accent); }
+.badge.lnx  { background: var(--al-warn-bg);  color: var(--al-warn); }
 
 button.al-btn { background: var(--al-accent); color: #fff; border: none;
     border-radius: 4px; padding: 0.4rem 0.85rem; font-size: 0.88rem; cursor: pointer; }
