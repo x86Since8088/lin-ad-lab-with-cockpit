@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.6.0 - 2026-09-19
+
+OS-exclusive GPOs — a GPO is created Windows- or Linux-exclusive so a Linux
+policy setting never applies on a Windows system and vice versa.
+
+The lab serves policy to both Windows clients and Linux clients (samba-gpupdate
++ adsys). The two mechanisms one might reach for to keep a GPO's settings on one
+OS do **not** hold: the Windows registry CSE writes *every* `registry.pol` entry
+regardless of root key (so Linux-rooted keys are written — just inert — on
+Windows; separation there is a consumption convention, not a gate), and WMI
+filters fail *open* on Linux (samba-gpupdate fetches `gPCWQLFilter` but never
+evaluates it; adsys ignores it; `samba-tool` cannot even create one). So
+exclusivity is enforced at the **source** — the wrong-OS setting is never
+allowed into the GPO. See `docs/GPO-OS-SCOPE.md`.
+
+- **`gpo-create`** now takes a required **`os` (Windows|Linux)** and records the
+  GPO's OS scope (host-side `/var/lib/adlab/gpo-os.json`, root-only, keyed by
+  GUID). The schema-driven "New GPO" form gains the selector automatically.
+- **`gpo-set-os`** (new) — declare or change the scope of an existing/legacy GPO
+  (e.g. `Default Domain Policy`), opting it into enforcement.
+- **Enforcement** (declared scope only; untyped legacy GPOs are never blocked):
+  `gpo-settings-apply` and `gpo-template-stack` refuse any registry entry whose
+  OS crosses the scope; `gpo-pref-set` refuses on a Windows GPO (the samba Unix
+  CSE preferences are Linux-only). Settings are classified by key namespace
+  (`Software\Policies\{Ubuntu,Canonical,GNOME}` = Linux; else Windows).
+- **Certificate Auto-Enrollment** (`Software\Policies\Microsoft\Cryptography\
+  AutoEnrollment` / `…\PolicyServers`) is Microsoft-rooted but consumed by
+  Windows AND both Linux clients, so it is classed **shared** and allowed in a
+  GPO of either scope — the one documented cross-OS setting.
+- **UI** — the Group Policy list gains an **OS** column (a Windows/Linux badge,
+  blank for untyped legacy GPOs) and a per-GPO **set OS** action; the page banner
+  explains the exclusivity. **`gpo-list`/`gpo-show`** now report `os_scope`
+  (`gpo-show` also *infers* one from SYSVOL when none is declared).
+- 17 new unit tests (`TestGpoOsScope`); 184 total.
+
 ## 1.5.0 - 2026-09-18
 
 Linux administrative templates in Group Policy (adsys/Ubuntu ADMX).

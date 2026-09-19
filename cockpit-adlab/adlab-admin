@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 
 def _require_config():
@@ -1976,27 +1976,165 @@ def v_object_create(a):
 
 # ---- GPO (gpmc.msc) — ALWAYS the PDC emulator -----------------------------
 
+# ---- per-GPO OS scope: Windows-exclusive vs Linux-exclusive ---------------
+# A GPO is created for exactly one OS so a Linux policy setting never applies on
+# Windows and vice versa. This is enforced at the SOURCE — the write verbs
+# refuse a setting whose OS differs from the GPO's declared scope — because that
+# is the only reliable lever in this lab:
+#   * Windows and Linux GP clients each process only their OWN settings
+#     namespace. Windows applies registry.pol under Software\Policies\Microsoft
+#     (+ the standard CSEs); the Linux clients (samba-gpupdate / adsys) apply
+#     VGP + samba Unix CSEs and registry roots under
+#     Software\Policies\{Ubuntu,Canonical,GNOME}, and each ignores the other's.
+#   * WMI filters are NOT usable here: samba-tool cannot create them, and
+#     samba-gpupdate reads gPCWQLFilter but never evaluates it (verified against
+#     samba/gp/gpclass.py — the attribute is fetched, never acted on), so a
+#     Win32_OperatingSystem filter fails OPEN on Linux (applied regardless).
+# The declared scope is a small host-side map (like the catalog-tags file), so
+# resolving/enforcing it needs no container round-trip. GPOs the plugin did not
+# create carry no declared scope; an operator tags one with `gpo-set-os` to opt
+# it into enforcement (its OS can still be INFERRED for display, see v_gpo_show).
+GPO_OS_FILE = "/var/lib/adlab/gpo-os.json"   # host, root-only: {GUID: {os, set_at}}
+
+def _norm_gpo_os(v):
+    m = {"windows": "Windows", "win": "Windows", "linux": "Linux"}
+    k = (v or "").strip().lower()
+    if k not in m:
+        raise Fail("os must be one of: %s" % ", ".join(OS_TYPES))
+    return m[k]
+
+def _read_gpo_os_map():
+    try:
+        with open(GPO_OS_FILE) as f:
+            t = json.load(f)
+            return t if isinstance(t, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _write_gpo_os_map(m):
+    os.makedirs(os.path.dirname(GPO_OS_FILE), exist_ok=True)
+    with open(GPO_OS_FILE, "w") as f:
+        json.dump(m, f, indent=2, sort_keys=True)
+    os.chmod(GPO_OS_FILE, 0o600)
+
+def _set_gpo_os(guid, os_):
+    m = _read_gpo_os_map()
+    m[guid.upper()] = {"os": os_, "set_at": _now_iso()}
+    _write_gpo_os_map(m)
+
+def _clear_gpo_os(guid):
+    m = _read_gpo_os_map()
+    if m.pop((guid or "").upper(), None) is not None:
+        _write_gpo_os_map(m)
+
+def _declared_gpo_os(guid):
+    """The operator-declared OS scope for a GPO, or None. Cheap (no container)."""
+    e = _read_gpo_os_map().get((guid or "").upper())
+    return e.get("os") if isinstance(e, dict) else None
+
+# Registry roots consumed by BOTH Windows and the Linux GP clients, so they are
+# OS-agnostic and allowed in a GPO of either scope. Certificate Auto-Enrollment
+# is Microsoft-rooted yet read by native Windows AND by samba's
+# gp_cert_auto_enroll_ext AND by adsys (which reuses samba's implementation) --
+# the one documented cross-OS setting.
+SHARED_REG_ROOTS = ("software\\policies\\microsoft\\cryptography\\autoenrollment",
+                    "software\\policies\\microsoft\\cryptography\\policyservers")
+
+def _setting_os(keyname):
+    """Which OS a registry.pol setting targets, by key namespace:
+    'Linux' | 'Windows' | 'shared' (applies on both, e.g. cert auto-enrollment)."""
+    k = (keyname or "").lower().replace("/", "\\")
+    if any(k == r or k.startswith(r + "\\") for r in SHARED_REG_ROOTS):
+        return "shared"
+    return "Linux" if _is_linux_regkey(keyname) else "Windows"
+
+def _enforce_gpo_scope(scope, entries, guid):
+    """Refuse registry entries whose OS crosses a KNOWN scope. entries is a list
+    of {keyname,...}. 'shared' settings are allowed in either scope; a None scope
+    (undeclared GPO) is not enforced."""
+    if not scope:
+        return
+    bad = sorted({e.get("keyname", "?") for e in entries
+                  if _setting_os(e.get("keyname")) not in (scope, "shared")})
+    if bad:
+        other = "Linux" if scope == "Windows" else "Windows"
+        shown = ", ".join(bad[:5]) + (" …" if len(bad) > 5 else "")
+        raise Fail("GPO %s is scoped %s-exclusive; refusing %d %s-targeted "
+                   "setting(s): %s. Use a %s GPO for these, or retag this GPO "
+                   "with gpo-set-os." % (guid, scope, len(bad), other, shown, other))
+
+def _infer_gpo_os(dc, guid):
+    """(os, source) inferred from a GPO's SYSVOL contents when no scope is
+    declared. source: inferred | mixed | unknown. Reads the container, so this
+    is DISPLAY-only (v_gpo_show/gpo-set-os), never on the write hot path."""
+    kinds = {_setting_os(e.get("keyname")) for e in _read_registry_pol(dc, guid)}
+    lin, win = "Linux" in kinds, "Windows" in kinds
+    if not lin:                       # VGP/samba Unix CSE artifacts are Linux too
+        ev = _gpo_linux_evidence(dc, guid)
+        lin = bool(ev.get("cse_artifacts") or ev.get("registry_keys"))
+    if lin and not win:
+        return "Linux", "inferred"
+    if win and not lin:
+        return "Windows", "inferred"
+    if lin and win:
+        return None, "mixed"
+    return None, "unknown"
+
+def _resolve_gpo_os(dc, guid):
+    """(os, source): the declared scope if set, else inferred from SYSVOL."""
+    d = _declared_gpo_os(guid)
+    if d:
+        return d, "declared"
+    return _infer_gpo_os(dc, guid)
+
+
 def v_gpo_list(a):
     d = pdc_emulator()
     rc, out, err = podman_auth(d, "samba-tool gpo listall")
     if rc != 0:
         raise Fail(err.strip() or out.strip())
-    return {"pdc_emulator": d, "gpos": parse_gpo_listall(out)}
+    gpos = parse_gpo_listall(out)
+    osmap = _read_gpo_os_map()
+    for g in gpos:                    # cheap: declared scope only (no per-GPO read)
+        e = osmap.get((g.get("gpo") or "").upper())
+        g["os_scope"] = e.get("os") if isinstance(e, dict) else ""
+    return {"pdc_emulator": d, "gpos": gpos, "os_types": list(OS_TYPES)}
 
 def v_gpo_create(a):
     d = pdc_emulator()
+    os_ = _norm_gpo_os(a["os"])
     rc, out, err = podman_auth(d, "samba-tool gpo create " + shq(a["name"]))
     if rc != 0:
         raise Fail(err.strip() or out.strip())
     m = re.search(r'\{[0-9A-Fa-f-]{36}\}', out)
-    return {"created": a["name"], "gpo": m.group(0) if m else "", "on": d,
-            "note": "SYSVOL replication propagates it within 5 minutes"}
+    guid = m.group(0) if m else ""
+    if guid:
+        _set_gpo_os(guid, os_)
+    return {"created": a["name"], "gpo": guid, "os": os_, "on": d,
+            "note": "Scoped %s-exclusive: only %s-targeted settings may be "
+                    "written to it. SYSVOL replication propagates it within 5 "
+                    "minutes." % (os_, os_)}
+
+def v_gpo_set_os(a):
+    """Declare (or change) a GPO's OS scope — for GPOs the plugin did not create,
+    or to retag. Verifies the GPO exists on the PDC emulator first."""
+    d = pdc_emulator()
+    gpo = _gpo_guid(a)
+    os_ = _norm_gpo_os(a["os"])
+    rc, out, err = podman_auth(d, "samba-tool gpo show " + shq(gpo))
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-300:] or ("no such GPO %s" % gpo))
+    _set_gpo_os(gpo, os_)
+    return {"gpo": gpo, "os": os_, "on": d,
+            "note": "Scoped %s-exclusive; the write verbs now refuse "
+                    "non-%s settings." % (os_, os_)}
 
 def v_gpo_delete(a):
     d = pdc_emulator()
     rc, out, err = podman_auth(d, "samba-tool gpo del " + shq(a["gpo"]))
     if rc != 0:
         raise Fail(err.strip() or out.strip())
+    _clear_gpo_os(a["gpo"])
     return {"deleted": a["gpo"], "on": d}
 
 def v_gpo_link(a):
@@ -2291,6 +2429,8 @@ def v_gpo_settings_apply(a):
     d = pdc_emulator()
     gpo = _gpo_guid(a)
     entries = _validate_entries(a["entries"])
+    scope = _declared_gpo_os(gpo)
+    _enforce_gpo_scope(scope, entries, gpo)
     cmd = "samba-tool gpo load %s --machine-ext-name=%s --user-ext-name=%s" % (
         shq(gpo), shq(DEFAULT_REG_CSE), shq(DEFAULT_REG_CSE))
     if str(a.get("replace", "")).lower() in ("1", "yes", "true"):
@@ -2298,7 +2438,7 @@ def v_gpo_settings_apply(a):
     rc, out, err = podman_auth(d, cmd, stdin=json.dumps(entries), timeout=180)
     if rc != 0:
         raise Fail((err.strip() or out.strip())[-600:])
-    return {"gpo": gpo, "on": d, "applied": len(entries),
+    return {"gpo": gpo, "on": d, "applied": len(entries), "os_scope": scope or "",
             "note": "registry.pol updated; SYSVOL replicates within 5 minutes"}
 
 def v_gpo_settings_remove(a):
@@ -2551,6 +2691,7 @@ def v_gpo_template_stack(a):
         layers.append({"source": s, "settings": len(ent)})
     if not merged:
         raise Fail("no registry settings found on the source GPO(s)")
+    _enforce_gpo_scope(_declared_gpo_os(target), merged, target)
     cmd = "samba-tool gpo load %s --machine-ext-name=%s --user-ext-name=%s" % (
         shq(target), shq(DEFAULT_REG_CSE), shq(DEFAULT_REG_CSE))
     payload = [{"keyname": e["keyname"], "valuename": e["valuename"],
@@ -2599,6 +2740,10 @@ def v_gpo_pref_set(a):
     cse = a["cse"]
     if cse not in GPO_CSES:
         raise Fail("cse must be one of: %s" % ", ".join(GPO_CSES))
+    # samba Unix CSE preferences are Linux-only; never let them onto a Windows GPO.
+    if _declared_gpo_os(gpo) == "Windows":
+        raise Fail("GPO %s is scoped Windows-exclusive; preferences (samba Unix "
+                   "CSEs) are Linux-only. Use a Linux GPO." % gpo)
     cmd = "samba-tool gpo manage %s set %s" % (cse, shq(gpo))
     if a.get("entry"):
         cmd += " " + shq(a["entry"])
@@ -2625,7 +2770,9 @@ def v_gpo_show(a):
             meta[m.group(1).strip().lower().replace(" ", "_")] = m.group(2).strip()
     rc2, lout, _ = podman_auth(d, "samba-tool gpo listcontainers " + shq(gpo))
     links = re.findall(r'DN:\s*(.+)', lout) if rc2 == 0 else []
+    scope, source = _resolve_gpo_os(d, gpo)
     return {"gpo": gpo, "on": d, "meta": meta, "links": links,
+            "os_scope": scope or "", "os_source": source,
             "settings": _read_registry_pol(d, gpo)}
 
 # ---- sites & replication --------------------------------------------------
@@ -4270,9 +4417,17 @@ VERBS = {
                                arg("given", required=False), arg("surname", required=False),
                                arg("description", required=False)]},
 
-    "gpo-list":      {"fn": v_gpo_list, "group": "gpo", "help": "All GPOs (queried on the PDC emulator)."},
+    "gpo-list":      {"fn": v_gpo_list, "group": "gpo", "help": "All GPOs (queried on the PDC emulator), each with its declared OS scope."},
     "gpo-create":    {"fn": v_gpo_create, "group": "gpo",
-                      "help": "Create a GPO on the PDC emulator.", "args": [arg("name")]},
+                      "help": "Create a GPO on the PDC emulator, scoped to one OS (Windows- or Linux-exclusive): only that OS's settings may be written to it, so a Linux setting never applies on Windows and vice versa.",
+                      "args": [arg("name"),
+                               arg("os", "enum", choices=OS_TYPES,
+                                   help_="OS scope — the GPO accepts only this OS's settings")]},
+    "gpo-set-os":    {"fn": v_gpo_set_os, "group": "gpo",
+                      "help": "Declare (or change) an existing GPO's OS scope (Windows- or Linux-exclusive), opting it into cross-OS write enforcement.",
+                      "args": [arg("gpo", help_="{GUID}"),
+                               arg("os", "enum", choices=OS_TYPES,
+                                   help_="OS scope — the GPO accepts only this OS's settings")]},
     "gpo-delete":    {"fn": v_gpo_delete, "group": "gpo", "danger": True,
                       "help": "Delete a GPO.", "args": [arg("gpo", help_="{GUID}")]},
     "gpo-link":      {"fn": v_gpo_link, "group": "gpo",

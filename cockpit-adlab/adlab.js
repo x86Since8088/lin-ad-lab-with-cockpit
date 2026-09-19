@@ -1643,11 +1643,14 @@
             "Template settings become registry.pol via `gpo load`; preferences use " +
             "samba CSEs (`gpo manage`); SYSVOL replicates within 5 minutes. " +
             "The ADMX central store carries both Windows and Linux (Ubuntu/adsys) " +
-            "administrative templates — open it to install or review Linux policy."));
+            "administrative templates — open it to install or review Linux policy. " +
+            "Each GPO is created Windows- or Linux-exclusive (the OS column): only " +
+            "that OS's settings may be written to it, so a Linux setting never " +
+            "applies on Windows and vice versa. Use “set OS” to scope a legacy GPO."));
         var holder = el("div", "al-grid"); m.appendChild(holder);
         var fGpo = slotCard(holder, "Group Policy objects", true);
         run("gpo-list").then(function (r) {
-            fGpo(emptyOr(r.gpos, ["GPO", "display name", "ver", "actions"], function (g) {
+            fGpo(emptyOr(r.gpos, ["GPO", "display name", "OS", "ver", "actions"], function (g) {
                 var box = el("div", "al-actions");
                 var edit = el("button", "al-btn", "edit");
                 edit.addEventListener("click", function () { openModal("gpo-edit", { target: g.gpo }); });
@@ -1661,11 +1664,16 @@
                 var prefs = el("button", "al-btn secondary", "preferences");
                 prefs.addEventListener("click", function () { openModal("gpo-prefs", { target: g.gpo }); });
                 box.appendChild(prefs);
+                box.appendChild(actionButton("set OS", "gpo-set-os", { gpo: g.gpo }));
                 box.appendChild(actionButton("backup", "gpo-backup", { gpo: g.gpo }));
                 box.appendChild(actionButton("link", "gpo-link", { gpo: g.gpo }));
                 box.appendChild(actionButton("unlink", "gpo-unlink", { gpo: g.gpo }));
                 box.appendChild(actionButton("delete", "gpo-delete", { gpo: g.gpo }));
-                return [el("kbd", "al", g.gpo), g.display_name, g.version, box];
+                // OS scope: Windows-/Linux-exclusive (blank = untyped legacy GPO)
+                var osCell = g.os_scope
+                    ? el("span", "badge " + (g.os_scope === "Linux" ? "lnx" : "win"), g.os_scope)
+                    : el("span", "hint", "—");
+                return [el("kbd", "al", g.gpo), g.display_name, osCell, g.version, box];
             }, "no GPOs"), "Group Policy objects (on " + r.pdc_emulator + ")");
         }).catch(function (e) { fGpo(el("div", "al-alert err", String(e))); });
     }
