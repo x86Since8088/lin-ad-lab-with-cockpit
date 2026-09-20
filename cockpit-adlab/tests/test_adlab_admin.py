@@ -423,6 +423,31 @@ class TestDomains(Base):
         self.assertEqual(out["trusts"][0]["direction"], "BOTH")
         self.assertEqual(out["trusts"][0]["type"], "Forest")
 
+    def test_domain_remove_keeps_shared_parent_network(self):
+        # a child domain shares the parent's network; removing it must NOT tear
+        # down that network (only its DCs).
+        self.fake.lab_up()
+        realm = "CORP.AD.EDT1.LAB"
+        parent = mod.PRIMARY_LAB["REALM"]
+        self.fake.on(lambda a: a[:3] == ["podman", "ps", "-a"]
+                     and any("{{.Names}}\t" in x for x in a), out="corp-dc1\t%s\n" % realm)
+        self.fake.on(lambda a: a[:3] == ["podman", "ps", "-a"]
+                     and ("label=adlab.realm=%s" % realm) in a, out="corp-dc1\n")
+        labels = {"adlab.realm": realm, "adlab.slug": "corp", "adlab.domain_nb": "CORP",
+                  "adlab.net": mod.PRIMARY_LAB["NET"],
+                  "adlab.net_prefix": mod.PRIMARY_LAB["NET_PREFIX"],
+                  "adlab.dc_base": "50", "adlab.parent": parent}
+        for k, v in labels.items():
+            self.fake.on((lambda key, val: (lambda a: a[:2] == ["podman", "inspect"]
+                          and any(('"%s"' % key) in x for x in a)))(k, v), out=v + "\n")
+        self.fake.on(lambda a: a[:2] == ["podman", "rm"], out="")
+        rc, out = self.call_main(["domain-remove", "--realm", realm])
+        self.assertEqual(rc, 0, out)
+        self.assertIsNone(out["network_removed"])
+        self.assertEqual(out["network_kept"], mod.PRIMARY_LAB["NET"])
+        self.assertEqual(self.fake.argv_containing("network", "rm"), [])  # never removed
+        self.assertIn("corp-dc1", out["removed_dcs"])
+
     def test_trust_create_happy_path(self):
         self.fake.lab_up()
         self._one_extra_domain(realm="CORP.AD.EDT1.LAB", slug="corp",

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.10.1 - 2026-09-19
+
+Safety fix for the parent-domain feature: `domain-remove` now removes the
+domain's podman network **only if the domain owns it**. A child domain (created
+with `domain-add --parent`) shares the parent's network, so tearing the child
+down must not delete the shared network — it now reports `network_kept` and
+leaves it. Regression test added; 224 tests.
+
 ## 1.10.0 - 2026-09-19
 
 Domain provisioning can specify a parent domain to join a forest. Since samba AD
