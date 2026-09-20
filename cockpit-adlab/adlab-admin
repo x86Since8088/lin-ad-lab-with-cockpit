@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.11.1"
+VERSION = "1.12.0"
 
 
 def _require_config():
@@ -3874,6 +3874,509 @@ def v_domain_remove(a):
         result.update({"removed_dcs": removed, "network_removed": net})
     return result
 
+# ---- AD PKI: CA node + domain-integrated templates + issuance -------------
+# Samba provisions the Public Key Services container tree and the PKI schema but
+# creates NO CA and NO templates, and samba is a certificate CONSUMER only (never
+# a CA). So this splits cleanly in two:
+#   * a CA NODE (a dedicated openssl-CA container with its own self-signed root)
+#     that issues leaf certs per template — deploy/status/destroy/issue below;
+#   * DOMAIN INTEGRATION via native directory writes on the PDC emulator:
+#     publish the CA (certificationAuthority + NTAuthCertificates + AIA +
+#     pKIEnrollmentService) and create real pKICertificateTemplate objects.
+# Enrollment is manual (via pki-issue); MS-WCCE/XCEP autoenrollment needs a
+# Windows/EJBCA CA and is out of scope for a lab.
+PKI_CA_CTR = "adlab-ca"
+PKI_CA_DIR = "/var/lib/adlab/ca"          # host: CA material (bind-mounted at /ca)
+PKI_CA_IP_OFFSET = 60                      # adlab-ca at <primary prefix>.60
+# EKU OIDs
+EKU = {"serverAuth": "1.3.6.1.5.5.7.3.1", "clientAuth": "1.3.6.1.5.5.7.3.2",
+       "codeSigning": "1.3.6.1.5.5.7.3.3", "emailProtection": "1.3.6.1.5.5.7.3.4",
+       "efs": "1.3.6.1.4.1.311.10.3.4", "smartcardLogon": "1.3.6.1.4.1.311.20.2.2",
+       "kdcAuth": "1.3.6.1.5.2.3.5"}
+# The standard template set — one intent -> issuance policy (openssl) AND the
+# domain-integrated pKICertificateTemplate object (same policy, AD attributes).
+PKI_TEMPLATES = {
+    "DomainController": {"display": "Domain Controller", "obj_class": "computer",
+        "eku": ["serverAuth", "clientAuth"], "ku": "digitalSignature,keyEncipherment",
+        "key": 2048, "days": 365, "purpose": "DC LDAPS/GC server+client auth"},
+    "WebServer": {"display": "Web Server", "obj_class": "computer",
+        "eku": ["serverAuth"], "ku": "digitalSignature,keyEncipherment",
+        "key": 2048, "days": 365, "purpose": "TLS server certificate"},
+    "Workstation": {"display": "Workstation Authentication", "obj_class": "computer",
+        "eku": ["clientAuth"], "ku": "digitalSignature,keyEncipherment",
+        "key": 2048, "days": 365, "purpose": "Machine client authentication"},
+    "User": {"display": "User", "obj_class": "user",
+        "eku": ["clientAuth", "efs", "emailProtection"], "ku": "digitalSignature,keyEncipherment",
+        "key": 2048, "days": 365, "purpose": "User client auth + EFS + email"},
+    "SmartcardLogon": {"display": "Smartcard Logon", "obj_class": "user",
+        "eku": ["smartcardLogon", "clientAuth"], "ku": "digitalSignature,keyEncipherment",
+        "key": 2048, "days": 365, "purpose": "PKINIT / smartcard logon (needs NTAuth)"},
+    "CodeSigning": {"display": "Code Signing", "obj_class": "user",
+        "eku": ["codeSigning"], "ku": "digitalSignature",
+        "key": 3072, "days": 1095, "purpose": "Script/agent code signing"},
+}
+
+def _ca_run(body, stdin=None, timeout=120):
+    """Run a bash body inside the CA node container (material at /ca)."""
+    return podman(PKI_CA_CTR, ["bash", "-c", body], stdin=stdin, timeout=timeout)
+
+def _ca_deployed():
+    return ctr_state(PKI_CA_CTR) == "running"
+
+def _ca_has_root():
+    if not _ca_deployed():
+        return False
+    rc, _, _ = _ca_run("test -f /ca/ca.crt")
+    return rc == 0
+
+def _ca_cert_pem():
+    rc, out, _ = _ca_run("cat /ca/ca.crt 2>/dev/null")
+    return out if rc == 0 and "BEGIN CERT" in (out or "") else ""
+
+def v_pki_ca_deploy(a):
+    """Deploy the CA node: an openssl-CA container on the primary network with a
+    persistent host CA directory, and generate a self-signed Enterprise Root CA
+    if none exists. Idempotent."""
+    cn = (a.get("cn") or ("%s Enterprise Root CA" % PRIMARY_LAB["REALM"])).strip()
+    days = int(a.get("days", 3650) or 3650)
+    keybits = int(a.get("key_bits", 4096) or 4096)
+    os.makedirs(PKI_CA_DIR, exist_ok=True)
+    ip = "%s.%d" % (PRIMARY_LAB["NET_PREFIX"], PKI_CA_IP_OFFSET)
+    fqdn = "ca." + PRIMARY_LAB["DOMAIN_DNS"]
+    if ctr_state(PKI_CA_CTR) == "missing":
+        rc, out, err = RUN.run([
+            "podman", "run", "-d", "--name", PKI_CA_CTR, "--hostname", fqdn,
+            "--network", PRIMARY_LAB["NET"], "--ip", ip,
+            "--entrypoint", "bash",
+            "-v", PKI_CA_DIR + ":/ca",
+            PRIMARY_LAB["IMG_DC"], "-c", "sleep infinity"], timeout=120)
+        if rc != 0:
+            raise Fail("CA node run failed: " + (err.strip() or out.strip()))
+    elif ctr_state(PKI_CA_CTR) != "running":
+        RUN.run(["podman", "start", PKI_CA_CTR])
+    # generate the root CA if absent
+    body = (
+        "set -e; mkdir -p /ca/issued /ca/csr; cd /ca; "
+        "if [ ! -f ca.crt ]; then "
+        "openssl genrsa -out ca.key %d >/dev/null 2>&1; chmod 600 ca.key; "
+        "openssl req -x509 -new -key ca.key -sha256 -days %d "
+        "-subj %s "
+        "-addext 'basicConstraints=critical,CA:TRUE,pathlen:1' "
+        "-addext 'keyUsage=critical,keyCertSign,cRLSign' "
+        "-addext 'subjectKeyIdentifier=hash' -out ca.crt; "
+        "touch index.txt; echo 1000 > serial; echo 1000 > crlnumber; "
+        "echo created; else echo exists; fi"
+    ) % (keybits, days, shq("/O=%s/CN=%s" % ("EDT1 Lab", cn)))
+    rc, out, err = _ca_run(body, timeout=180)
+    if rc != 0:
+        raise Fail("CA init failed: " + (err.strip() or out.strip())[-400:])
+    return {"ca_node": PKI_CA_CTR, "ip": ip, "fqdn": fqdn, "cn": cn,
+            "root": ("created" if "created" in out else "already present"),
+            "note": "Publish it into AD with pki-ca-publish so members trust it, "
+                    "then seed templates (pki-template-seed) and issue (pki-issue)."}
+
+def _cert_field(pem_body, flag):
+    rc, out, _ = _ca_run("echo %s | base64 -d | openssl x509 -noout %s 2>/dev/null"
+                         % (shq(pem_body), flag))
+    return (out or "").strip()
+
+def v_pki_ca_status(a):
+    """CA node + root-CA state, and whether the CA is published into AD."""
+    deployed = _ca_deployed()
+    root = _ca_has_root()
+    info = {}
+    if root:
+        for k, flag in (("subject", "-subject"), ("issuer", "-issuer"),
+                        ("not_after", "-enddate"), ("fingerprint", "-fingerprint -sha256")):
+            rc, out, _ = _ca_run("openssl x509 -in /ca/ca.crt -noout %s 2>/dev/null" % flag)
+            info[k] = (out or "").strip()
+        rc, cnt, _ = _ca_run("ls /ca/issued/*.crt 2>/dev/null | wc -l")
+        info["issued_count"] = int((cnt or "0").split()[0] or 0) if (cnt or "").strip() else 0
+    d = pdc_emulator()
+    pub = _pki_ad_state(d)
+    return {"ca_node": PKI_CA_CTR, "deployed": deployed, "root_ca": root,
+            "ca_info": info, "ad": pub}
+
+def v_pki_ca_destroy(a):
+    """Remove the CA node container (its material stays on the host unless
+    --wipe true)."""
+    RUN.run(["podman", "rm", "-f", PKI_CA_CTR])
+    wiped = False
+    if str(a.get("wipe", "")).lower() in ("1", "yes", "true"):
+        import shutil
+        shutil.rmtree(PKI_CA_DIR, ignore_errors=True)
+        wiped = True
+    return {"removed": PKI_CA_CTR, "material_wiped": wiped}
+
+def v_pki_issue(a):
+    """Issue a leaf certificate from the CA node per a template's policy
+    (key size, EKU, key usage, validity). Returns the cert PEM; the private key
+    is written on the CA node under /ca/issued and returned once."""
+    if not _ca_has_root():
+        raise Fail("CA node not deployed — run pki-ca-deploy first")
+    tname = a["template"]
+    tpl = PKI_TEMPLATES.get(tname)
+    if not tpl:
+        raise Fail("template must be one of: %s" % ", ".join(PKI_TEMPLATES))
+    cn = a["cn"].strip()
+    name = re.sub(r'[^A-Za-z0-9._-]', "_", cn) + "-" + tname.lower()
+    sans = (a.get("sans") or "").strip()   # e.g. DNS:web01.ad.edt1.lab,IP:172.15.4.5
+    days = int(a.get("days", tpl["days"]) or tpl["days"])
+    eku = ",".join(EKU[e] for e in tpl["eku"])
+    ext = ("basicConstraints=critical,CA:FALSE\\n"
+           "keyUsage=critical,%s\\n"
+           "extendedKeyUsage=%s\\n"
+           "subjectKeyIdentifier=hash\\n"
+           "authorityKeyIdentifier=keyid,issuer\\n") % (tpl["ku"], eku)
+    if sans:
+        ext += "subjectAltName=%s\\n" % sans
+    body = (
+        "set -e; cd /ca; "
+        "openssl req -new -newkey rsa:%d -nodes -keyout issued/%s.key -out csr/%s.csr "
+        "-subj %s >/dev/null 2>&1; "
+        "printf %s > /tmp/%s.ext; "
+        "openssl x509 -req -in csr/%s.csr -CA ca.crt -CAkey ca.key -CAcreateserial "
+        "-days %d -sha256 -extfile /tmp/%s.ext -out issued/%s.crt >/dev/null 2>&1; "
+        "rm -f /tmp/%s.ext; cat issued/%s.crt"
+    ) % (tpl["key"], name, name,
+         shq("/O=EDT1 Lab/CN=%s" % cn), shq(ext), name,
+         name, days, name, name, name, name)
+    rc, out, err = _ca_run(body, timeout=120)
+    if rc != 0 or "BEGIN CERT" not in (out or ""):
+        raise Fail("issue failed: " + (err.strip() or out.strip())[-400:])
+    return {"issued": cn, "template": tname, "eku": tpl["eku"], "days": days,
+            "sans": sans, "key_bits": tpl["key"], "cert_pem": out.strip(),
+            "key_on_node": "/ca/issued/%s.key" % name}
+
+def v_pki_cert_list(a):
+    """Certificates the CA node has issued (subject + validity)."""
+    if not _ca_deployed():
+        raise Fail("CA node not deployed")
+    rc, out, _ = _ca_run(
+        "cd /ca/issued 2>/dev/null && for c in *.crt; do "
+        "[ -e \"$c\" ] || continue; "
+        "s=$(openssl x509 -in \"$c\" -noout -subject 2>/dev/null); "
+        "e=$(openssl x509 -in \"$c\" -noout -enddate 2>/dev/null); "
+        "n=$(openssl x509 -in \"$c\" -noout -serial 2>/dev/null); "
+        "echo \"$c|$s|$e|$n\"; done")
+    certs = []
+    for ln in (out or "").splitlines():
+        p = ln.split("|")
+        if len(p) >= 4:
+            certs.append({"file": p[0],
+                          "subject": p[1].replace("subject=", "").strip(),
+                          "not_after": p[2].replace("notAfter=", "").strip(),
+                          "serial": p[3].replace("serial=", "").strip()})
+    return {"ca_node": PKI_CA_CTR, "certs": certs, "count": len(certs)}
+
+# ---- AD directory integration (Public Key Services, on the PDC emulator) ---
+# The container tree samba provisions under the Configuration NC. Objects here
+# are forest-wide and replicate to every DC.
+def _pks_dn():       return "CN=Public Key Services,CN=Services," + config_dn()
+def _cas_dn():       return "CN=Certification Authorities," + _pks_dn()
+def _ntauth_dn():    return "CN=NTAuthCertificates," + _pks_dn()
+def _aia_dn():       return "CN=AIA," + _pks_dn()
+def _enroll_dn():    return "CN=Enrollment Services," + _pks_dn()
+def _templates_dn(): return "CN=Certificate Templates," + _pks_dn()
+
+def _ca_der_b64():
+    rc, out, _ = _ca_run("openssl x509 -in /ca/ca.crt -outform DER 2>/dev/null | base64 -w0")
+    return (out or "").strip()
+
+def _ca_subject_dn():
+    rc, out, _ = _ca_run("openssl x509 -in /ca/ca.crt -noout -subject -nameopt RFC2253 2>/dev/null")
+    return (out or "").replace("subject=", "").strip()
+
+def _ca_subject_cn():
+    m = re.search(r'CN=([^,]+)', _ca_subject_dn())
+    return m.group(1).strip() if m else ""
+
+def _ca_crl_der_b64():
+    """Generate (idempotently) an empty CRL on the CA node and return its DER
+    base64 — certificationAuthority objects mustContain the two CRL attributes."""
+    body = (
+        "set -e; cd /ca; "
+        "if [ ! -f crl.cnf ]; then cat > crl.cnf <<'CNF'\n"
+        "[ca]\ndefault_ca = CA\n[CA]\ndir = /ca\ndatabase = /ca/index.txt\n"
+        "certificate = /ca/ca.crt\nprivate_key = /ca/ca.key\n"
+        "crlnumber = /ca/crlnumber\ndefault_md = sha256\ndefault_crl_days = 3650\n"
+        "CNF\nfi; "
+        "openssl ca -config crl.cnf -gencrl -out crl.pem >/dev/null 2>&1; "
+        "openssl crl -in crl.pem -outform DER | base64 -w0")
+    rc, out, err = _ca_run(body)
+    if rc != 0 or not (out or "").strip():
+        raise Fail("CRL generation failed: " + (err.strip() or out.strip())[-300:])
+    return out.strip()
+
+def _ldb_exists(d, dn):
+    rc, out, _ = podman(d, ["ldbsearch", "-H", SAM, "--cross-ncs", "-b", dn,
+                            "-s", "base", "dn"])
+    return rc == 0 and "dn:" in (out or "")
+
+def _pki_ad_state(d=None):
+    d = d or pdc_emulator()
+    caname = _ca_subject_cn() if _ca_has_root() else ""
+    st = {"config_root": _pks_dn(),
+          "root_trust": (_ldb_exists(d, "CN=%s,%s" % (caname, _cas_dn())) if caname else False),
+          "aia": (_ldb_exists(d, "CN=%s,%s" % (caname, _aia_dn())) if caname else False),
+          "ntauth": _ldb_exists(d, _ntauth_dn()),
+          "enrollment_service": (_ldb_exists(d, "CN=%s,%s" % (caname, _enroll_dn())) if caname else False)}
+    rc, out, _ = podman(d, ["ldbsearch", "-H", SAM, "--cross-ncs", "-b", _templates_dn(),
+                            "(objectClass=pKICertificateTemplate)", "cn"])
+    st["templates"] = len(re.findall(r'(?mi)^cn:', out or "")) if rc == 0 else 0
+    return st
+
+def _upsert_ca_object(d, dn, cn, der, crl):
+    """Create (or refresh the cert on) a certificationAuthority object."""
+    if _ldb_exists(d, dn):
+        ldif = ("dn: %s\nchangetype: modify\nreplace: cACertificate\n"
+                "cACertificate:: %s\n") % (dn, der)
+        rc, out, err = podman(d, ["ldbmodify", "-H", SAM], stdin=ldif)
+        if rc != 0:
+            raise Fail("refresh %s failed: %s" % (dn, err.strip() or out.strip()))
+        return {"dn": dn, "action": "refreshed"}
+    ldif = ("dn: %s\nchangetype: add\nobjectClass: certificationAuthority\n"
+            "cn: %s\ncACertificate:: %s\nauthorityRevocationList:: %s\n"
+            "certificateRevocationList:: %s\n") % (dn, cn, der, crl, crl)
+    rc, out, err = podman(d, ["ldbadd", "-H", SAM], stdin=ldif)
+    if rc != 0:
+        raise Fail("create %s failed: %s" % (dn, err.strip() or out.strip()))
+    return {"dn": dn, "action": "created"}
+
+def _ntauth_add(d, der, crl):
+    """NTAuthCertificates is one object whose cACertificate is the multi-valued
+    set of CAs trusted to issue smartcard/PKINIT logon certs. Create it or append."""
+    dn = _ntauth_dn()
+    if _ldb_exists(d, dn):
+        # append only if not already present
+        rc, out, _ = podman(d, ["ldbsearch", "-H", SAM, "--cross-ncs", "-b", dn,
+                                "-s", "base", "cACertificate"])
+        have = der in (out or "").replace("\n ", "")
+        if have:
+            return {"dn": dn, "action": "already-present"}
+        ldif = ("dn: %s\nchangetype: modify\nadd: cACertificate\n"
+                "cACertificate:: %s\n") % (dn, der)
+        rc, out, err = podman(d, ["ldbmodify", "-H", SAM], stdin=ldif)
+        if rc != 0:
+            raise Fail("NTAuth append failed: %s" % (err.strip() or out.strip()))
+        return {"dn": dn, "action": "appended"}
+    ldif = ("dn: %s\nchangetype: add\nobjectClass: certificationAuthority\n"
+            "cn: NTAuthCertificates\ncACertificate:: %s\n"
+            "authorityRevocationList:: %s\ncertificateRevocationList:: %s\n"
+            ) % (dn, der, crl, crl)
+    rc, out, err = podman(d, ["ldbadd", "-H", SAM], stdin=ldif)
+    if rc != 0:
+        raise Fail("NTAuth create failed: %s" % (err.strip() or out.strip()))
+    return {"dn": dn, "action": "created"}
+
+def _upsert_enrollment(d, caname, der, casubj, dnshost):
+    dn = "CN=%s,%s" % (caname, _enroll_dn())
+    # certificateTemplates = whatever templates already exist (else the standard set)
+    rc, out, _ = podman(d, ["ldbsearch", "-H", SAM, "--cross-ncs", "-b", _templates_dn(),
+                            "(objectClass=pKICertificateTemplate)", "cn"])
+    tpls = re.findall(r'(?mi)^cn:\s*(\S+)', out or "") or list(PKI_TEMPLATES)
+    tlines = "".join("certificateTemplates: %s\n" % t for t in tpls)
+    if _ldb_exists(d, dn):
+        ldif = ("dn: %s\nchangetype: modify\nreplace: cACertificate\n"
+                "cACertificate:: %s\n") % (dn, der)
+        rc, out, err = podman(d, ["ldbmodify", "-H", SAM], stdin=ldif)
+        if rc != 0:
+            raise Fail("enrollment refresh failed: %s" % (err.strip() or out.strip()))
+        return {"dn": dn, "action": "refreshed", "templates": tpls}
+    ldif = ("dn: %s\nchangetype: add\nobjectClass: pKIEnrollmentService\n"
+            "cn: %s\ndisplayName: %s\ndNSHostName: %s\n"
+            "cACertificate:: %s\ncACertificateDN: %s\n%s"
+            ) % (dn, caname, caname, dnshost, der, casubj, tlines)
+    rc, out, err = podman(d, ["ldbadd", "-H", SAM], stdin=ldif)
+    if rc != 0:
+        raise Fail("enrollment create failed: %s" % (err.strip() or out.strip()))
+    return {"dn": dn, "action": "created", "templates": tpls}
+
+def v_pki_ca_publish(a):
+    """Publish the CA node's root into AD so the whole forest trusts it: the
+    root-trust object (Certification Authorities), the AIA copy, the
+    NTAuthCertificates entry (enables cert logon), and the Enrollment Services
+    object. Idempotent — re-running refreshes the certs. Writes on the PDC."""
+    if not _ca_has_root():
+        raise Fail("CA node not deployed — run pki-ca-deploy first")
+    d = pdc_emulator()
+    der, crl = _ca_der_b64(), _ca_crl_der_b64()
+    caname, casubj = _ca_subject_cn(), _ca_subject_dn()
+    dnshost = "ca." + PRIMARY_LAB["DOMAIN_DNS"]
+    steps = [_upsert_ca_object(d, "CN=%s,%s" % (caname, _cas_dn()), caname, der, crl),
+             _upsert_ca_object(d, "CN=%s,%s" % (caname, _aia_dn()), caname, der, crl),
+             _ntauth_add(d, der, crl),
+             _upsert_enrollment(d, caname, der, casubj, dnshost)]
+    return {"published": caname, "on": d, "steps": steps, "ad": _pki_ad_state(d)}
+
+def v_pki_ca_unpublish(a):
+    """Remove the CA's AD registration (root-trust, AIA, enrollment service).
+    Leaves the NTAuthCertificates container in place unless --ntauth true (it
+    may hold other CAs)."""
+    if not _ca_has_root():
+        raise Fail("CA node not deployed")
+    d = pdc_emulator()
+    caname = _ca_subject_cn()
+    removed = []
+    for dn in ("CN=%s,%s" % (caname, _cas_dn()), "CN=%s,%s" % (caname, _aia_dn()),
+               "CN=%s,%s" % (caname, _enroll_dn())):
+        if _ldb_exists(d, dn):
+            rc, out, err = podman(d, ["ldbdel", "-H", SAM, dn])
+            if rc == 0:
+                removed.append(dn)
+    if str(a.get("ntauth", "")).lower() in ("1", "yes", "true") and _ldb_exists(d, _ntauth_dn()):
+        rc, out, err = podman(d, ["ldbdel", "-H", SAM, _ntauth_dn()])
+        if rc == 0:
+            removed.append(_ntauth_dn())
+    return {"unpublished": caname, "on": d, "removed": removed}
+
+def v_pki_ntauth_list(a):
+    """The CAs currently in NTAuthCertificates (trusted for smartcard/PKINIT
+    logon) with each cert's subject and validity."""
+    d = pdc_emulator()
+    if not _ldb_exists(d, _ntauth_dn()):
+        return {"ntauth_dn": _ntauth_dn(), "present": False, "cas": []}
+    rc, out, _ = podman(d, ["ldbsearch", "-H", SAM, "--cross-ncs", "-b", _ntauth_dn(),
+                            "-s", "base", "cACertificate"])
+    ents = parse_ldif_full(out or "")
+    cas = []
+    for e in ents:
+        # parse_ldif_full returns binary values (the DER cert) as an uppercase
+        # hex string with the b64 flag set — convert hex -> DER -> base64 to decode.
+        for i, hexval in enumerate(e["attrs"].get("cACertificate", [])):
+            info = ""
+            try:
+                der_b64 = base64.b64encode(bytes.fromhex(hexval)).decode()
+                rc, subj, _ = _ca_run("echo %s | base64 -d | openssl x509 -inform DER "
+                                      "-noout -subject -enddate 2>/dev/null" % shq(der_b64))
+                info = (subj or "").replace("\n", " ").strip()
+            except Exception:
+                pass
+            cas.append({"index": i, "info": info})
+    return {"ntauth_dn": _ntauth_dn(), "present": True, "cas": cas, "count": len(cas)}
+
+# ---- domain-integrated certificate templates (pKICertificateTemplate) -------
+_KU_BITS = {"digitalSignature": 0x80, "nonRepudiation": 0x40, "keyEncipherment": 0x20,
+            "dataEncipherment": 0x10, "keyAgreement": 0x08, "keyCertSign": 0x04,
+            "cRLSign": 0x02}
+
+def _keyusage_b64(ku_csv):
+    # Windows stores pKIKeyUsage as a 2-byte octet string (e.g. a0 00).
+    b = 0
+    for k in ku_csv.split(","):
+        b |= _KU_BITS.get(k.strip(), 0)
+    return base64.b64encode(bytes([b, 0])).decode()
+
+def _filetime_b64(seconds):
+    # AD validity/overlap: a negative 100-ns interval FILETIME, 8 bytes LE.
+    return base64.b64encode(struct.pack("<q", -int(seconds) * 10_000_000)).decode()
+
+def _template_oid(dns, index):
+    n = 0
+    for ch in dns:
+        n = (n * 131 + ord(ch)) & 0x0FFFFFFF
+    return "1.3.6.1.4.1.311.21.8.%d.%d" % (n, 10000 + index)
+
+def _template_ldif(name, tpl):
+    ekus = [EKU[e] for e in tpl["eku"]]
+    # Name-Flag 1 = ENROLLEE_SUPPLIES_SUBJECT: our issuance is manual (pki-issue
+    # supplies subject/SAN), so the subject is not sourced from AD autoenroll.
+    lines = [
+        "dn: CN=%s,%s" % (name, _templates_dn()),
+        "changetype: add",
+        "objectClass: top",
+        "objectClass: pKICertificateTemplate",
+        "cn: %s" % name,
+        "displayName: %s" % tpl["display"],
+        "showInAdvancedViewOnly: TRUE",
+        "flags: 131648",
+        "revision: 100",
+        "msPKI-Template-Schema-Version: 2",
+        "msPKI-Template-Minor-Revision: 0",
+        "msPKI-Cert-Template-OID: %s" % _template_oid(PRIMARY_LAB["DOMAIN_DNS"], list(PKI_TEMPLATES).index(name)),
+        "msPKI-Minimal-Key-Size: %d" % tpl["key"],
+        "msPKI-RA-Signature: 0",
+        "msPKI-Enrollment-Flag: 0",
+        "msPKI-Private-Key-Flag: 16",
+        "msPKI-Certificate-Name-Flag: 1",
+        "pKIDefaultKeySpec: 1",
+        "pKIMaxIssuingDepth: 0",
+        "pKICriticalExtensions: 2.5.29.15",
+        "pKIExpirationPeriod:: %s" % _filetime_b64(tpl["days"] * 86400),
+        "pKIOverlapPeriod:: %s" % _filetime_b64(6 * 7 * 86400),
+        "pKIKeyUsage:: %s" % _keyusage_b64(tpl["ku"]),
+        "pKIDefaultCSPs: 1,Microsoft RSA SChannel Cryptographic Provider",
+    ]
+    lines += ["pKIExtendedKeyUsage: %s" % o for o in ekus]
+    lines += ["msPKI-Certificate-Application-Policy: %s" % o for o in ekus]
+    return "\n".join(lines) + "\n"
+
+def v_pki_template_list(a):
+    """The pKICertificateTemplate objects in AD, plus the standard set this
+    helper can seed (so the UI can offer create)."""
+    d = pdc_emulator()
+    rc, out, _ = podman(d, ["ldbsearch", "-H", SAM, "--cross-ncs", "-b", _templates_dn(),
+                            "(objectClass=pKICertificateTemplate)",
+                            "cn", "displayName", "msPKI-Template-Schema-Version",
+                            "pKIExtendedKeyUsage"])
+    ents = parse_ldif_full(out or "") if rc == 0 else []
+    live = []
+    for e in ents:
+        at = e["attrs"]
+        live.append({"cn": (at.get("cn") or [""])[0],
+                     "display": (at.get("displayName") or [""])[0],
+                     "schema_version": (at.get("msPKI-Template-Schema-Version") or [""])[0],
+                     "eku": at.get("pKIExtendedKeyUsage", [])})
+    catalog = [{"name": k, "display": v["display"], "purpose": v["purpose"],
+                "eku": v["eku"], "key": v["key"], "days": v["days"],
+                "obj_class": v["obj_class"]} for k, v in PKI_TEMPLATES.items()]
+    return {"templates_dn": _templates_dn(), "live": live, "catalog": catalog}
+
+def v_pki_template_seed(a):
+    """Create the standard domain-integrated certificate templates (or one named
+    by --name). Idempotent — skips any that already exist. Writes on the PDC."""
+    d = pdc_emulator()
+    only = a.get("name")
+    if only and only not in PKI_TEMPLATES:
+        raise Fail("unknown template %s (have: %s)" % (only, ", ".join(PKI_TEMPLATES)))
+    names = [only] if only else list(PKI_TEMPLATES)
+    results = []
+    for name in names:
+        dn = "CN=%s,%s" % (name, _templates_dn())
+        if _ldb_exists(d, dn):
+            results.append({"template": name, "action": "exists"})
+            continue
+        rc, out, err = podman(d, ["ldbadd", "-H", SAM], stdin=_template_ldif(name, PKI_TEMPLATES[name]))
+        if rc != 0:
+            raise Fail("seed %s failed: %s" % (name, err.strip() or out.strip()))
+        results.append({"template": name, "action": "created", "dn": dn})
+    return {"on": d, "seeded": results}
+
+def v_pki_template_delete(a):
+    """Delete a certificate template object."""
+    d = pdc_emulator()
+    name = a["name"]
+    dn = "CN=%s,%s" % (name, _templates_dn())
+    if not _ldb_exists(d, dn):
+        raise Fail("no such template: %s" % name)
+    rc, out, err = podman(d, ["ldbdel", "-H", SAM, dn])
+    if rc != 0:
+        raise Fail("delete failed: %s" % (err.strip() or out.strip()))
+    return {"deleted": name, "dn": dn}
+
+def v_pki_status(a):
+    """One-call PKI overview: CA node, root CA, AD registration, template count,
+    issued-cert count — drives the PKI tab."""
+    d = pdc_emulator()
+    st = {"ca_node": {"deployed": _ca_deployed(), "root_ca": _ca_has_root()},
+          "ad": _pki_ad_state(d), "pdc": d}
+    if _ca_has_root():
+        rc, subj, _ = _ca_run("openssl x509 -in /ca/ca.crt -noout -subject -enddate 2>/dev/null")
+        st["ca_node"]["cert"] = (subj or "").replace("\n", " ").strip()
+        rc, cnt, _ = _ca_run("ls /ca/issued/*.crt 2>/dev/null | wc -l")
+        st["ca_node"]["issued"] = int((cnt or "0").split()[0] or 0) if (cnt or "").strip() else 0
+    return st
+
 # ---- clients & onboarding -------------------------------------------------
 
 def v_client_list(a):
@@ -5382,6 +5885,44 @@ VERBS = {
                       "args": [arg("realm", help_="domain to destroy"),
                                arg("backup", "enum", required=False, choices=["true", "false"], default="false",
                                    help_="run an offline AD backup before destroying")]},
+    "pki-status":     {"fn": v_pki_status, "group": "pki",
+                      "help": "AD PKI overview: CA node, root CA, AD registration (root-trust/AIA/NTAuth/enrollment), template + issued-cert counts. Drives the PKI tab."},
+    "pki-ca-deploy":  {"fn": v_pki_ca_deploy, "group": "pki",
+                      "help": "Deploy the CA node (an openssl-CA container on the lab network) and generate a self-signed Enterprise Root CA. Idempotent.",
+                      "args": [arg("cn", required=False, help_="CA common name (default: <REALM> Enterprise Root CA)"),
+                               arg("days", "int", required=False, default=3650, help_="root validity in days"),
+                               arg("key_bits", "int", required=False, default=4096, help_="root RSA key size")]},
+    "pki-ca-status":  {"fn": v_pki_ca_status, "group": "pki",
+                      "help": "CA node + root-CA detail (subject/validity/fingerprint, issued count) and whether the CA is published into AD."},
+    "pki-ca-destroy": {"fn": v_pki_ca_destroy, "group": "pki", "danger": True,
+                      "help": "Remove the CA node container. Material on the host is kept unless wipe=true.",
+                      "args": [arg("wipe", "enum", required=False, choices=["true", "false"], default="false",
+                                   help_="true = also delete the CA key/certs/issued material")]},
+    "pki-ca-publish": {"fn": v_pki_ca_publish, "group": "pki",
+                      "help": "Publish the root CA into AD (Certification Authorities root-trust, AIA, NTAuthCertificates, Enrollment Services) so the forest trusts it. Idempotent; writes on the PDC."},
+    "pki-ca-unpublish": {"fn": v_pki_ca_unpublish, "group": "pki", "danger": True,
+                      "help": "Remove the CA's AD registration (root-trust/AIA/enrollment). Keeps NTAuthCertificates unless ntauth=true.",
+                      "args": [arg("ntauth", "enum", required=False, choices=["true", "false"], default="false",
+                                   help_="true = also delete the NTAuthCertificates object")]},
+    "pki-ntauth-list": {"fn": v_pki_ntauth_list, "group": "pki",
+                      "help": "CAs currently trusted for smartcard/PKINIT logon (contents of NTAuthCertificates)."},
+    "pki-template-list": {"fn": v_pki_template_list, "group": "pki",
+                      "help": "Certificate templates in AD (pKICertificateTemplate) plus the standard set this helper can seed."},
+    "pki-template-seed": {"fn": v_pki_template_seed, "group": "pki",
+                      "help": "Create the standard domain-integrated certificate templates (or one named). Idempotent; writes on the PDC.",
+                      "args": [arg("name", "enum", required=False, choices=list(PKI_TEMPLATES),
+                                   help_="one template to seed (default: all)")]},
+    "pki-template-delete": {"fn": v_pki_template_delete, "group": "pki", "danger": True,
+                      "help": "Delete a certificate template object.",
+                      "args": [arg("name", help_="template CN")]},
+    "pki-issue":      {"fn": v_pki_issue, "group": "pki",
+                      "help": "Issue a leaf certificate from the CA node per a template's policy (key size, EKU, key usage, validity). Returns the cert PEM.",
+                      "args": [arg("template", "enum", choices=list(PKI_TEMPLATES), help_="template to issue under"),
+                               arg("cn", help_="subject common name, e.g. web01.ad.edt1.lab"),
+                               arg("sans", required=False, help_="SAN list, e.g. DNS:web01.ad.edt1.lab,IP:172.15.4.5"),
+                               arg("days", "int", required=False, help_="validity override (default: the template's)")]},
+    "pki-cert-list":  {"fn": v_pki_cert_list, "group": "pki",
+                      "help": "Certificates the CA node has issued (subject, serial, validity)."},
     "client-list":   {"fn": v_client_list, "group": "clients",
                       "help": "Client containers with join state."},
     "client-onboard": {"fn": v_client_onboard, "group": "clients",
