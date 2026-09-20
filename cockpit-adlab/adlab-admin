@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 
 
 def _require_config():
@@ -232,6 +232,7 @@ def _domain_from_container(realm, ctr):
         "DC_BASE": int(_label(ctr, "adlab.dc_base") or "10"),
         "SLUG": slug,
         "PRIMARY": False,
+        "PARENT": _label(ctr, "adlab.parent") or "",
     })
     return base
 
@@ -3563,6 +3564,8 @@ def _run_dc(dom, name, ip, role, peer_ip=None):
                 "--label", "adlab.dc_base=%d" % dom["DC_BASE"],
                 "--label", "adlab.slug=" + dom["SLUG"],
                 "--label", "adlab.role=" + role]
+        if dom.get("PARENT"):
+            cmd += ["--label", "adlab.parent=" + dom["PARENT"]]
     cmd.append(PRIMARY_LAB["IMG_DC"])
     return RUN.run(cmd, timeout=180)
 
@@ -3637,6 +3640,7 @@ def v_domain_list(a):
             "realm": d["REALM"], "domain_nb": d["DOMAIN_NB"],
             "primary": bool(d.get("PRIMARY")), "net": d["NET"],
             "net_prefix": d.get("NET_PREFIX", ""), "slug": d.get("SLUG", ""),
+            "parent": d.get("PARENT", ""),
             "dcs": dcs, "dc_count": sum(1 for x in dcs if x["state"] != "missing")})
     return {"domains": out}
 
@@ -3658,17 +3662,54 @@ def _alloc_domain_subnet():
 
 
 def v_domain_add(a):
-    """Create a new INDEPENDENT forest: its own podman network + first DC
-    (provisioned). This is how the initial DC of a new domain is deployed."""
+    """Create a new domain. Without --parent: an INDEPENDENT forest (its own
+    podman network + provisioned first DC). With --parent <realm>: the new domain
+    is provisioned on the PARENT's network so it can be linked to the parent's
+    forest with a forest trust — samba AD cannot create an in-forest CHILD domain,
+    so the parent relationship is realized as a trust (see domain-trust-create). A
+    contiguous child.parent namespace best emulates a child domain."""
     realm = a["realm"].strip().upper()
     nb = a["domain_nb"].strip().upper()
     slug = (a.get("slug") or realm.split(".")[0]).strip().lower()
+    parent_realm = (a.get("parent") or "").strip().upper()
     if "." not in realm:
         raise Fail("realm must be a dotted DNS domain, e.g. CORP.EXAMPLE.LAB")
     if realm.lower() == PRIMARY_LAB["REALM"].lower():
         raise Fail("%s is the primary domain" % realm)
     if any(d["REALM"].lower() == realm.lower() for d in list_domains() if not d.get("PRIMARY")):
         raise Fail("domain %s already exists (see domain-list)" % realm)
+
+    if parent_realm:
+        parent = resolve_domain(parent_realm)          # must exist (raises otherwise)
+        if not parent.get("NET_PREFIX"):
+            raise Fail("parent %s has no known subnet; cannot place a child on its network"
+                       % parent_realm)
+        # The child shares the parent's network so it can reach the parent DC for
+        # a trust. Each child of a parent gets its own 10-address block from .50.
+        kids = sum(1 for d in list_domains()
+                   if (d.get("PARENT") or "").lower() == parent_realm.lower())
+        dom = {"REALM": realm, "DOMAIN_NB": nb, "DOMAIN_DNS": realm.lower(),
+               "NET": parent["NET"], "NET_PREFIX": parent["NET_PREFIX"],
+               "DC_BASE": 50 + 10 * kids, "SLUG": slug, "PRIMARY": False,
+               "PARENT": parent_realm,
+               "FORWARDER": parent.get("FORWARDER", PRIMARY_LAB["FORWARDER"])}
+        name, ip = dc_name(1, dom), dc_ip(1, dom)
+        contiguous = realm.lower().endswith("." + parent_realm.lower())
+        rc, out, err = _run_dc(dom, name, ip, "provision")
+        if rc != 0:
+            raise Fail("provision failed: " + (err.strip() or out.strip()))
+        note = ("Provisioned as its own forest on %s's network (samba AD has no "
+                "in-forest child domains). When provisioning finishes, link it to "
+                "the parent forest with: domain-trust-create --realm %s --parent %s"
+                % (parent_realm, realm, parent_realm))
+        if not contiguous:
+            note += (". NB: a contiguous CHILD.%s namespace best emulates a child domain"
+                     % parent_realm)
+        return {"domain": realm, "domain_nb": nb, "slug": slug, "parent": parent_realm,
+                "network": parent["NET"], "shared_with_parent": True,
+                "subnet": parent["NET_PREFIX"] + ".0/24", "dc": name, "ip": ip,
+                "contiguous_namespace": contiguous, "note": note}
+
     net = "adlab-" + slug
     prefix = _alloc_domain_subnet()
     rc, out, err = RUN.run(["podman", "network", "create", net, "--subnet", prefix + ".0/24"])
@@ -3686,6 +3727,90 @@ def v_domain_add(a):
             "subnet": prefix + ".0/24", "dc": name, "ip": ip,
             "note": "provisioning runs in the background; watch: dc-logs --dc %s --domain %s. "
                     "Add DCs with: dc-promote --domain %s" % (name, realm, realm)}
+
+
+# ---- domain trusts (samba's cross-forest linkage; it has no child domains) ----
+
+def _trust_partner_dc_ip(pdom):
+    return ctr_ip(first_up_dc(pdom)) or dc_ip(1, pdom)
+
+def v_domain_trust_create(a):
+    """Establish a forest/external trust between a lab domain and a parent/partner
+    domain — samba's way to link two forests (it cannot create an in-forest child
+    domain). Runs on the local domain's DC and creates the trust on BOTH sides."""
+    realm = a["realm"].strip().upper()
+    dom = resolve_domain(realm)
+    partner = (a.get("parent") or dom.get("PARENT") or "").strip().upper()
+    if not partner:
+        raise Fail("specify --parent (the forest to trust); this domain has no recorded parent")
+    if partner.lower() == realm.lower():
+        raise Fail("a domain cannot trust itself")
+    pdom = resolve_domain(partner)
+    ttype = (a.get("type") or "forest").lower()
+    if ttype not in ("forest", "external"):
+        raise Fail("type must be 'forest' or 'external'")
+    direction = (a.get("direction") or "both").lower()
+    if direction not in ("both", "incoming", "outgoing"):
+        raise Fail("direction must be 'both', 'incoming' or 'outgoing'")
+    dc = first_up_dc(dom)
+    pip = _trust_partner_dc_ip(pdom)
+    body = (
+        "umask 077; "
+        "grep -q ' {pip}$' /etc/resolv.conf || sed -i '1a nameserver {pip}' /etc/resolv.conf; "
+        "af=$(mktemp /run/adlab.auth.XXXXXX); "
+        "printf 'username=Administrator\\npassword=%s\\ndomain={pnb}\\n' "
+        "\"$(tr -d '\\n' </run/adminpass)\" > \"$af\"; "
+        "samba-tool domain trust create {partner} --type={t} --direction={d} "
+        "--create-location=both -A \"$af\" --ipaddress={pip}; "
+        "rc=$?; rm -f \"$af\"; exit $rc"
+    ).format(pip=pip, pnb=pdom["DOMAIN_NB"], partner=shq(partner.lower()), t=ttype, d=direction)
+    rc, out, err = podman(dc, ["bash", "-c", body], timeout=240)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-600:])
+    return {"realm": realm, "partner": partner, "type": ttype, "direction": direction,
+            "on": dc, "created": True, "output": (out or "").strip()[-500:]}
+
+def v_domain_trust_list(a):
+    """List the trusts configured on a lab domain (samba-tool domain trust list)."""
+    dom = resolve_domain(a.get("realm"))
+    dc = first_up_dc(dom)
+    rc, out, err = podman(dc, ["samba-tool", "domain", "trust", "list"])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    trusts = []
+    for ln in (out or "").splitlines():
+        nm = re.search(r'Name\[([^\]]+)\]', ln)
+        if not nm:
+            continue
+        def _f(k, l=ln):
+            m = re.search(k + r'\[([^\]]*)\]', l)
+            return m.group(1) if m else ""
+        trusts.append({"name": nm.group(1), "type": _f("Type"),
+                       "direction": _f("Direction"), "transitive": _f("Transitive"),
+                       "raw": ln.strip()})
+    return {"realm": dom["REALM"], "on": dc, "trusts": trusts, "count": len(trusts)}
+
+def v_domain_trust_delete(a):
+    """Delete a trust between a lab domain and a partner (both sides)."""
+    realm = a["realm"].strip().upper()
+    dom = resolve_domain(realm)
+    partner = (a.get("parent") or dom.get("PARENT") or "").strip().upper()
+    if not partner:
+        raise Fail("specify --parent (the trusted forest to remove)")
+    pdom = resolve_domain(partner)
+    dc = first_up_dc(dom)
+    pip = _trust_partner_dc_ip(pdom)
+    body = (
+        "umask 077; af=$(mktemp /run/adlab.auth.XXXXXX); "
+        "printf 'username=Administrator\\npassword=%s\\ndomain={pnb}\\n' "
+        "\"$(tr -d '\\n' </run/adminpass)\" > \"$af\"; "
+        "samba-tool domain trust delete {partner} --delete-location=both -A \"$af\" "
+        "--ipaddress={pip}; rc=$?; rm -f \"$af\"; exit $rc"
+    ).format(pnb=pdom["DOMAIN_NB"], partner=shq(partner.lower()), pip=pip)
+    rc, out, err = podman(dc, ["bash", "-c", body], timeout=180)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-500:])
+    return {"realm": realm, "partner": partner, "on": dc, "deleted": True}
 
 
 def v_domain_backup(a):
@@ -5216,10 +5341,24 @@ VERBS = {
     "domain-list":   {"fn": v_domain_list, "group": "domains",
                       "help": "Every forest in the lab (primary first) with its DCs."},
     "domain-add":    {"fn": v_domain_add, "group": "domains", "danger": True,
-                      "help": "Create a NEW independent forest: its own podman network + a provisioned first DC.",
+                      "help": "Create a NEW domain: a standalone forest, or with --parent, provisioned on the parent's network to join the parent's forest via a trust (samba has no in-forest child domains).",
                       "args": [arg("realm", help_="realm / DNS domain, e.g. CORP.EXAMPLE.LAB"),
                                arg("domain_nb", help_="NetBIOS name (<=15 chars)"),
-                               arg("slug", required=False, help_="short name for the containers/network (default: first realm label)")]},
+                               arg("slug", required=False, help_="short name for the containers/network (default: first realm label)"),
+                               arg("parent", required=False, help_="parent realm to join its forest via a trust (default: a new independent forest); a contiguous CHILD.parent namespace best emulates a child domain")]},
+    "domain-trust-create": {"fn": v_domain_trust_create, "group": "domains", "danger": True,
+                      "help": "Establish a forest/external trust with a parent/partner domain (both sides) — samba's way to link two forests.",
+                      "args": [arg("realm", help_="the local lab domain"),
+                               arg("parent", required=False, help_="partner/parent realm (default: this domain's recorded parent)"),
+                               arg("type", "enum", required=False, choices=["forest", "external"], help_="default: forest"),
+                               arg("direction", "enum", required=False, choices=["both", "incoming", "outgoing"], help_="default: both")]},
+    "domain-trust-list": {"fn": v_domain_trust_list, "group": "domains",
+                      "help": "List the trusts configured on a lab domain.",
+                      "args": [arg("realm", required=False, help_="default: the primary domain")]},
+    "domain-trust-delete": {"fn": v_domain_trust_delete, "group": "domains", "danger": True,
+                      "help": "Delete a trust between a lab domain and a partner (both sides).",
+                      "args": [arg("realm", help_="the local lab domain"),
+                               arg("parent", required=False, help_="partner realm (default: recorded parent)")]},
     "domain-backup": {"fn": v_domain_backup, "group": "domains",
                       "help": "Offline AD backup of a domain to a host tarball.",
                       "args": [arg("realm", help_="which domain to back up (see domain-list)")]},

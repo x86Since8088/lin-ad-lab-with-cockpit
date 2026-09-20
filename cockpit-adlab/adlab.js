@@ -2889,9 +2889,12 @@
         acts.appendChild(actionButton("Add domain", "domain-add", {}, ""));
         m.appendChild(acts);
         m.appendChild(el("div", "hint",
-            "Each domain is an independent Samba forest on its own podman network. "
-            + "Adding a domain deploys its first (provisioning) DC; removing a domain "
-            + "tears down all of its DCs and its network (optionally backing up first)."));
+            "Each domain is a Samba forest on its own podman network. Adding a domain "
+            + "deploys its first (provisioning) DC. Specify a parent to place the new "
+            + "domain on the parent's network and join the parent's forest via a trust — "
+            + "samba AD has no in-forest child domains, so the parent link is a forest "
+            + "trust (use “Create trust” after it provisions). Removing a domain tears "
+            + "down all of its DCs and its network (optionally backing up first)."));
         var holder = el("div", "al-grid"); m.appendChild(holder);
         loadDomains().then(function (domains) {
             if (!domains.length) { holder.appendChild(failCard("Domains", "no forests found")); return; }
@@ -2902,6 +2905,7 @@
                 head.appendChild(badge("NetBIOS " + d.domain_nb));
                 head.appendChild(badge("net " + d.net));
                 if (d.net_prefix) head.appendChild(badge(d.net_prefix + ".0/24"));
+                if (d.parent) head.appendChild(badge("parent " + d.parent, "warn"));
                 head.appendChild(badge(d.dc_count + " DC" + (d.dc_count === 1 ? "" : "s"),
                                        d.dc_count ? "ok" : "warn"));
                 c.appendChild(head);
@@ -2917,6 +2921,26 @@
                 });
                 box.appendChild(manage);
                 box.appendChild(actionButton("Back up", "domain-backup", { realm: d.realm }));
+                var trustsBtn = el("button", "al-btn secondary", "Trusts");
+                trustsBtn.addEventListener("click", function () {
+                    run("domain-trust-list", { realm: d.realm }).then(function (r) {
+                        transientModal("Trusts of " + d.realm, function (b, close) {
+                            if (!(r.trusts || []).length) b.appendChild(el("div", "hint", "no trusts"));
+                            else b.appendChild(tableOf(["name", "type", "direction", "transitive"],
+                                r.trusts.map(function (t) { return [t.name, t.type, t.direction, t.transitive]; })));
+                            var ok = el("button", "al-btn", "Close");
+                            ok.addEventListener("click", close); b.appendChild(ok);
+                        });
+                    }).catch(function (e) {
+                        transientModal("trust-list failed", function (b, close) {
+                            b.appendChild(el("div", "al-alert err", String(e)));
+                            var ok = el("button", "al-btn", "Close");
+                            ok.addEventListener("click", close); b.appendChild(ok);
+                        });
+                    });
+                });
+                box.appendChild(trustsBtn);
+                box.appendChild(actionButton("Create trust", "domain-trust-create", { realm: d.realm }));
                 if (!d.primary)
                     box.appendChild(actionButton("Remove domain", "domain-remove", { realm: d.realm }, "danger"));
                 c.appendChild(box);
