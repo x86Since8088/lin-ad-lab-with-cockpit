@@ -466,6 +466,7 @@
     var TABS = [
         ["overview", "Overview"],
         ["objects", "AD Objects"],
+        ["spn", "SPNs"],
         ["gpo", "Group Policy"], ["sites", "Sites & Replication"],
         ["dns", "DNS"], ["domains", "Domains"], ["dcs", "Domain Controllers"],
         ["clients", "Clients"], ["members", "Member Servers"],
@@ -1141,6 +1142,24 @@
                             holder.appendChild(box);
                         });
                     }
+                }
+                // SPNs: shown for ANY account that carries them (users too, not
+                // just the computer form's Delegation tab). Manage on the SPN tab.
+                if (obj.attrs && obj.attrs.servicePrincipalName && obj.attrs.servicePrincipalName.length) {
+                    var spns = obj.attrs.servicePrincipalName.slice().sort();
+                    var secS = el("div", "al-prev-sec");
+                    secS.appendChild(el("h4", null, "SPNs (" + spns.length + ")"));
+                    var boxS = el("div", "al-spnlist");
+                    spns.forEach(function (s) {
+                        var line = el("div", "al-spnrow");
+                        line.appendChild(el("code", "al-spn", s));
+                        boxS.appendChild(line);
+                    });
+                    secS.appendChild(boxS);
+                    var manage = el("button", "al-btn secondary", "Manage SPNs →");
+                    manage.addEventListener("click", function () { goTab("spn"); });
+                    secS.appendChild(manage);
+                    body.appendChild(secS);
                 }
             }).catch(function (e) { clear(body); body.appendChild(el("div", "al-alert err", String(e))); });
         }
@@ -3026,9 +3045,50 @@
         refresh.addEventListener("click", load); load();
     }
 
+    // -------- SPNs (Service Principal Names) — setspn-compatible control plane
+    function renderSpn() {
+        var m = content();
+        var acts = el("div", "al-actions");
+        acts.appendChild(actionButton("Add SPN", "spn-add", {}, ""));
+        acts.appendChild(actionButton("Query SPN", "spn-query", {}));
+        acts.appendChild(actionButton("Find duplicates", "spn-find-duplicates", {}));
+        var refresh = el("button", "al-btn secondary", "Refresh");
+        refresh.addEventListener("click", function () { refreshTab(); });
+        acts.appendChild(refresh);
+        m.appendChild(acts);
+        m.appendChild(el("div", "al-alert warn",
+            "A Service Principal Name binds a Kerberos service to the account that runs it. " +
+            "These map to Windows setspn: Add SPN = setspn -S (add, refuses a duplicate; " +
+            "force = -A), the ✕ next to an SPN = setspn -D, Query SPN = setspn -Q, " +
+            "Find duplicates = setspn -X. Writes land on the PDC emulator. The SAME SPN on " +
+            "two accounts breaks Kerberos for that service — Find duplicates surfaces those."));
+        var holder = el("div", "al-grid"); m.appendChild(holder);
+        var fSpn = slotCard(holder, "Accounts with SPNs", true);
+        run("spn-list-all").then(function (r) {
+            var title = "Accounts with SPNs — " + r.account_count + " account(s), " +
+                        r.spn_count + " SPN(s) (on " + r.on + ")";
+            fSpn(emptyOr(r.accounts, ["account", "type", "#", "servicePrincipalName", ""],
+                function (a) {
+                    var spnCell = el("div", "al-spnlist");
+                    a.spns.forEach(function (s) {
+                        var line = el("div", "al-spnrow");
+                        line.appendChild(el("code", "al-spn", s));
+                        line.appendChild(actionButton("✕", "spn-delete",
+                            { account: a.account, spn: s }));
+                        spnCell.appendChild(line);
+                    });
+                    var addBox = el("div", "al-actions");
+                    addBox.appendChild(actionButton("+ SPN", "spn-add", { account: a.account }));
+                    return [el("kbd", "al", a.account),
+                            badge(a["class"] === "computer" ? "computer" : "user", "dim"),
+                            String(a.spns.length), spnCell, addBox];
+                }, "no account carries an SPN"), title);
+        }).catch(function (e) { fSpn(el("div", "al-alert err", String(e))); });
+    }
+
     // ---------------------------------------------------------------- boot
     var RENDER = { overview: renderOverview,
-                   objects: renderObjects, gpo: renderGpo,
+                   objects: renderObjects, spn: renderSpn, gpo: renderGpo,
                    sites: renderSites, dns: renderDns, domains: renderDomains,
                    dcs: renderDcs, clients: renderClients, members: renderMembers,
                    activity: renderActivity };
