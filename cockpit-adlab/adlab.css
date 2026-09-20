@@ -116,6 +116,19 @@ pre.al-log { background: var(--al-code-bg); border: 1px solid var(--al-border);
 .al-modal h2 { margin: 0 0 0.3rem; font-size: 1.15rem; }
 .al-modal .danger-note { color: var(--al-err); font-size: 0.86rem; }
 
+/* contextual help: the "?" on every modal + the per-tab help button */
+.al-modal-head { display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 0.8rem; }
+.al-modal-head h2 { margin: 0 0 0.3rem; }
+.al-help-btn { flex: none; width: 1.7rem; height: 1.7rem; line-height: 1.6rem;
+    text-align: center; border-radius: 50%; border: 1px solid var(--al-border);
+    background: var(--al-card); color: var(--al-accent); font-weight: 700;
+    font-size: 0.95rem; cursor: pointer; padding: 0; }
+.al-help-btn:hover { background: var(--al-accent-soft); border-color: var(--al-accent); }
+.al-tabhelp { display: flex; justify-content: flex-end; margin: -0.2rem 0 0.4rem; }
+button.al-btn.al-help { width: auto; font-size: 0.82rem; padding: 0.2rem 0.6rem; }
+.al-help-p { margin: 0 0 0.6rem; line-height: 1.45; }
+
 kbd.al { background: var(--al-code-bg); border: 1px solid var(--al-border);
     border-radius: 3px; padding: 0 0.3rem; font-size: 0.82rem; }
 
