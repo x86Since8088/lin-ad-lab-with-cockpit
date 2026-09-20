@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.11.0"
+VERSION = "1.11.1"
 
 
 def _require_config():
@@ -1172,12 +1172,16 @@ def v_kerberos_audit_status(a):
     for d in _target_dcs(a):
         pids = _kdc_worker_pids(d)
         levels = [_kdc_kerberos_level(d, p) for p in pids]
+        # grep -c already prints "0" on no matches (exit 1); the old `|| echo 0`
+        # then appended a second "0", yielding "0\n0" which int() choked on. Drop
+        # it and take the first number (empty = missing file = 0).
         rc, cnt, _ = podman(d, ["bash", "-c",
-            "grep -ac 'TGS-REQ SUCCESS' %s 2>/dev/null || echo 0" % KDC_LOG])
+            "grep -ac 'TGS-REQ SUCCESS' %s 2>/dev/null" % KDC_LOG])
+        nums = (cnt or "").split()
         rows.append({"dc": d, "kdc_pids": pids,
                      "kerberos_level": max(levels) if levels else 0,
                      "audit_active": bool(levels) and max(levels) >= 3,
-                     "tgs_records": int((cnt or "0").strip() or 0)})
+                     "tgs_records": int(nums[0]) if nums and nums[0].isdigit() else 0})
     return {"dcs": rows, "any_active": any(r["audit_active"] for r in rows),
             "note": "Auditing is runtime-only (the entrypoint's --debuglevel=1 "
                     "overrides smb.conf) and resets on a DC restart; re-run "

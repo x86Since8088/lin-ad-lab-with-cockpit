@@ -1318,6 +1318,18 @@ class TestKerberos(Base):
         self.assertEqual(out["dcs"][0]["kerberos_level"], 3)
         self.assertEqual(out["dcs"][0]["tgs_records"], 5)
 
+    def test_audit_status_zero_records_no_crash(self):
+        # regression: grep -c prints "0" on no matches; a stray double line
+        # ("0\n0") must not make int() throw — take the first number.
+        self.fake.lab_up()
+        self.fake.on(lambda a: "bash" in a and any(":88 " in str(x) for x in a), out="31\n")
+        self.fake.on(lambda a: "smbcontrol" in a and "debuglevel" in a, out="PID 31: kerberos:1")
+        self.fake.on(lambda a: "bash" in a and any("grep -ac 'TGS-REQ SUCCESS'" in str(x) for x in a),
+                     out="0\n0")
+        rc, out = self.call_main(["kerberos-audit-status", "--dc", "dc1"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["dcs"][0]["tgs_records"], 0)
+
     def test_audit_enable_smbcontrols_workers(self):
         self.fake.lab_up()
         self.fake.on(lambda a: "bash" in a and any(":88 " in str(x) for x in a), out="31\n36\n")
