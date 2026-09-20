@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.7.2 - 2026-09-19
+
+Accuracy fix after full live validation of the SPN verbs: samba enforces SPN
+uniqueness in the directory (`samldb_spn_uniqueness_check`), so `spn-add --force`
+**cannot** create a duplicate — a real collision is refused with a Constraint
+violation regardless of `--force` (which only bypasses `samba-tool`'s own
+pre-check). Corrected the `spn-add` help text, the verb docstring/comments and
+`docs/SPN.md`, which had implied force could create a duplicate. Added a
+regression test asserting the uniqueness error surfaces. Live-validated
+end-to-end (reads incl. long GUID SPNs, `-S`/`-A`/`-D`/`-Q`/`-X`); 197 tests.
+
 ## 1.7.1 - 2026-09-19
 
 SPN fixes found by live validation against the lab:

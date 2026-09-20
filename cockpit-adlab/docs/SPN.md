@@ -27,10 +27,13 @@ Notes on the mapping:
 
 - **`-S` is the default add.** `samba-tool spn add` refuses an SPN that is already
   registered anywhere, which is exactly `setspn -S` (add-with-duplicate-check).
-  `--force true` reproduces the older `setspn -A` (add without the check). Because
+  `--force true` reproduces the older `setspn -A` (add without that check). Because
   `samba-tool spn add` has no `--force`, that path writes `servicePrincipalName`
-  directly with `ldbmodify` — use it only when you know what you are doing, since
-  it can create a duplicate SPN.
+  directly with `ldbmodify`. Note it still **cannot create a duplicate**: samba's
+  `samldb` module enforces SPN uniqueness at the directory level
+  (`samldb_spn_uniqueness_check`), so a real collision is refused with a
+  Constraint violation regardless of `--force`. Force only bypasses `samba-tool`'s
+  own pre-check.
 - **Account name.** A computer account may be given with or without the trailing
   `$` (`WEB01` or `WEB01$`); a user is its `sAMAccountName`.
 - **SPN format.** `serviceClass/host[:port][/serviceName]`, e.g.
@@ -51,5 +54,11 @@ Notes on the mapping:
 `spn-find-duplicates` (setspn -X) is the one to run when Kerberos to a service
 fails intermittently: a duplicate SPN (the same value on two accounts) is a
 classic cause. `spn-query` on a specific SPN also flags `duplicate: true` when the
-value resolves to more than one account. The default `spn-add` prevents you from
-creating a duplicate in the first place unless you pass `--force`.
+value resolves to more than one account.
+
+In this samba directory, though, duplicates should be **impossible to create** —
+samba's `samldb_spn_uniqueness_check` refuses any write (including `--force`
+`ldbmodify`) that would put an SPN on a second account. So on a healthy DC
+`spn-find-duplicates` returns nothing; a non-empty result would point at
+something abnormal (e.g. a replication-conflict object), which is exactly when
+you want to see it.

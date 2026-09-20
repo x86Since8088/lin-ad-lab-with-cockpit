@@ -1078,6 +1078,19 @@ class TestSpn(Base):
         self.assertIn("servicePrincipalName: HTTP/web01.new", mod_call[1])
         self.assertIn("CN=web01", mod_call[1])                        # the resolved DN
 
+    def test_spn_add_force_surfaces_uniqueness_error(self):
+        # samba's samldb enforces SPN uniqueness even for a direct ldbmodify, so
+        # --force cannot create a duplicate; the constraint error must surface.
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=self.ONE)
+        self.fake.on(lambda a: "ldbmodify" in a, rc=1,
+                     err="samldb_spn_uniqueness_check: failed direct uniqueness "
+                         "check\nERR: (Constraint violation)")
+        rc, out = self.call_main(["spn-add", "--account", "WEB01$",
+                                  "--spn", "HTTP/dup.ad.edt1.lab", "--force", "true"])
+        self.assertEqual(rc, 1)
+        self.assertIn("uniqueness", out["error"].lower())
+
     def test_spn_list_unfolds_long_spn(self):
         # ldbsearch folds values >79 chars onto continuation lines (leading
         # space); parse_ldif_full must UNFOLD them (parse_ldif_entries truncated).
