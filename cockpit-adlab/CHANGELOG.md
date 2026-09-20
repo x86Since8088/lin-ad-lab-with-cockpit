@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.11.1 - 2026-09-19
+
+Fix: `kerberos-audit-status` crashed with `invalid literal for int() with base
+10: '0\n0'` on a DC whose log has zero `TGS-REQ SUCCESS` lines. `grep -c` already
+prints `0` (and exits 1) on no matches, so the `|| echo 0` guard appended a
+second `0`. Dropped the guard and made the count parse take the first number
+(empty output = missing log = 0). Regression test added; 225 tests.
+
 ## 1.11.0 - 2026-09-19
 
 Contextual help everywhere — a help button on every page tab and every modal
