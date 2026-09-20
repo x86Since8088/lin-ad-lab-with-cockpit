@@ -68,6 +68,14 @@ table.al tr:last-child td { border-bottom: none; }
 .badge.win  { background: var(--al-accent-soft); color: var(--al-accent); }
 .badge.lnx  { background: var(--al-warn-bg);  color: var(--al-warn); }
 
+/* SPN lists (SPN tab + object preview) */
+.al-spnlist { display: flex; flex-direction: column; gap: 3px; }
+.al-spnrow  { display: flex; align-items: center; gap: 6px; }
+.al-spn     { font-family: Consolas, Monaco, monospace; font-size: 0.8rem;
+    background: var(--al-code-bg); padding: 1px 6px; border-radius: 3px;
+    word-break: break-all; }
+.al-spnrow .al-btn { padding: 0 7px; font-size: 0.85rem; line-height: 1.5; }
+
 button.al-btn { background: var(--al-accent); color: #fff; border: none;
     border-radius: 4px; padding: 0.4rem 0.85rem; font-size: 0.88rem; cursor: pointer; }
 button.al-btn:hover { filter: brightness(1.1); }

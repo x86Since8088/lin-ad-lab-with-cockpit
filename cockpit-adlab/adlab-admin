@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 
 def _require_config():
@@ -938,6 +938,123 @@ def v_computer_list(a):
     if rc != 0:
         raise Fail(err.strip() or out.strip())
     return {"computers": parse_name_list(out)}
+
+# ---- Service Principal Names (Windows setspn.exe compatibility) ------------
+# setspn maps onto samba's `spn` subcommand plus two directory reads:
+#   setspn -L <acct>       -> spn-list             (samba-tool spn list)
+#   setspn -S <spn> <acct> -> spn-add              (samba-tool spn add, dup-checked)
+#   setspn -A <spn> <acct> -> spn-add --force true (add WITHOUT the duplicate check)
+#   setspn -D <spn> <acct> -> spn-delete           (samba-tool spn delete)
+#   setspn -Q <spn>        -> spn-query            (which account(s) hold an SPN)
+#   setspn -X              -> spn-find-duplicates   (one SPN on >1 account)
+# Reads use ldbsearch (no credentials, any up DC); add/delete run samba-tool spn
+# locally as root on the PDC emulator — like the object write verbs, single-master.
+SPN_ACCOUNT_FILTER = "(|(objectClass=user)(objectClass=computer))"
+
+def _ldap_escape(s):
+    """Escape a value for an LDAP filter (RFC 4515)."""
+    return (str(s).replace("\\", "\\5c").replace("*", "\\2a")
+            .replace("(", "\\28").replace(")", "\\29").replace("\x00", "\\00"))
+
+def _valid_spn(s):
+    """A service principal name: serviceClass '/' instance[:port][/name], no spaces."""
+    s = (s or "").strip()
+    if not s or "/" not in s or any(c.isspace() for c in s):
+        raise Fail("SPN must look like service/host[:port][/name] with no spaces (got %r)" % s)
+    return s
+
+def _spn_rows(dc, filt):
+    """ldbsearch accounts matching filt -> [{account, dn, class, spns:[...]}],
+    only those that actually carry a servicePrincipalName, sorted."""
+    rc, out, err = podman(dc, ["ldbsearch", "-H", SAM, "-b", domain_dn(), filt,
+                               "sAMAccountName", "servicePrincipalName", "objectClass"])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    rows = []
+    for e in parse_ldif_entries(out):
+        spns = e.get("servicePrincipalName", [])
+        if not spns:
+            continue
+        cls = "computer" if "computer" in e.get("objectClass", []) else "user"
+        rows.append({"account": e.get("sAMAccountName", [""])[0],
+                     "dn": e.get("dn", [""])[0], "class": cls,
+                     "spns": sorted(spns, key=lambda x: x.lower())})
+    rows.sort(key=lambda r: r["account"].lower())
+    return rows
+
+def v_spn_list(a):
+    """setspn -L: the SPNs registered on one account (by sAMAccountName; a
+    computer may be given with or without the trailing '$')."""
+    d = first_up_dc()
+    name = a["account"].strip()
+    cands = [name] + ([name + "$"] if not name.endswith("$") else [])
+    ors = "".join("(sAMAccountName=%s)" % _ldap_escape(c) for c in cands)
+    rc, out, err = podman(d, ["ldbsearch", "-H", SAM, "-b", domain_dn(),
+                              "(&%s(|%s))" % (SPN_ACCOUNT_FILTER, ors),
+                              "sAMAccountName", "servicePrincipalName"])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    ents = parse_ldif_entries(out)
+    if not ents:
+        raise Fail("no user or computer account named %r" % name)
+    e = ents[0]
+    return {"account": e.get("sAMAccountName", [name])[0], "dn": e.get("dn", [""])[0],
+            "on": d, "spns": sorted(e.get("servicePrincipalName", []), key=lambda x: x.lower())}
+
+def v_spn_list_all(a):
+    """Every user/computer account that carries an SPN — powers the SPN tab and
+    the object preview's SPN section."""
+    d = first_up_dc()
+    rows = _spn_rows(d, "(&%s(servicePrincipalName=*))" % SPN_ACCOUNT_FILTER)
+    return {"on": d, "accounts": rows, "account_count": len(rows),
+            "spn_count": sum(len(r["spns"]) for r in rows)}
+
+def v_spn_add(a):
+    """setspn -S (default: refuse a duplicate) or setspn -A (force true: skip the
+    duplicate check). samba-tool spn add <spn> <account>."""
+    d = pdc_emulator()
+    spn = _valid_spn(a["spn"])
+    acct = a["account"].strip()
+    cmd = ["samba-tool", "spn", "add", spn, acct]
+    forced = str(a.get("force", "")).lower() in ("1", "yes", "true")
+    if forced:
+        cmd.append("--force")
+    rc, out, err = podman(d, cmd)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"added": spn, "account": acct, "on": d, "forced": forced}
+
+def v_spn_delete(a):
+    """setspn -D: remove one SPN from an account. samba-tool spn delete <spn> <account>."""
+    d = pdc_emulator()
+    spn = _valid_spn(a["spn"])
+    acct = a["account"].strip()
+    rc, out, err = podman(d, ["samba-tool", "spn", "delete", spn, acct])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"deleted": spn, "account": acct, "on": d}
+
+def v_spn_query(a):
+    """setspn -Q: which account(s) hold a given SPN (exact match)."""
+    d = first_up_dc()
+    spn = _valid_spn(a["spn"])
+    rows = _spn_rows(d, "(&%s(servicePrincipalName=%s))" % (SPN_ACCOUNT_FILTER, _ldap_escape(spn)))
+    return {"spn": spn, "on": d, "accounts": rows, "count": len(rows),
+            "duplicate": len(rows) > 1}
+
+def v_spn_find_duplicates(a):
+    """setspn -X: SPNs registered on more than one account (these break Kerberos)."""
+    d = first_up_dc()
+    rows = _spn_rows(d, "(&%s(servicePrincipalName=*))" % SPN_ACCOUNT_FILTER)
+    seen = {}
+    for r in rows:
+        for s in r["spns"]:
+            k = s.lower()
+            ent = seen.setdefault(k, {"spn": s, "accounts": set()})
+            ent["accounts"].add(r["account"])
+    dups = [{"spn": v["spn"], "accounts": sorted(v["accounts"])}
+            for _, v in sorted(seen.items()) if len(v["accounts"]) > 1]
+    return {"on": d, "duplicates": dups, "count": len(dups)}
 
 # ---- OUs ------------------------------------------------------------------
 
@@ -4353,6 +4470,25 @@ VERBS = {
     "group-remove-member": {"fn": v_group_remove_member, "group": "groups",
                       "help": "Remove a member.", "args": [arg("group"), arg("member")]},
     "computer-list": {"fn": v_computer_list, "group": "users", "help": "All computer accounts."},
+    "spn-list":      {"fn": v_spn_list, "group": "spn",
+                      "help": "setspn -L: the SPNs registered on one account.",
+                      "args": [arg("account", help_="sAMAccountName (a computer may omit the trailing $)")]},
+    "spn-list-all":  {"fn": v_spn_list_all, "group": "spn",
+                      "help": "Every user/computer account that carries a servicePrincipalName."},
+    "spn-add":       {"fn": v_spn_add, "group": "spn",
+                      "help": "setspn -S/-A: register an SPN on an account (refuses a duplicate unless force=true).",
+                      "args": [arg("account"),
+                               arg("spn", help_="service/host[:port][/name], e.g. HTTP/web01.ad.edt1.lab"),
+                               arg("force", "enum", required=False, choices=["true", "false"],
+                                   help_="true = add even if the SPN already exists (setspn -A)")]},
+    "spn-delete":    {"fn": v_spn_delete, "group": "spn", "danger": True,
+                      "help": "setspn -D: remove an SPN from an account.",
+                      "args": [arg("account"), arg("spn", help_="the exact SPN to remove")]},
+    "spn-query":     {"fn": v_spn_query, "group": "spn",
+                      "help": "setspn -Q: which account(s) hold a given SPN.",
+                      "args": [arg("spn", help_="the SPN to look up")]},
+    "spn-find-duplicates": {"fn": v_spn_find_duplicates, "group": "spn",
+                      "help": "setspn -X: SPNs registered on more than one account (these break Kerberos auth)."},
     "rds-status":    {"fn": v_rds_status, "group": "rds",
                       "help": "RD/Terminal Server licensing support: the license-servers group, its members, per-user-CAL schema, delegation ACE, site SCPs."},
     "rds-ensure":    {"fn": v_rds_ensure, "group": "rds",

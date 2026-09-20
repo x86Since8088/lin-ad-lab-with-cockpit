@@ -249,12 +249,12 @@ class Base(unittest.TestCase):
 KNOWN_TYPES = {"str", "int", "bool", "enum", "password-stdin"}
 KNOWN_GROUPS = {"meta", "overview", "fsmo", "users", "groups", "gpo", "objects",
                 "sites", "dns", "dcs", "clients", "activity", "domains",
-                "members", "rds"}
+                "members", "rds", "spn"}
 DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "ou-delete", "gpo-delete", "gpo-unlink", "gpo-settings-remove",
                "dns-delete", "dc-restart", "dc-shell", "dc-promote", "dc-demote",
                "dc-decommission", "domain-add", "domain-remove",
-               "client-remove", "member-deprovision"}
+               "client-remove", "member-deprovision", "spn-delete"}
 
 
 class TestSchema(Base):
@@ -989,6 +989,134 @@ class TestGpoVerbs(Base):
 import base64 as _base64
 def _b64(blob):
     return _base64.b64encode(blob).decode()
+
+
+class TestSpn(Base):
+    """setspn-compatible SPN verbs: list / list-all / add / delete / query /
+    find-duplicates."""
+    ONE = ("dn: CN=web01,CN=Computers,DC=ad,DC=edt1,DC=lab\n"
+           "sAMAccountName: WEB01$\n"
+           "objectClass: computer\n"
+           "servicePrincipalName: HTTP/web01.ad.edt1.lab\n"
+           "servicePrincipalName: HOST/web01\n\n")
+    TWO = (ONE +
+           "dn: CN=svc-sql,CN=Users,DC=ad,DC=edt1,DC=lab\n"
+           "sAMAccountName: svc-sql\n"
+           "objectClass: user\n"
+           "servicePrincipalName: MSSQLSvc/db01.ad.edt1.lab:1433\n\n")
+    # same SPN (HTTP/dup) on two accounts -> a duplicate
+    DUP = ("dn: CN=a,CN=Computers,DC=ad,DC=edt1,DC=lab\n"
+           "sAMAccountName: A$\nobjectClass: computer\n"
+           "servicePrincipalName: HTTP/dup.ad.edt1.lab\n"
+           "servicePrincipalName: HOST/a\n\n"
+           "dn: CN=b,CN=Computers,DC=ad,DC=edt1,DC=lab\n"
+           "sAMAccountName: B$\nobjectClass: computer\n"
+           "servicePrincipalName: HTTP/dup.ad.edt1.lab\n\n")
+
+    # -- units -------------------------------------------------------------
+    def test_valid_spn(self):
+        self.assertEqual(mod._valid_spn(" HTTP/web01 "), "HTTP/web01")
+        for bad in ("", "noSlash", "has space/x"):
+            with self.assertRaises(mod.Fail):
+                mod._valid_spn(bad)
+
+    # -- setspn -L ---------------------------------------------------------
+    def test_spn_list_returns_sorted_spns(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=self.ONE)
+        rc, out = self.call_main(["spn-list", "--account", "web01"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["account"], "WEB01$")
+        self.assertEqual(out["spns"], ["HOST/web01", "HTTP/web01.ad.edt1.lab"])
+
+    def test_spn_list_unknown_account(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out="")
+        rc, out = self.call_main(["spn-list", "--account", "ghost"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no user or computer account", out["error"])
+
+    # -- list-all ----------------------------------------------------------
+    def test_spn_list_all_groups_and_counts(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=self.TWO)
+        rc, out = self.call_main(["spn-list-all"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["account_count"], 2)
+        self.assertEqual(out["spn_count"], 3)
+        by = {r["account"]: r for r in out["accounts"]}
+        self.assertEqual(by["WEB01$"]["class"], "computer")
+        self.assertEqual(by["svc-sql"]["class"], "user")
+
+    # -- setspn -S / -A ----------------------------------------------------
+    def test_spn_add_targets_pdc_dup_checked(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "spn" in a and "add" in a, out="")
+        rc, out = self.call_main(["spn-add", "--account", "WEB01$",
+                                  "--spn", "HTTP/web01.ad.edt1.lab"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(out["forced"])
+        argv = next(c[0] for c in self.fake.calls if "add" in c[0] and "spn" in c[0])
+        self.assertIn("dc1", argv)                      # PDC emulator
+        self.assertEqual(argv[-3:], ["add", "HTTP/web01.ad.edt1.lab", "WEB01$"])
+        self.assertNotIn("--force", argv)
+
+    def test_spn_add_force_skips_dup_check(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "spn" in a and "add" in a, out="")
+        rc, out = self.call_main(["spn-add", "--account", "WEB01$",
+                                  "--spn", "HTTP/web01", "--force", "true"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["forced"])
+        argv = next(c[0] for c in self.fake.calls if "add" in c[0] and "spn" in c[0])
+        self.assertIn("--force", argv)
+
+    def test_spn_add_rejects_bad_spn(self):
+        self.fake.lab_up()
+        rc, out = self.call_main(["spn-add", "--account", "x", "--spn", "noslash"])
+        self.assertEqual(rc, 1)
+        self.assertIn("SPN must look like", out["error"])
+
+    # -- setspn -D ---------------------------------------------------------
+    def test_spn_delete_builds_command(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "spn" in a and "delete" in a, out="")
+        rc, out = self.call_main(["spn-delete", "--account", "WEB01$",
+                                  "--spn", "HOST/web01"])
+        self.assertEqual(rc, 0, out)
+        argv = next(c[0] for c in self.fake.calls if "delete" in c[0] and "spn" in c[0])
+        self.assertIn("dc1", argv)
+        self.assertEqual(argv[-3:], ["delete", "HOST/web01", "WEB01$"])
+
+    # -- setspn -Q ---------------------------------------------------------
+    def test_spn_query_finds_and_flags_duplicate(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=self.DUP)
+        rc, out = self.call_main(["spn-query", "--spn", "HTTP/dup.ad.edt1.lab"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["count"], 2)
+        self.assertTrue(out["duplicate"])
+        # the queried SPN is escaped into the ldbsearch filter
+        argv = next(c[0] for c in self.fake.calls if "ldbsearch" in c[0])
+        self.assertTrue(any("servicePrincipalName=HTTP/dup.ad.edt1.lab" in x for x in argv))
+
+    # -- setspn -X ---------------------------------------------------------
+    def test_spn_find_duplicates(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=self.DUP)
+        rc, out = self.call_main(["spn-find-duplicates"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["count"], 1)
+        d = out["duplicates"][0]
+        self.assertEqual(d["spn"], "HTTP/dup.ad.edt1.lab")
+        self.assertEqual(d["accounts"], ["A$", "B$"])
+
+    def test_spn_find_duplicates_none(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=self.TWO)   # all SPNs unique
+        rc, out = self.call_main(["spn-find-duplicates"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["count"], 0)
 
 
 class TestGpoOsScope(Base):

@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.7.0 - 2026-09-19
+
+Service Principal Names — a setspn-compatible control plane, a dedicated SPNs
+tab, and SPN visibility on every account object.
+
+SPNs bind a Kerberos service to the account that runs it (the `servicePrincipalName`
+attribute on a user or computer). This adds first-class management mirroring
+Windows `setspn.exe`, backed by samba's `spn` subcommand plus two directory reads.
+
+- **Helper verbs (group `spn`)** — the setspn map:
+  - `spn-list --account` → **setspn -L** (SPNs on one account).
+  - `spn-list-all` → every user/computer that carries an SPN (powers the tab and
+    the object preview).
+  - `spn-add --account --spn [--force]` → **setspn -S** (add, refuses a duplicate)
+    / **-A** (`--force true` skips the duplicate check). `samba-tool spn add`.
+  - `spn-delete --account --spn` → **setspn -D** (`samba-tool spn delete`; danger).
+  - `spn-query --spn` → **setspn -Q** (which account(s) hold an SPN; flags a
+    duplicate).
+  - `spn-find-duplicates` → **setspn -X** (one SPN on more than one account — the
+    Kerberos-breaking case).
+  Reads use `ldbsearch` (no credentials, any up DC); add/delete run `samba-tool
+  spn` locally as root on the PDC emulator, like the other object writes.
+- **Dedicated “SPNs” tab** — a control plane listing every account with SPNs
+  (account, type, count, each SPN with a ✕ delete and a per-account “+ SPN”),
+  plus toolbar Add SPN / Query SPN / Find duplicates. All schema-driven.
+- **SPNs on the object** — the AD Objects preview now shows an **SPNs** section for
+  ANY account that carries them (users too, not just the computer Delegation tab),
+  with a link through to the SPN tab.
+- 11 new unit tests (`TestSpn`); 195 total. VERSION → 1.7.0. See `docs/SPN.md`.
+
 ## 1.6.0 - 2026-09-19
 
 OS-exclusive GPOs — a GPO is created Windows- or Linux-exclusive so a Linux
