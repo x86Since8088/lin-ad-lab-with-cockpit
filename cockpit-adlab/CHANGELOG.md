@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.11.2 - 2026-09-19
+
+Fix a deploy-time regression that could take the live plugin down.
+
+- **`deploy.sh` payload retention sorted lexicographically.** The "keep exactly
+  one previous payload" cleanup used `sort -r`, so `payload-1.9.0` sorted *after*
+  `payload-1.10.x`. With 1.10.0 in use and 1.9.0 also present, deploying 1.10.1
+  kept 1.9.0 and **removed `payload-1.10.0`** — the directory the live
+  `/usr/share/cockpit/adlab/*` and `/usr/local/sbin/adlab-admin` symlinks still
+  pointed at. Now `sort -Vr` (semantic version, reversed), so the newest previous
+  payload is the one kept.
+- **`install.sh` refused a dangling self-owned symlink.** `owned_by_us()` used
+  `readlink -f`, which fails once a link target's parent directory is gone, so a
+  link into a just-removed payload read as "not ours" and a redeploy aborted with
+  `already exists and is not ours`. Now `readlink -m`, which canonicalizes without
+  requiring the target to exist: a dangling link still under our root is treated
+  as ours and replaced, while a link pointing outside our root is still refused.
+  This means a host already broken by the sorting bug self-heals on the next
+  deploy instead of needing a manual `rm` of the dangling links.
+- Regression test added (`tests/deploy.test.sh`, root-free, DESTDIR-staged):
+  reproduces the retention outage and the dangling-link recovery. VERSION → 1.11.2.
+
 ## 1.11.1 - 2026-09-19
 
 Fix: `kerberos-audit-status` crashed with `invalid literal for int() with base

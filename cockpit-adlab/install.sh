@@ -170,7 +170,15 @@ owned_by_us() {
     local link=$1 cur
     [[ -e "$link" || -L "$link" ]] || return 0
     [[ -L "$link" ]] || { warn "$link exists and is NOT a symlink"; return 1; }
-    cur="$(readlink -f -- "$link")" || return 1
+    # readlink -m, not -f. -f fails the moment a target's PARENT is gone, which
+    # is exactly the state a link into a just-removed payload is in: a DANGLING
+    # symlink still pointing under our own root. Treating that as "not ours" made
+    # a redeploy abort ("already exists and is not ours") and left the plugin
+    # broken until a manual rm of the dangling links. -m canonicalizes without
+    # requiring anything on the path to exist, and for a LIVE link is identical
+    # to -f - so a dangling self-owned link now reads as ours and is replaced,
+    # while a link pointing outside our root is still refused.
+    cur="$(readlink -m -- "$link")" || return 1
     [[ "$cur" == "$ROOT_REAL"/* || "$cur" == "$SRC"/* ]] \
         || { warn "$link -> $cur, which is not under $ROOT_REAL"; return 1; }
     return 0
