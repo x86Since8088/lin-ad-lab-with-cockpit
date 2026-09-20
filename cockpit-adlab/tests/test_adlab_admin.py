@@ -1061,15 +1061,38 @@ class TestSpn(Base):
         self.assertEqual(argv[-3:], ["add", "HTTP/web01.ad.edt1.lab", "WEB01$"])
         self.assertNotIn("--force", argv)
 
-    def test_spn_add_force_skips_dup_check(self):
+    def test_spn_add_force_uses_ldbmodify(self):
+        # samba-tool spn add has NO --force, so the -A path writes the value
+        # directly with ldbmodify (bypassing the uniqueness check).
         self.fake.lab_up()
-        self.fake.on(lambda a: "spn" in a and "add" in a, out="")
+        self.fake.on(lambda a: "ldbsearch" in a, out=self.ONE)       # account resolves
+        self.fake.on(lambda a: "ldbmodify" in a, out="Modified 1 record")
         rc, out = self.call_main(["spn-add", "--account", "WEB01$",
-                                  "--spn", "HTTP/web01", "--force", "true"])
+                                  "--spn", "HTTP/web01.new", "--force", "true"])
         self.assertEqual(rc, 0, out)
         self.assertTrue(out["forced"])
-        argv = next(c[0] for c in self.fake.calls if "add" in c[0] and "spn" in c[0])
-        self.assertIn("--force", argv)
+        self.assertEqual([c for c in self.fake.calls
+                          if "add" in c[0] and "spn" in c[0]], [])   # NOT samba-tool spn add
+        mod_call = next(c for c in self.fake.calls if "ldbmodify" in c[0])
+        self.assertIn("add: servicePrincipalName", mod_call[1])       # stdin LDIF
+        self.assertIn("servicePrincipalName: HTTP/web01.new", mod_call[1])
+        self.assertIn("CN=web01", mod_call[1])                        # the resolved DN
+
+    def test_spn_list_unfolds_long_spn(self):
+        # ldbsearch folds values >79 chars onto continuation lines (leading
+        # space); parse_ldif_full must UNFOLD them (parse_ldif_entries truncated).
+        folded = ("dn: CN=DC1,OU=Domain Controllers,DC=ad,DC=edt1,DC=lab\n"
+                  "sAMAccountName: DC1$\n"
+                  "objectClass: computer\n"
+                  "servicePrincipalName: E3514235-4B06-11D1-AB04-00C04FC2DCD2/"
+                  "7f750fb1-21cf-4eaa-\n"
+                  " bb60-bd681bea50dd/ad.edt1.lab\n\n")
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=folded)
+        rc, out = self.call_main(["spn-list", "--account", "DC1$"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["spns"], ["E3514235-4B06-11D1-AB04-00C04FC2DCD2/"
+                                       "7f750fb1-21cf-4eaa-bb60-bd681bea50dd/ad.edt1.lab"])
 
     def test_spn_add_rejects_bad_spn(self):
         self.fake.lab_up()
