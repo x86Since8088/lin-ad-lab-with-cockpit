@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 
 
 def _require_config():
@@ -4377,6 +4377,344 @@ def v_pki_status(a):
         st["ca_node"]["issued"] = int((cnt or "0").split()[0] or 0) if (cnt or "").strip() else 0
     return st
 
+# ---- S4U / delegation + authentication policies ---------------------------
+# Kerberos delegation and the modern authentication-hardening controls, wrapping
+# samba-tool (run locally as root on the PDC emulator via -H, no credential file
+# needed — same as the object write verbs). Three delegation types:
+#   * unconstrained (UF_TRUSTED_FOR_DELEGATION 0x80000)  — highest risk
+#   * constrained  (msDS-AllowedToDelegateTo; +protocol transition via
+#     UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION 0x1000000 = S4U2Proxy)
+#   * resource-based (RBCD, msDS-AllowedToActOnBehalfOfOtherIdentity on the
+#     RESOURCE) — the target says who may impersonate to it.
+# Plus the hardening side: the Protected Users group, and authentication
+# policies / silos (samba-tool domain auth).
+UAC_TRUSTED_FOR_DELEGATION = 0x80000        # unconstrained
+UAC_TRUSTED_TO_AUTH_FOR_DELEGATION = 0x1000000   # protocol transition (S4U2Proxy)
+DELEG_FILTER = ("(|(userAccountControl:1.2.840.113556.1.4.803:=524288)"
+                "(userAccountControl:1.2.840.113556.1.4.803:=16777216)"
+                "(msDS-AllowedToDelegateTo=*)"
+                "(msDS-AllowedToActOnBehalfOfOtherIdentity=*))")
+
+def _st_local(dc, args, timeout=120):
+    """samba-tool <args> -H <local sam.ldb> on a DC, as root (no credential
+    file). -H is a global option so appending it is always valid."""
+    return podman(dc, ["samba-tool"] + list(args) + ["-H", SAM], timeout=timeout)
+
+def _deleg_sam(dc, name):
+    """Resolve a user/computer name to its exact sAMAccountName (a computer given
+    without the trailing '$' is matched and returned WITH it) — samba-tool
+    delegation/RBCD need the exact name, unlike the UAC/ldb helpers."""
+    return _spn_account(dc, name.strip())["attrs"].get("sAMAccountName", [name.strip()])[0]
+
+def _parse_delegation_show(out):
+    d = {"account_dn": "", "unconstrained": False, "protocol_transition": False,
+         "allowed_to": []}
+    for ln in (out or "").splitlines():
+        s = ln.strip()
+        if s.startswith("Account-DN:"):
+            d["account_dn"] = s.split(":", 1)[1].strip()
+        elif s.startswith("UF_TRUSTED_FOR_DELEGATION:"):
+            d["unconstrained"] = s.endswith("True")
+        elif s.startswith("UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION:"):
+            d["protocol_transition"] = s.endswith("True")
+        elif s.startswith("msDS-AllowedToDelegateTo:"):
+            d["allowed_to"].append(s.split(":", 1)[1].strip())
+    return d
+
+def v_delegation_list(a):
+    """Every account with any Kerberos delegation configured — the security
+    inventory. Classifies each (unconstrained / constrained[+protocol-transition]
+    / rbcd-target) and ranks by risk (unconstrained highest)."""
+    d = first_up_dc()
+    rc, out, err = podman(d, ["ldbsearch", "-H", SAM, "-b", domain_dn(), DELEG_FILTER,
+                             "sAMAccountName", "userAccountControl",
+                             "msDS-AllowedToDelegateTo",
+                             "msDS-AllowedToActOnBehalfOfOtherIdentity", "objectClass"])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    rows = []
+    for e in parse_ldif_full(out):
+        at = e["attrs"]
+        try:
+            uac = int((at.get("userAccountControl", ["0"])[0]) or 0)
+        except ValueError:
+            uac = 0
+        unconstrained = bool(uac & UAC_TRUSTED_FOR_DELEGATION)
+        prot = bool(uac & UAC_TRUSTED_TO_AUTH_FOR_DELEGATION)
+        allowed = at.get("msDS-AllowedToDelegateTo", [])
+        rbcd = bool(at.get("msDS-AllowedToActOnBehalfOfOtherIdentity"))
+        kinds = []
+        if unconstrained:
+            kinds.append("unconstrained")
+        if allowed:
+            kinds.append("constrained" + ("+protocol-transition" if prot else ""))
+        elif prot:
+            kinds.append("protocol-transition")
+        if rbcd:
+            kinds.append("rbcd-target")
+        risk = "high" if unconstrained else ("medium" if (allowed or rbcd) else "low")
+        cls = "computer" if "computer" in at.get("objectClass", []) else "user"
+        rows.append({"account": at.get("sAMAccountName", [""])[0], "dn": e["dn"],
+                     "class": cls, "kinds": kinds, "unconstrained": unconstrained,
+                     "protocol_transition": prot, "allowed_to": sorted(allowed),
+                     "rbcd": rbcd, "risk": risk})
+    rank = {"high": 0, "medium": 1, "low": 2}
+    rows.sort(key=lambda r: (rank[r["risk"]], r["account"].lower()))
+    return {"on": d, "count": len(rows), "accounts": rows,
+            "note": "Unconstrained delegation (TRUSTED_FOR_DELEGATION) lets a "
+                    "compromise of that host impersonate any user to any service "
+                    "— DCs hold it by design; anything else is worth review."}
+
+def v_delegation_show(a):
+    """samba-tool delegation show for one account (outbound delegation)."""
+    d = first_up_dc()
+    rc, out, err = _st_local(d, ["delegation", "show", a["account"].strip()])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    r = _parse_delegation_show(out)
+    r["on"] = d
+    return r
+
+def v_delegation_set_unconstrained(a):
+    """Set/unset unconstrained delegation (UF_TRUSTED_FOR_DELEGATION) on an
+    account. HIGH RISK — prefer constrained/RBCD."""
+    d = pdc_emulator()
+    state = a["state"].strip().lower()
+    if state not in ("on", "off"):
+        raise Fail("state must be on|off")
+    sam = _deleg_sam(d, a["account"])
+    rc, out, err = _st_local(d, ["delegation", "for-any-service", sam, state])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"account": sam, "unconstrained": state == "on", "on": d}
+
+def v_delegation_set_protocol_transition(a):
+    """Set/unset protocol transition (UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION,
+    S4U2Proxy) — lets constrained delegation work for any protocol."""
+    d = pdc_emulator()
+    state = a["state"].strip().lower()
+    if state not in ("on", "off"):
+        raise Fail("state must be on|off")
+    sam = _deleg_sam(d, a["account"])
+    rc, out, err = _st_local(d, ["delegation", "for-any-protocol", sam, state])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"account": sam, "protocol_transition": state == "on", "on": d}
+
+def v_delegation_add_service(a):
+    """Add a service SPN to msDS-AllowedToDelegateTo (constrained delegation)."""
+    d = pdc_emulator()
+    sam = _deleg_sam(d, a["account"])
+    rc, out, err = _st_local(d, ["delegation", "add-service", sam, a["service"].strip()])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"account": sam, "added_service": a["service"], "on": d}
+
+def v_delegation_remove_service(a):
+    """Remove a service SPN from msDS-AllowedToDelegateTo."""
+    d = pdc_emulator()
+    sam = _deleg_sam(d, a["account"])
+    rc, out, err = _st_local(d, ["delegation", "del-service", sam, a["service"].strip()])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"account": sam, "removed_service": a["service"], "on": d}
+
+def _rbcd_principals(dc, dn):
+    """Decode msDS-AllowedToActOnBehalfOfOtherIdentity (a binary SD) to SDDL via
+    samba-python and resolve each ACE SID to a name. Returns (dict|None, err)."""
+    code = (
+        "from samba.samdb import SamDB\n"
+        "from samba.auth import system_session\n"
+        "from samba.param import LoadParm\n"
+        "from samba.dcerpc import security\n"
+        "from samba.ndr import ndr_unpack\n"
+        "lp=LoadParm();lp.load_default()\n"
+        "db=SamDB(%r,session_info=system_session(),lp=lp)\n"
+        "r=db.search(base=%r,scope=0,attrs=['msDS-AllowedToActOnBehalfOfOtherIdentity'])\n"
+        "v=r[0].get('msDS-AllowedToActOnBehalfOfOtherIdentity')\n"
+        "print(ndr_unpack(security.descriptor,bytes(v[0])).as_sddl() if v else '')\n"
+    ) % (SAM, dn)
+    rc, out, err = podman(dc, ["python3", "-c", code])
+    if rc != 0:
+        return None, (err.strip() or out.strip())[-400:]
+    sddl = (out or "").strip()
+    principals = []
+    for sid in sorted(set(re.findall(r'S-1-[0-9-]+', sddl))):
+        rc2, o2, _ = podman(dc, ["ldbsearch", "-H", SAM, "-b", domain_dn(),
+                                 "(objectSid=%s)" % sid, "sAMAccountName"])
+        m = re.search(r'(?mi)^sAMAccountName:\s*(.+)$', o2 or "") if rc2 == 0 else None
+        principals.append({"sid": sid, "name": m.group(1).strip() if m else ""})
+    return {"sddl": sddl, "principals": principals}, None
+
+def v_rbcd_show(a):
+    """Resource-based constrained delegation on a RESOURCE account: which
+    principals may act on its behalf (decoded from the security descriptor)."""
+    d = first_up_dc()
+    e = _spn_account(d, a["account"].strip())
+    info, err = _rbcd_principals(d, e["dn"])
+    if info is None:
+        raise Fail("RBCD decode failed: " + err)
+    return {"account": a["account"], "dn": e["dn"], "on": d,
+            "principals": info["principals"], "count": len(info["principals"])}
+
+def v_rbcd_add(a):
+    """Allow a principal to act on behalf of the resource account (RBCD)."""
+    d = pdc_emulator()
+    res = _deleg_sam(d, a["account"])
+    prin = _deleg_sam(d, a["principal"])
+    rc, out, err = _st_local(d, ["delegation", "add-principal", res, prin])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"resource": res, "added_principal": prin, "on": d}
+
+def v_rbcd_remove(a):
+    """Revoke a principal from the resource account's RBCD set."""
+    d = pdc_emulator()
+    res = _deleg_sam(d, a["account"])
+    prin = _deleg_sam(d, a["principal"])
+    rc, out, err = _st_local(d, ["delegation", "del-principal", res, prin])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"resource": res, "removed_principal": prin, "on": d}
+
+# ---- Protected Users + authentication policies / silos --------------------
+PROTECTED_USERS = "Protected Users"
+
+def v_protected_users_list(a):
+    """Members of the Protected Users group (their credentials get hardened:
+    no NTLM/DES/RC4, no delegation, no long-lived TGT)."""
+    d = first_up_dc()
+    rc, out, err = podman(d, ["ldbsearch", "-H", SAM, "-b", domain_dn(),
+                             "(sAMAccountName=%s)" % PROTECTED_USERS, "member"])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    ents = parse_ldif_full(out)
+    members = sorted(ents[0]["attrs"].get("member", [])) if ents else []
+    return {"group": PROTECTED_USERS, "on": d, "members": members,
+            "count": len(members),
+            "note": "Members cannot use NTLM, DES/RC4, unconstrained/constrained "
+                    "delegation, or TGTs beyond ~4h. Do NOT add service accounts "
+                    "or computers that rely on those."}
+
+def v_protected_users_add(a):
+    """Add a member to Protected Users."""
+    d = pdc_emulator()
+    rc, out, err = _st_local(d, ["group", "addmembers", PROTECTED_USERS, a["member"].strip()])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"group": PROTECTED_USERS, "added": a["member"], "on": d}
+
+def v_protected_users_remove(a):
+    """Remove a member from Protected Users."""
+    d = pdc_emulator()
+    rc, out, err = _st_local(d, ["group", "removemembers", PROTECTED_USERS, a["member"].strip()])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"group": PROTECTED_USERS, "removed": a["member"], "on": d}
+
+def _auth_list(d, kind):
+    """samba-tool domain auth <policy|silo> list -> [names]."""
+    rc, out, err = _st_local(d, ["domain", "auth", kind, "list"])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return sorted(l.strip() for l in (out or "").splitlines() if l.strip())
+
+def v_authpolicy_list(a):
+    """Authentication policies on the domain (TGT lifetime + who may authenticate
+    from/to). Enforcement needs samba's KDC + FAST; new ones default to audit."""
+    d = first_up_dc()
+    return {"on": d, "policies": _auth_list(d, "policy"),
+            "note": "Create with --enforce off (audit) first; enforcement is by "
+                    "samba's KDC and applies to accounts in an assigned silo or "
+                    "with the policy set directly."}
+
+def v_authpolicy_show(a):
+    """View one authentication policy."""
+    d = first_up_dc()
+    rc, out, err = _st_local(d, ["domain", "auth", "policy", "view", "--name", a["name"].strip()])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"name": a["name"], "on": d, "detail": (out or "").strip()}
+
+def v_authpolicy_create(a):
+    """Create an authentication policy. Defaults to AUDIT (safe); pass
+    enforce=true to enforce. Optional TGT lifetime (minutes)."""
+    d = pdc_emulator()
+    args = ["domain", "auth", "policy", "create", "--name", a["name"].strip()]
+    args.append("--enforce" if str(a.get("enforce", "")).lower() in ("1", "yes", "true") else "--audit")
+    if a.get("tgt_lifetime_mins"):
+        args += ["--user-tgt-lifetime-mins", str(int(a["tgt_lifetime_mins"]))]
+    if a.get("description"):
+        args += ["--description", a["description"]]
+    rc, out, err = _st_local(d, args)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"created": a["name"], "enforced": str(a.get("enforce", "")).lower() in ("1", "yes", "true"),
+            "on": d}
+
+def v_authpolicy_delete(a):
+    """Delete an authentication policy."""
+    d = pdc_emulator()
+    rc, out, err = _st_local(d, ["domain", "auth", "policy", "delete", "--name", a["name"].strip()])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"deleted": a["name"], "on": d}
+
+def v_authsilo_list(a):
+    """Authentication silos on the domain."""
+    d = first_up_dc()
+    return {"on": d, "silos": _auth_list(d, "silo")}
+
+def v_authsilo_show(a):
+    """View one authentication silo (its policies + members)."""
+    d = first_up_dc()
+    rc, out, err = _st_local(d, ["domain", "auth", "silo", "view", "--name", a["name"].strip()])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"name": a["name"], "on": d, "detail": (out or "").strip()}
+
+def v_authsilo_create(a):
+    """Create an authentication silo, binding user/computer/service policies.
+    Defaults to AUDIT; pass enforce=true to enforce."""
+    d = pdc_emulator()
+    args = ["domain", "auth", "silo", "create", "--name", a["name"].strip()]
+    for k, flag in (("user_policy", "--user-authentication-policy"),
+                    ("computer_policy", "--computer-authentication-policy"),
+                    ("service_policy", "--service-authentication-policy")):
+        if a.get(k):
+            args += [flag, a[k]]
+    args.append("--enforce" if str(a.get("enforce", "")).lower() in ("1", "yes", "true") else "--audit")
+    rc, out, err = _st_local(d, args)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"created": a["name"], "on": d}
+
+def v_authsilo_delete(a):
+    """Delete an authentication silo."""
+    d = pdc_emulator()
+    rc, out, err = _st_local(d, ["domain", "auth", "silo", "delete", "--name", a["name"].strip()])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"deleted": a["name"], "on": d}
+
+def v_authsilo_member_grant(a):
+    """Grant an account membership in an authentication silo."""
+    d = pdc_emulator()
+    rc, out, err = _st_local(d, ["domain", "auth", "silo", "member", "grant",
+                                 "--name", a["name"].strip(), "--member", a["member"].strip()])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"silo": a["name"], "granted": a["member"], "on": d}
+
+def v_authsilo_member_revoke(a):
+    """Revoke an account's membership in an authentication silo."""
+    d = pdc_emulator()
+    rc, out, err = _st_local(d, ["domain", "auth", "silo", "member", "revoke",
+                                 "--name", a["name"].strip(), "--member", a["member"].strip()])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"silo": a["name"], "revoked": a["member"], "on": d}
+
 # ---- clients & onboarding -------------------------------------------------
 
 def v_client_list(a):
@@ -5923,6 +6261,73 @@ VERBS = {
                                arg("days", "int", required=False, help_="validity override (default: the template's)")]},
     "pki-cert-list":  {"fn": v_pki_cert_list, "group": "pki",
                       "help": "Certificates the CA node has issued (subject, serial, validity)."},
+    "delegation-list": {"fn": v_delegation_list, "group": "delegation",
+                      "help": "Every account with any Kerberos delegation, classified and risk-ranked (unconstrained highest). The security inventory — drives the Delegation tab."},
+    "delegation-show": {"fn": v_delegation_show, "group": "delegation",
+                      "help": "Outbound delegation of one account (samba-tool delegation show).",
+                      "args": [arg("account", help_="sAMAccountName (computer with or without $)")]},
+    "delegation-set-unconstrained": {"fn": v_delegation_set_unconstrained, "group": "delegation", "danger": True,
+                      "help": "Set/unset UNCONSTRAINED delegation (UF_TRUSTED_FOR_DELEGATION). High risk — prefer constrained/RBCD.",
+                      "args": [arg("account"), arg("state", "enum", choices=["on", "off"])]},
+    "delegation-set-protocol-transition": {"fn": v_delegation_set_protocol_transition, "group": "delegation", "danger": True,
+                      "help": "Set/unset protocol transition (UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION / S4U2Proxy).",
+                      "args": [arg("account"), arg("state", "enum", choices=["on", "off"])]},
+    "delegation-add-service": {"fn": v_delegation_add_service, "group": "delegation",
+                      "help": "Add a service SPN to msDS-AllowedToDelegateTo (constrained delegation).",
+                      "args": [arg("account"), arg("service", help_="SPN, e.g. cifs/fs01.ad.edt1.lab")]},
+    "delegation-remove-service": {"fn": v_delegation_remove_service, "group": "delegation", "danger": True,
+                      "help": "Remove a service SPN from msDS-AllowedToDelegateTo.",
+                      "args": [arg("account"), arg("service", help_="SPN to remove")]},
+    "rbcd-show": {"fn": v_rbcd_show, "group": "delegation",
+                      "help": "Resource-based constrained delegation: which principals may act on behalf of this resource (decoded from its security descriptor).",
+                      "args": [arg("account", help_="the RESOURCE account")]},
+    "rbcd-add": {"fn": v_rbcd_add, "group": "delegation",
+                      "help": "Allow a principal to act on behalf of the resource account (RBCD).",
+                      "args": [arg("account", help_="the RESOURCE account"),
+                               arg("principal", help_="principal allowed to impersonate, e.g. web01$")]},
+    "rbcd-remove": {"fn": v_rbcd_remove, "group": "delegation", "danger": True,
+                      "help": "Revoke a principal from the resource account's RBCD set.",
+                      "args": [arg("account", help_="the RESOURCE account"), arg("principal")]},
+    "protected-users-list": {"fn": v_protected_users_list, "group": "authpolicy",
+                      "help": "Members of the Protected Users group (credentials hardened: no NTLM/DES/RC4, no delegation, short TGT)."},
+    "protected-users-add": {"fn": v_protected_users_add, "group": "authpolicy", "danger": True,
+                      "help": "Add a member to Protected Users. Do not add accounts relying on NTLM/RC4/delegation.",
+                      "args": [arg("member", help_="sAMAccountName")]},
+    "protected-users-remove": {"fn": v_protected_users_remove, "group": "authpolicy", "danger": True,
+                      "help": "Remove a member from Protected Users.",
+                      "args": [arg("member")]},
+    "authpolicy-list": {"fn": v_authpolicy_list, "group": "authpolicy",
+                      "help": "Authentication policies on the domain (TGT lifetime, allowed-from/to)."},
+    "authpolicy-show": {"fn": v_authpolicy_show, "group": "authpolicy",
+                      "help": "View one authentication policy.", "args": [arg("name")]},
+    "authpolicy-create": {"fn": v_authpolicy_create, "group": "authpolicy",
+                      "help": "Create an authentication policy. Defaults to AUDIT; enforce=true to enforce.",
+                      "args": [arg("name"),
+                               arg("enforce", "enum", required=False, choices=["true", "false"], default="false",
+                                   help_="true = enforce; default audit-only"),
+                               arg("tgt_lifetime_mins", "int", required=False, help_="user TGT lifetime in minutes"),
+                               arg("description", required=False)]},
+    "authpolicy-delete": {"fn": v_authpolicy_delete, "group": "authpolicy", "danger": True,
+                      "help": "Delete an authentication policy.", "args": [arg("name")]},
+    "authsilo-list": {"fn": v_authsilo_list, "group": "authpolicy",
+                      "help": "Authentication silos on the domain."},
+    "authsilo-show": {"fn": v_authsilo_show, "group": "authpolicy",
+                      "help": "View one authentication silo (its policies + members).", "args": [arg("name")]},
+    "authsilo-create": {"fn": v_authsilo_create, "group": "authpolicy",
+                      "help": "Create an authentication silo binding user/computer/service policies. Defaults to AUDIT.",
+                      "args": [arg("name"),
+                               arg("user_policy", required=False, help_="user authentication policy name"),
+                               arg("computer_policy", required=False, help_="computer authentication policy name"),
+                               arg("service_policy", required=False, help_="service authentication policy name"),
+                               arg("enforce", "enum", required=False, choices=["true", "false"], default="false")]},
+    "authsilo-delete": {"fn": v_authsilo_delete, "group": "authpolicy", "danger": True,
+                      "help": "Delete an authentication silo.", "args": [arg("name")]},
+    "authsilo-member-grant": {"fn": v_authsilo_member_grant, "group": "authpolicy",
+                      "help": "Grant an account membership in an authentication silo.",
+                      "args": [arg("name", help_="silo name"), arg("member", help_="sAMAccountName")]},
+    "authsilo-member-revoke": {"fn": v_authsilo_member_revoke, "group": "authpolicy", "danger": True,
+                      "help": "Revoke an account's membership in an authentication silo.",
+                      "args": [arg("name", help_="silo name"), arg("member")]},
     "client-list":   {"fn": v_client_list, "group": "clients",
                       "help": "Client containers with join state."},
     "client-onboard": {"fn": v_client_onboard, "group": "clients",
