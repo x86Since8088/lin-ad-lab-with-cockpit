@@ -467,6 +467,7 @@
         ["overview", "Overview"],
         ["objects", "AD Objects"],
         ["spn", "SPNs"],
+        ["kerberos", "Kerberos"],
         ["gpo", "Group Policy"], ["sites", "Sites & Replication"],
         ["dns", "DNS"], ["domains", "Domains"], ["dcs", "Domain Controllers"],
         ["clients", "Clients"], ["members", "Member Servers"],
@@ -3045,6 +3046,78 @@
         refresh.addEventListener("click", load); load();
     }
 
+    // -------- Kerberos ticket anomaly detection (Kerberoasting)
+    function renderKerberos() {
+        var m = content();
+        function fmtT(s) { try { return s ? new Date(s * 1000).toLocaleString() : ""; } catch (e) { return String(s); } }
+        var acts = el("div", "al-actions");
+        acts.appendChild(actionButton("Enable audit", "kerberos-audit-enable", {}));
+        acts.appendChild(actionButton("Disable audit", "kerberos-audit-disable", {}));
+        acts.appendChild(actionButton("Ticket requests", "kerberos-ticket-requests", {}));
+        var refresh = el("button", "al-btn secondary", "Refresh");
+        refresh.addEventListener("click", function () { refreshTab(); });
+        acts.appendChild(refresh);
+        m.appendChild(acts);
+        m.appendChild(el("div", "al-alert warn",
+            "Detects Kerberoasting: service tickets requested/issued with RC4 (etype " +
+            "0x17) instead of AES — RC4 hashes crack far faster — and accounts pulling " +
+            "many TGS tickets for distinct SPNs in a short window (a roasting sweep). " +
+            "Live detection needs KDC auditing ON (Enable audit — runtime; resets on a " +
+            "DC restart). The exposure table below is always available."));
+        var holder = el("div", "al-grid"); m.appendChild(holder);
+
+        var fAnom = slotCard(holder, "Anomalous ticket requests", true);
+        run("kerberos-anomalies", { window: 60 }).then(function (r) {
+            var box = el("div");
+            if (!r.audit_active)
+                box.appendChild(el("div", "al-alert warn",
+                    "KDC auditing is OFF — click “Enable audit”, then generate or await " +
+                    "Kerberos traffic. Showing " + r.considered + " live events."));
+            box.appendChild(el("h4", null, "RC4 downgrade requests — " + r.rc4_count));
+            box.appendChild(emptyOr(r.rc4_requests,
+                ["time", "client", "target SPN", "requested", "issued", "source"],
+                function (x) {
+                    return [fmtT(x.time), x.client, x.spn,
+                            (x.requested_etypes || []).join(", "),
+                            x.rc4_issued ? badge(String(x.issued_etype), "err") : String(x.issued_etype),
+                            x.ip];
+                }, "no RC4 requests in window"));
+            box.appendChild(el("h4", null, "Bulk TGS — possible sweep — " + r.bulk_count));
+            box.appendChild(emptyOr(r.bulk_tgs,
+                ["client", "TGS", "distinct SPNs", "RC4?", "SPNs"],
+                function (x) {
+                    return [el("kbd", "al", x.client), String(x.tgs_count),
+                            String(x.distinct_spns),
+                            x.rc4_any ? badge("yes", "err") : badge("no", "dim"),
+                            (x.spns || []).join("  ")];
+                }, "no bulk-TGS accounts in window"));
+            fAnom(box, "Anomalous ticket requests (last " + r.window_minutes + " min; flag ≥ " +
+                r.distinct_spn_threshold + " distinct SPNs or ≥ " + r.tgs_threshold + " TGS/account)");
+        }).catch(function (e) { fAnom(el("div", "al-alert err", String(e))); });
+
+        var fExp = slotCard(holder, "Kerberoast exposure", true);
+        run("kerberos-roast-exposure").then(function (r) {
+            fExp(emptyOr(r.accounts,
+                ["account", "type", "#SPN", "supported etypes", "exposure"],
+                function (x) {
+                    return [el("kbd", "al", x.account), x.class, String(x.spn_count),
+                            (x.supported_etypes || []).join(", ") || "(unset → RC4)",
+                            x.aes_only ? badge("AES-only", "ok") : badge("RC4 roastable", "err")];
+                }, "no SPN accounts"),
+                "Kerberoast exposure — " + r.roastable + "/" + r.total + " roastable (" +
+                r.roastable_users + " user account(s)); harden to AES-only (0x18). On " + r.on);
+        }).catch(function (e) { fExp(el("div", "al-alert err", String(e))); });
+
+        var fSt = slotCard(holder, "KDC audit status", true);
+        run("kerberos-audit-status").then(function (r) {
+            fSt(emptyOr(r.dcs, ["DC", "kerberos level", "auditing", "records"], function (x) {
+                return [x.dc, String(x.kerberos_level),
+                        x.audit_active ? badge("on", "ok") : badge("off", "dim"),
+                        String(x.tgs_records)];
+            }, "no DCs"), "KDC audit status (auditing is runtime — resets on a DC restart)");
+        }).catch(function (e) { fSt(el("div", "al-alert err", String(e))); });
+    }
+
     // -------- SPNs (Service Principal Names) — setspn-compatible control plane
     function renderSpn() {
         var m = content();
@@ -3088,7 +3161,7 @@
 
     // ---------------------------------------------------------------- boot
     var RENDER = { overview: renderOverview,
-                   objects: renderObjects, spn: renderSpn, gpo: renderGpo,
+                   objects: renderObjects, spn: renderSpn, kerberos: renderKerberos, gpo: renderGpo,
                    sites: renderSites, dns: renderDns, domains: renderDomains,
                    dcs: renderDcs, clients: renderClients, members: renderMembers,
                    activity: renderActivity };

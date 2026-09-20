@@ -249,7 +249,7 @@ class Base(unittest.TestCase):
 KNOWN_TYPES = {"str", "int", "bool", "enum", "password-stdin"}
 KNOWN_GROUPS = {"meta", "overview", "fsmo", "users", "groups", "gpo", "objects",
                 "sites", "dns", "dcs", "clients", "activity", "domains",
-                "members", "rds", "spn"}
+                "members", "rds", "spn", "kerberos"}
 DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "ou-delete", "gpo-delete", "gpo-unlink", "gpo-settings-remove",
                "dns-delete", "dc-restart", "dc-shell", "dc-promote", "dc-demote",
@@ -989,6 +989,136 @@ class TestGpoVerbs(Base):
 import base64 as _base64
 def _b64(blob):
     return _base64.b64encode(blob).decode()
+
+
+class TestKerberos(Base):
+    """Kerberos ticket anomaly detection: KDC-audit parse, RC4 downgrade + bulk
+    TGS, and static roast exposure."""
+    def _tgs(self, client, spn, etype="18/18", etypes="18,17", auth=None):
+        import time as _t
+        auth = auth if auth is not None else int(_t.time())
+        return ("  Kerberos: TGS-REQ SUCCESS ipv4:10.0.0.9:5 %s %s etype=%s "
+                "pac_attributes=2 canon_client_name=%s end=1 auth=%d etypes=%s "
+                "renew=1 elapsed=0.001 flags=canonicalize start=1 armor_client_name=%s"
+                % (client, spn, etype, client, auth, etypes, client))
+
+    def _grep_tgs(self, blob):
+        self.fake.on(lambda a: "bash" in a and any("TGS-REQ SUCCESS" in str(x) for x in a),
+                     out=blob)
+
+    # -- pure parsers ------------------------------------------------------
+    def test_parse_tgs_requested_rc4_issued_aes(self):
+        rec = mod._parse_tgs_success(
+            "  Kerberos: TGS-REQ SUCCESS ipv4:127.0.0.1:35242 krbu@AD.EDT1.LAB "
+            "HOST/dc1.ad.edt1.lab@AD.EDT1.LAB etype=18/18 pac_attributes=2 "
+            "canon_client_name=krbu@AD.EDT1.LAB end=1 auth=1789865502 etypes=23 "
+            "renew=1 elapsed=0.004 flags=canonicalize start=1 armor_client_name=x")
+        self.assertEqual(rec["client"], "krbu@AD.EDT1.LAB")
+        self.assertEqual(rec["spn"], "HOST/dc1.ad.edt1.lab@AD.EDT1.LAB")
+        self.assertEqual(rec["ip"], "ipv4:127.0.0.1:35242")
+        self.assertEqual(rec["issued_etype"], 18)
+        self.assertEqual(rec["requested_etypes"], [23])
+        self.assertTrue(rec["rc4_requested"])       # asked for RC4 (downgrade)
+        self.assertFalse(rec["rc4_issued"])         # KDC still gave AES
+        self.assertEqual(rec["auth"], 1789865502)
+
+    def test_parse_tgs_issued_rc4(self):
+        rec = mod._parse_tgs_success(
+            "Kerberos: TGS-REQ SUCCESS ipv4:1.2.3.4:5 svc@R MSSQLSvc/db@R "
+            "etype=23/23 auth=1 etypes=23")
+        self.assertTrue(rec["rc4_issued"])
+        self.assertEqual(rec["issued_etype_name"], "rc4-hmac")
+
+    def test_parse_non_tgs_is_none(self):
+        self.assertIsNone(mod._parse_tgs_success("Kerberos: AS-REQ a from b for krbtgt"))
+
+    def test_decode_supp_etypes(self):
+        _, rc4, aes_only, _ = mod._decode_supp_etypes("0")     # unset -> legacy RC4
+        self.assertTrue(rc4); self.assertFalse(aes_only)
+        names, rc4, aes_only, _ = mod._decode_supp_etypes(str(0x18))   # AES128+256 only
+        self.assertFalse(rc4); self.assertTrue(aes_only); self.assertIn("AES256-SHA1", names)
+        _, rc4, aes_only, _ = mod._decode_supp_etypes(str(0x1C))       # RC4+AES
+        self.assertTrue(rc4); self.assertFalse(aes_only)
+        _, rc4, aes_only, _ = mod._decode_supp_etypes(str(0x4))        # RC4 only
+        self.assertTrue(rc4); self.assertFalse(aes_only)
+
+    # -- anomalies ---------------------------------------------------------
+    def test_anomalies_flags_rc4_and_bulk(self):
+        self.fake.lab_up()
+        lines = [self._tgs("attacker@AD.EDT1.LAB", "svc%d/h@AD.EDT1.LAB" % i, etypes="23")
+                 for i in range(7)]
+        lines.append(self._tgs("alice@AD.EDT1.LAB", "HOST/dc1@AD.EDT1.LAB", etypes="18,17"))
+        self._grep_tgs("\n".join(lines))
+        rc, out = self.call_main(["kerberos-anomalies", "--dc", "dc1",
+                                  "--window", "60", "--distinct_spn_threshold", "5"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["rc4_count"], 7)
+        self.assertEqual(out["bulk_count"], 1)
+        self.assertEqual(out["bulk_tgs"][0]["client"], "attacker@AD.EDT1.LAB")
+        self.assertEqual(out["bulk_tgs"][0]["distinct_spns"], 7)
+        self.assertTrue(out["bulk_tgs"][0]["rc4_any"])
+
+    def test_anomalies_window_excludes_old(self):
+        import time as _t
+        self.fake.lab_up()
+        self._grep_tgs(self._tgs("x@R", "svc/h@R", etypes="23", auth=int(_t.time()) - 3600 * 5))
+        rc, out = self.call_main(["kerberos-anomalies", "--dc", "dc1", "--window", "60"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["considered"], 0)
+        self.assertEqual(out["rc4_count"], 0)
+
+    def test_ticket_requests_parses(self):
+        self.fake.lab_up()
+        self._grep_tgs(self._tgs("alice@R", "HTTP/web@R", etypes="18") + "\n" +
+                       self._tgs("bob@R", "CIFS/fs@R", etypes="23"))
+        rc, out = self.call_main(["kerberos-ticket-requests", "--dc", "dc1"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["count"], 2)
+        self.assertIn("bob@R", [r["client"] for r in out["requests"]])
+
+    # -- static exposure ---------------------------------------------------
+    def test_roast_exposure_classifies(self):
+        self.fake.lab_up()
+        ldif = ("dn: CN=svc1,CN=Users,DC=ad,DC=edt1,DC=lab\n"
+                "sAMAccountName: svc1\nobjectClass: user\n"
+                "servicePrincipalName: MSSQLSvc/db@R\n\n"
+                "dn: CN=svc2,CN=Users,DC=ad,DC=edt1,DC=lab\n"
+                "sAMAccountName: svc2\nobjectClass: user\n"
+                "servicePrincipalName: HTTP/web@R\n"
+                "msDS-SupportedEncryptionTypes: 24\n\n")   # 0x18 = AES only
+        self.fake.on(lambda a: "ldbsearch" in a, out=ldif)
+        rc, out = self.call_main(["kerberos-roast-exposure"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["total"], 2)
+        by = {x["account"]: x for x in out["accounts"]}
+        self.assertTrue(by["svc1"]["rc4_allowed"])     # unset -> roastable
+        self.assertFalse(by["svc2"]["rc4_allowed"])    # AES-only
+        self.assertTrue(by["svc2"]["aes_only"])
+        self.assertEqual(out["roastable"], 1)
+
+    # -- audit enable/status ----------------------------------------------
+    def test_audit_status_reports_level(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "bash" in a and any(":88 " in str(x) for x in a), out="31\n36\n")
+        self.fake.on(lambda a: "smbcontrol" in a and "debuglevel" in a,
+                     out="PID 31: all:1 kerberos:3 kdc:1")
+        self.fake.on(lambda a: "bash" in a and any("grep -ac 'TGS-REQ SUCCESS'" in str(x) for x in a),
+                     out="5\n")
+        rc, out = self.call_main(["kerberos-audit-status", "--dc", "dc1"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["dcs"][0]["audit_active"])
+        self.assertEqual(out["dcs"][0]["kerberos_level"], 3)
+        self.assertEqual(out["dcs"][0]["tgs_records"], 5)
+
+    def test_audit_enable_smbcontrols_workers(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "bash" in a and any(":88 " in str(x) for x in a), out="31\n36\n")
+        self.fake.on(lambda a: "smbcontrol" in a and "debug" in a, out="")
+        rc, out = self.call_main(["kerberos-audit-enable", "--dc", "dc1"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["enabled_on"][0]["set_ok"], 2)
+        self.assertTrue(any("kerberos:3" in " ".join(map(str, c[0]))
+                            for c in self.fake.calls if "smbcontrol" in c[0]))
 
 
 class TestSpn(Base):

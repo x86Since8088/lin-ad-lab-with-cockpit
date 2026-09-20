@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.8.0 - 2026-09-19
+
+Kerberos ticket anomaly detection (Kerberoasting) — a dedicated "Kerberos" tab
+and verbs that flag RC4-downgrade service-ticket requests and bulk-TGS sweeps,
+plus a static exposure view. See `docs/KERBEROS-ANOMALIES.md`.
+
+- **`kerberos-roast-exposure`** (static, always available) — every SPN-bearing
+  account with its `msDS-supportedEncryptionTypes` decoded and an RC4-roastable
+  vs AES-only verdict (unset ⇒ legacy RC4). This is the Kerberoastable surface;
+  user service accounts are the high-value targets. ldbsearch-based.
+- **KDC audit** — the two live detections read the samba/Heimdal KDC audit:
+  - **`kerberos-audit-enable` / `-status` / `-disable`** — turn KDC request
+    logging on/off. The DC entrypoint starts samba with `--debuglevel=1`, which
+    overrides smb.conf `log level`, so the only runtime lever is `smbcontrol` to
+    the pre-forked KDC **worker** processes (the master's level does not
+    propagate). This is runtime-only and resets on a DC restart.
+  - **`kerberos-ticket-requests`** — parsed `TGS-REQ SUCCESS` audit records
+    (client, target SPN, requested vs issued etype, source, time), optionally
+    within `--window` minutes.
+  - **`kerberos-anomalies`** — the two goal detections in one window:
+    (1) **RC4 downgrade** — requests whose requested etypes include RC4 (23/24)
+    or whose issued service-ticket etype is RC4; (2) **bulk TGS** — accounts
+    exceeding a distinct-SPN or total-TGS threshold (defaults 6 / 20), the
+    Kerberoasting-sweep signal.
+- **UI** — a "Kerberos" tab with the anomalies (RC4 requests + bulk-TGS
+  accounts), the exposure table, KDC audit status, and enable/disable controls.
+- Detection nuance (from live testing): the KDC issues the service ticket with
+  the target account's strongest key, so a client that *requests* RC4 against an
+  AES-capable account still gets AES — the tool records both the *requested*
+  etypes (`etypes=`, the attacker's downgrade attempt) and the *issued* etype
+  (`etype=<tkt>/<svc>`, the roastable one), and flags either.
+- 10 new unit tests (`TestKerberos`); 207 total. VERSION → 1.8.0.
+
 ## 1.7.2 - 2026-09-19
 
 Accuracy fix after full live validation of the SPN verbs: samba enforces SPN

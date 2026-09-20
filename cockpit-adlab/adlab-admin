@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.7.2"
+VERSION = "1.8.0"
 
 
 def _require_config():
@@ -1073,6 +1073,233 @@ def v_spn_find_duplicates(a):
     dups = [{"spn": v["spn"], "accounts": sorted(v["accounts"])}
             for _, v in sorted(seen.items()) if len(v["accounts"]) > 1]
     return {"on": d, "duplicates": dups, "count": len(dups)}
+
+# ---- Kerberos ticket anomaly detection (Kerberoasting) --------------------
+# Two detections over the samba/Heimdal KDC audit:
+#   1. RC4 downgrade: a TGS service ticket REQUESTED and/or ISSUED with RC4
+#      (etype 23/24 = 0x17/0x18) instead of AES (17/18) -- RC4 hashes crack far
+#      faster offline, so roasting tools request RC4.
+#   2. Bulk TGS: one account pulling service tickets for many distinct SPNs in a
+#      short window -- a Kerberoasting sweep.
+# DATA SOURCE: once the "kerberos" debug class is >=3 the KDC writes, per request,
+# a structured line to log.samba, e.g.:
+#   Kerberos: TGS-REQ SUCCESS ipv4:10.0.0.9:5 alice@REALM MSSQLSvc/db@REALM \
+#     etype=18/18 ... etypes=23 ... auth=1789865502 ...
+# etype=<tkt>/<svc> is the ISSUED service-ticket etype (svc = the roastable key);
+# etypes=<list> is the CLIENT's requested etype list; auth=<epoch> is the time.
+# ENABLING: the DC entrypoint starts samba with --debuglevel=1, which OVERRIDES
+# smb.conf `log level`, so the only runtime lever is smbcontrol to the pre-forked
+# KDC WORKER processes (the master's level does not propagate). Not persistent
+# across a DC restart -- kerberos-audit-enable re-applies it.
+KRB_ETYPE_NAMES = {1: "des-cbc-crc", 3: "des-cbc-md5",
+                   17: "aes128-cts-hmac-sha1-96", 18: "aes256-cts-hmac-sha1-96",
+                   19: "aes256-cts-hmac-sha384-192", 20: "aes128-cts-hmac-sha256-128",
+                   23: "rc4-hmac", 24: "rc4-hmac-exp"}
+KRB_RC4_ETYPES = {23, 24}
+SUPP_ETYPE_FLAGS = [(0x1, "DES-CBC-CRC"), (0x2, "DES-CBC-MD5"), (0x4, "RC4-HMAC"),
+                    (0x8, "AES128-SHA1"), (0x10, "AES256-SHA1")]
+KDC_LOG = "/var/log/samba/log.samba"
+
+def _etype_name(n):
+    return KRB_ETYPE_NAMES.get(n, "etype-%s" % n)
+
+def _kdc_worker_pids(dc):
+    """PIDs of the KDC processes (pre-fork master + workers), from the :88 listener."""
+    rc, out, _ = podman(dc, ["bash", "-c",
+        "ss -tlnp 2>/dev/null | awk '/:88 /{print}' | grep -oE 'pid=[0-9]+' | "
+        "grep -oE '[0-9]+' | sort -u"])
+    return [p for p in (out or "").split() if p.isdigit()]
+
+def _kdc_kerberos_level(dc, pid):
+    rc, out, _ = podman(dc, ["smbcontrol", pid, "debuglevel"])
+    m = re.search(r'kerberos:(\d+)', out or "")
+    return int(m.group(1)) if m else 0
+
+def _audit_active(dc):
+    return any(_kdc_kerberos_level(dc, p) >= 3 for p in _kdc_worker_pids(dc)[:1])
+
+def _parse_tgs_success(line):
+    """Parse a 'Kerberos: TGS-REQ SUCCESS <ip> <client> <spn> k=v...' audit line
+    into a record, or None. Pure -- unit-tested."""
+    m = re.search(r'TGS-REQ SUCCESS\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$', line)
+    if not m:
+        return None
+    ip, client, spn, rest = m.groups()
+    kv = dict(re.findall(r'(\w[\w-]*)=(\S+)', rest))
+    svc_etype = None
+    em = re.match(r'(\d+)/(\d+)', kv.get("etype", ""))
+    if em:
+        svc_etype = int(em.group(2))
+    req = [int(x) for x in kv.get("etypes", "").split(",") if x.isdigit()]
+    auth = int(kv["auth"]) if kv.get("auth", "").isdigit() else None
+    return {"ip": ip, "client": client, "spn": spn,
+            "issued_etype": svc_etype,
+            "issued_etype_name": _etype_name(svc_etype) if svc_etype else "",
+            "requested_etypes": req,
+            "rc4_requested": bool(set(req) & KRB_RC4_ETYPES),
+            "rc4_issued": svc_etype in KRB_RC4_ETYPES,
+            "auth": auth}
+
+def _read_tgs_records(dc, limit=4000):
+    """Parse recent TGS-REQ SUCCESS audit records from a DC's log.samba."""
+    rc, out, _ = podman(dc, ["bash", "-c",
+        "grep -a 'TGS-REQ SUCCESS' %s 2>/dev/null | tail -n %d" % (KDC_LOG, limit)])
+    recs = []
+    for ln in (out or "").splitlines():
+        r = _parse_tgs_success(ln)
+        if r:
+            r["dc"] = dc
+            recs.append(r)
+    return recs
+
+def _up_dcs():
+    return [d for d in all_dcs() if ctr_state(d) == "running"]
+
+def _target_dcs(a):
+    return [a["dc"]] if a.get("dc") else _up_dcs()
+
+def _collect_tgs(a):
+    recs = []
+    for d in _target_dcs(a):
+        recs.extend(_read_tgs_records(d))
+    return recs
+
+def v_kerberos_audit_status(a):
+    """Whether KDC ticket-request auditing is active on each DC (kerberos debug
+    >=3 on the KDC workers) and how many audit records exist."""
+    rows = []
+    for d in _target_dcs(a):
+        pids = _kdc_worker_pids(d)
+        levels = [_kdc_kerberos_level(d, p) for p in pids]
+        rc, cnt, _ = podman(d, ["bash", "-c",
+            "grep -ac 'TGS-REQ SUCCESS' %s 2>/dev/null || echo 0" % KDC_LOG])
+        rows.append({"dc": d, "kdc_pids": pids,
+                     "kerberos_level": max(levels) if levels else 0,
+                     "audit_active": bool(levels) and max(levels) >= 3,
+                     "tgs_records": int((cnt or "0").strip() or 0)})
+    return {"dcs": rows, "any_active": any(r["audit_active"] for r in rows),
+            "note": "Auditing is runtime-only (the entrypoint's --debuglevel=1 "
+                    "overrides smb.conf) and resets on a DC restart; re-run "
+                    "kerberos-audit-enable afterwards."}
+
+def v_kerberos_audit_enable(a):
+    """Turn on KDC ticket-request auditing: raise the 'kerberos' debug class to 3
+    on each DC's pre-forked KDC workers (the only runtime lever, since the
+    entrypoint pins --debuglevel=1). Non-persistent across a DC restart."""
+    rows = []
+    for d in _target_dcs(a):
+        pids = _kdc_worker_pids(d)
+        ok = sum(1 for p in pids
+                 if podman(d, ["smbcontrol", p, "debug", "1 kerberos:3"])[0] == 0)
+        rows.append({"dc": d, "kdc_pids": pids, "set_ok": ok,
+                     "kerberos_level": max([_kdc_kerberos_level(d, p) for p in pids] or [0])})
+    return {"enabled_on": rows, "level": 3,
+            "note": "Runtime only (resets on a DC restart). New KDC ticket "
+                    "requests now log to %s; read them with kerberos-ticket-requests "
+                    "or kerberos-anomalies." % KDC_LOG}
+
+def v_kerberos_audit_disable(a):
+    """Restore the KDC workers' debug level to the startup default (kerberos:1)."""
+    rows = []
+    for d in _target_dcs(a):
+        pids = _kdc_worker_pids(d)
+        for p in pids:
+            podman(d, ["smbcontrol", p, "debug", "1"])
+        rows.append({"dc": d, "kdc_pids": pids})
+    return {"disabled_on": rows}
+
+def v_kerberos_ticket_requests(a):
+    """Parsed TGS service-ticket requests from the KDC audit, oldest first,
+    optionally within the last --window minutes and/or for one --dc."""
+    window = int(a.get("window", 0) or 0)
+    recs = _collect_tgs(a)
+    if window > 0:
+        cutoff = time.time() - window * 60
+        recs = [r for r in recs if r["auth"] and r["auth"] >= cutoff]
+    recs.sort(key=lambda r: r.get("auth") or 0)
+    return {"count": len(recs), "window_minutes": window,
+            "audit_active": any(_audit_active(d) for d in _target_dcs(a)),
+            "requests": recs[-500:]}
+
+def v_kerberos_anomalies(a):
+    """The two Kerberoasting detections over the KDC audit in a window:
+    (1) RC4 downgrade requests, (2) accounts pulling many TGS / distinct SPNs."""
+    window = int(a.get("window", 60) or 60)
+    distinct_threshold = int(a.get("distinct_spn_threshold", 6) or 6)
+    tgs_threshold = int(a.get("tgs_threshold", 20) or 20)
+    cutoff = time.time() - window * 60
+    recent = [r for r in _collect_tgs(a) if r["auth"] and r["auth"] >= cutoff]
+    rc4 = [{"time": r["auth"], "client": r["client"], "spn": r["spn"], "ip": r["ip"],
+            "rc4_requested": r["rc4_requested"], "rc4_issued": r["rc4_issued"],
+            "issued_etype": r["issued_etype_name"] or r["issued_etype"],
+            "requested_etypes": [_etype_name(e) for e in r["requested_etypes"]],
+            "dc": r["dc"]}
+           for r in recent if r["rc4_requested"] or r["rc4_issued"]]
+    byc = {}
+    for r in recent:
+        byc.setdefault(r["client"], []).append(r)
+    bulk = []
+    for c, rs in byc.items():
+        spns = sorted(set(x["spn"] for x in rs))
+        if len(spns) >= distinct_threshold or len(rs) >= tgs_threshold:
+            bulk.append({"client": c, "tgs_count": len(rs), "distinct_spns": len(spns),
+                         "spns": spns[:25],
+                         "rc4_any": any(x["rc4_requested"] or x["rc4_issued"] for x in rs)})
+    bulk.sort(key=lambda x: (-x["distinct_spns"], -x["tgs_count"]))
+    return {"window_minutes": window, "considered": len(recent),
+            "distinct_spn_threshold": distinct_threshold, "tgs_threshold": tgs_threshold,
+            "rc4_requests": rc4, "rc4_count": len(rc4),
+            "bulk_tgs": bulk, "bulk_count": len(bulk),
+            "audit_active": any(_audit_active(d) for d in _target_dcs(a)),
+            "note": "" if recent else "No TGS audit records in window — enable with "
+                    "kerberos-audit-enable, then generate/await Kerberos traffic."}
+
+def _decode_supp_etypes(val):
+    """msDS-supportedEncryptionTypes int -> (flag names, rc4_allowed, aes_only, n)."""
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        n = 0
+    names = [nm for bit, nm in SUPP_ETYPE_FLAGS if n & bit]
+    aes = bool(n & (0x8 | 0x10))
+    # Unset/0 => the KDC treats the account as RC4-capable (legacy default).
+    rc4_allowed = (n == 0) or bool(n & 0x4) or (not aes)
+    aes_only = aes and not (n & (0x1 | 0x2 | 0x4))
+    return names, rc4_allowed, aes_only, n
+
+def v_kerberos_roast_exposure(a):
+    """Static Kerberoasting exposure: SPN-bearing accounts whose
+    msDS-supportedEncryptionTypes permits RC4 (or is unset) — accounts for which
+    an attacker can obtain an RC4 (fast-cracking) service ticket. User service
+    accounts are the high-value targets."""
+    d = first_up_dc()
+    rc, out, err = podman(d, ["ldbsearch", "-H", SAM, "-b", domain_dn(),
+        "(&%s(servicePrincipalName=*))" % SPN_ACCOUNT_FILTER,
+        "sAMAccountName", "servicePrincipalName", "objectClass",
+        "msDS-SupportedEncryptionTypes"])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    accounts = []
+    for e in parse_ldif_full(out):
+        at = e["attrs"]
+        spns = at.get("servicePrincipalName", [])
+        if not spns:
+            continue
+        cls = "computer" if "computer" in at.get("objectClass", []) else "user"
+        raw = at.get("msDS-SupportedEncryptionTypes", ["0"])[0]
+        names, rc4_allowed, aes_only, n = _decode_supp_etypes(raw)
+        accounts.append({"account": at.get("sAMAccountName", [""])[0], "class": cls,
+                         "spn_count": len(spns), "spns": sorted(spns)[:20],
+                         "supported_etypes_value": n, "supported_etypes": names,
+                         "rc4_allowed": rc4_allowed, "aes_only": aes_only})
+    accounts.sort(key=lambda x: (not x["rc4_allowed"], x["class"], x["account"].lower()))
+    roastable = [x for x in accounts if x["rc4_allowed"]]
+    return {"on": d, "accounts": accounts, "total": len(accounts),
+            "roastable": len(roastable),
+            "roastable_users": sum(1 for x in roastable if x["class"] == "user"),
+            "note": "rc4_allowed = an RC4 service ticket can be obtained (weak, "
+                    "fast to crack). Harden by setting the account's "
+                    "msDS-SupportedEncryptionTypes to AES-only (0x18)."}
 
 # ---- OUs ------------------------------------------------------------------
 
@@ -4507,6 +4734,27 @@ VERBS = {
                       "args": [arg("spn", help_="the SPN to look up")]},
     "spn-find-duplicates": {"fn": v_spn_find_duplicates, "group": "spn",
                       "help": "setspn -X: SPNs registered on more than one account (these break Kerberos auth)."},
+    "kerberos-roast-exposure": {"fn": v_kerberos_roast_exposure, "group": "kerberos",
+                      "help": "Static Kerberoasting exposure: which SPN accounts permit an RC4 (fast-cracking) service ticket vs are AES-only."},
+    "kerberos-audit-status": {"fn": v_kerberos_audit_status, "group": "kerberos",
+                      "help": "Whether KDC ticket-request auditing is active (per DC) and how many audit records exist.",
+                      "args": [arg("dc", "enum", required=False, choices=DC_CHOICES, help_="one DC (default: all up DCs)")]},
+    "kerberos-audit-enable": {"fn": v_kerberos_audit_enable, "group": "kerberos",
+                      "help": "Turn on KDC ticket-request auditing (kerberos debug 3 on the KDC workers). Runtime only — resets on a DC restart.",
+                      "args": [arg("dc", "enum", required=False, choices=DC_CHOICES)]},
+    "kerberos-audit-disable": {"fn": v_kerberos_audit_disable, "group": "kerberos",
+                      "help": "Restore the KDC workers' debug level to the startup default.",
+                      "args": [arg("dc", "enum", required=False, choices=DC_CHOICES)]},
+    "kerberos-ticket-requests": {"fn": v_kerberos_ticket_requests, "group": "kerberos",
+                      "help": "Parsed TGS service-ticket requests from the KDC audit (client, target SPN, requested/issued etype, time).",
+                      "args": [arg("window", "int", required=False, help_="only the last N minutes"),
+                               arg("dc", "enum", required=False, choices=DC_CHOICES)]},
+    "kerberos-anomalies": {"fn": v_kerberos_anomalies, "group": "kerberos",
+                      "help": "Anomalous ticket requests: RC4 (0x17) downgrade requests, and accounts pulling many TGS / distinct SPNs (Kerberoasting sweep).",
+                      "args": [arg("window", "int", required=False, help_="lookback minutes (default 60)"),
+                               arg("distinct_spn_threshold", "int", required=False, help_="flag >= this many distinct SPNs per account (default 6)"),
+                               arg("tgs_threshold", "int", required=False, help_="flag >= this many TGS per account (default 20)"),
+                               arg("dc", "enum", required=False, choices=DC_CHOICES)]},
     "rds-status":    {"fn": v_rds_status, "group": "rds",
                       "help": "RD/Terminal Server licensing support: the license-servers group, its members, per-user-CAL schema, delegation ACE, site SCPs."},
     "rds-ensure":    {"fn": v_rds_ensure, "group": "rds",
