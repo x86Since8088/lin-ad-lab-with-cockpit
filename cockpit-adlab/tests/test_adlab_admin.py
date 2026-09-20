@@ -219,11 +219,19 @@ class Base(unittest.TestCase):
         os.unlink(self._gpo_os.name)          # start with no file
         self._old_gpo_os = mod.GPO_OS_FILE
         mod.GPO_OS_FILE = self._gpo_os.name
+        # isolate the CA node's host material dir so pki-ca-deploy never touches
+        # the real /var/lib/adlab/ca
+        self._ca_dir = tempfile.mkdtemp(suffix=".ca")
+        self._old_ca_dir = mod.PKI_CA_DIR
+        mod.PKI_CA_DIR = self._ca_dir
 
     def tearDown(self):
         mod.RUN = self._old_run
         mod.AUDIT_LOG = self._old_audit
         mod.GPO_OS_FILE = self._old_gpo_os
+        mod.PKI_CA_DIR = self._old_ca_dir
+        import shutil
+        shutil.rmtree(self._ca_dir, ignore_errors=True)
         if os.path.exists(self._gpo_os.name):
             os.unlink(self._gpo_os.name)
         os.unlink(self._audit.name)
@@ -249,14 +257,15 @@ class Base(unittest.TestCase):
 KNOWN_TYPES = {"str", "int", "bool", "enum", "password-stdin"}
 KNOWN_GROUPS = {"meta", "overview", "fsmo", "users", "groups", "gpo", "objects",
                 "sites", "dns", "dcs", "clients", "activity", "domains",
-                "members", "rds", "spn", "kerberos", "crypto"}
+                "members", "rds", "spn", "kerberos", "crypto", "pki"}
 DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "ou-delete", "gpo-delete", "gpo-unlink", "gpo-settings-remove",
                "dns-delete", "dc-restart", "dc-shell", "dc-promote", "dc-demote",
                "dc-decommission", "domain-add", "domain-remove",
                "client-remove", "member-deprovision", "spn-delete",
                "crypto-harden", "crypto-set",
-               "domain-trust-create", "domain-trust-delete"}
+               "domain-trust-create", "domain-trust-delete",
+               "pki-ca-destroy", "pki-ca-unpublish", "pki-template-delete"}
 
 
 class TestSchema(Base):
@@ -2957,6 +2966,110 @@ class AdmxApply(Base):
         self.assertEqual(out["admx"], "Ubuntu.admx")
         self.assertEqual(out["retired"], [])
         self.assertGreaterEqual(out["policies"], 20)
+
+
+class TestPki(Base):
+    """AD PKI: CA node, AD directory publish, templates, issuance."""
+
+    def _body(self, argv):
+        for i, x in enumerate(argv):
+            if x == "-c" and i + 1 < len(argv):
+                return argv[i + 1]
+        return ""
+
+    # ---- pure encoders, locked against MS-verified octet values ----
+    def test_filetime_encoding(self):
+        self.assertEqual(mod._filetime_b64(2 * 365 * 86400), "AIByDl3C/f8=")
+        self.assertEqual(mod._filetime_b64(6 * 7 * 86400), "AICmCv/e//8=")
+
+    def test_keyusage_is_two_bytes(self):
+        self.assertEqual(mod._keyusage_b64("digitalSignature,keyEncipherment"), "oAA=")
+        self.assertEqual(mod._keyusage_b64("digitalSignature"), "gAA=")
+
+    def test_template_oid_unique_and_stable(self):
+        a0 = mod._template_oid("ad.edt1.lab", 0)
+        a1 = mod._template_oid("ad.edt1.lab", 1)
+        self.assertNotEqual(a0, a1)
+        self.assertEqual(a0, mod._template_oid("ad.edt1.lab", 0))
+        self.assertTrue(a0.startswith("1.3.6.1.4.1.311.21.8."))
+
+    def test_template_ldif_shape(self):
+        ldif = mod._template_ldif("WebServer", mod.PKI_TEMPLATES["WebServer"])
+        self.assertIn("objectClass: pKICertificateTemplate", ldif)
+        self.assertIn("CN=WebServer,CN=Certificate Templates,CN=Public Key Services,", ldif)
+        self.assertIn("pKIKeyUsage:: oAA=", ldif)
+        self.assertIn("pKIExtendedKeyUsage: 1.3.6.1.5.5.7.3.1", ldif)   # serverAuth
+        self.assertIn("msPKI-Certificate-Name-Flag: 1", ldif)          # enrollee supplies subject
+        self.assertIn("msPKI-Template-Schema-Version: 2", ldif)
+
+    # ---- deploy ----
+    def test_ca_deploy_runs_container_and_inits(self):
+        f = self.fake
+        f.on(lambda a: a[:2] == ["podman", "inspect"] and "adlab-ca" in a, rc=1)  # missing
+        f.on(lambda a: a[:2] == ["podman", "run"] and "adlab-ca" in a, out="cid\n")
+        f.on(lambda a: a[:2] == ["podman", "exec"] and "adlab-ca" in a, out="created\n")
+        f.lab_up()
+        rc, out = self.call_main(["pki-ca-deploy"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["root"], "created")
+        runs = f.argv_containing("podman", "run", "adlab-ca")
+        self.assertTrue(runs)
+        self.assertTrue(any(mod.PRIMARY_LAB["IMG_DC"] in x for x in runs[0]))
+
+    # ---- template seed ----
+    def test_template_seed_ldbadds_each(self):
+        f = self.fake
+        f.on(lambda a: "ldbsearch" in a and "-s" in a and "base" in a, rc=1)  # none exist
+        f.on(lambda a: "ldbadd" in a, out="")
+        f.lab_up()
+        rc, out = self.call_main(["pki-template-seed"])
+        self.assertEqual(rc, 0, out)
+        created = [s for s in out["seeded"] if s["action"] == "created"]
+        self.assertEqual(len(created), len(mod.PKI_TEMPLATES))
+        adds = [c for c in f.calls if "ldbadd" in c[0]]
+        self.assertTrue(adds and all("pKICertificateTemplate" in (c[1] or "") for c in adds))
+
+    # ---- publish to AD ----
+    def test_ca_publish_creates_ad_objects(self):
+        f, b = self.fake, self._body
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "gencrl" in b(a), out="Q1JMREVS\n")
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "RFC2253" in b(a),
+             out="subject=CN=AD.EDT1.LAB Enterprise Root CA,O=EDT1 Lab\n")
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "test -f" in b(a), rc=0)
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "outform DER" in b(a), out="ZGVy\n")
+        f.on(lambda a: "ldbsearch" in a, rc=1)     # nothing exists yet / no templates
+        f.on(lambda a: "ldbadd" in a, out="")
+        f.lab_up()
+        rc, out = self.call_main(["pki-ca-publish"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(out["steps"]), 4)
+        self.assertTrue(all(s["action"] == "created" for s in out["steps"]))
+        joined = " ".join((c[1] or "") for c in f.calls if "ldbadd" in c[0])
+        self.assertIn("objectClass: certificationAuthority", joined)
+        self.assertIn("objectClass: pKIEnrollmentService", joined)
+        self.assertIn("cn: NTAuthCertificates", joined)
+        # certificationAuthority mustContain: the CRL attrs are supplied at create
+        self.assertIn("authorityRevocationList:: ", joined)
+        self.assertIn("certificateRevocationList:: ", joined)
+
+    # ---- issuance ----
+    def test_issue_signs_leaf_per_template(self):
+        f, b = self.fake, self._body
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "test -f" in b(a), rc=0)
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "x509 -req" in b(a),
+             out="-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+        f.lab_up()
+        rc, out = self.call_main(["pki-issue", "--template", "WebServer",
+                                  "--cn", "web01.ad.edt1.lab",
+                                  "--sans", "DNS:web01.ad.edt1.lab"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["template"], "WebServer")
+        self.assertIn("BEGIN CERTIFICATE", out["cert_pem"])
+        # the same body generates the CSR and signs it; assert the template's EKU
+        # reached the openssl extfile
+        signed = [b(c[0]) for c in f.calls if "x509 -req" in b(c[0])]
+        self.assertTrue(signed)
+        self.assertIn("extendedKeyUsage=1.3.6.1.5.5.7.3.1", signed[0])   # serverAuth
 
 
 if __name__ == "__main__":

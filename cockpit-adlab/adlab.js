@@ -73,6 +73,10 @@
         crypto: { title: "Crypto control plane", body: [
             "Enable or disable encryption per situation. Kerberos account encryption types are set live in the directory; “Bulk harden” applies a preset (e.g. AES-only) across a filter — dry-run first.",
             "Server crypto (SMB / NTLM / LDAP-TLS / schannel) writes smb.conf and reloads; some settings only take effect after a DC restart, and a wrong value can break authentication."] },
+        pki: { title: "AD PKI", body: [
+            "A domain-integrated public-key infrastructure. The CA node is a dedicated openssl-CA container with its own self-signed Enterprise Root CA — samba is only a certificate consumer, never a CA.",
+            "“Publish to AD” writes the root into the forest's Public Key Services tree (Certification Authorities root-trust, AIA for chain-building, NTAuthCertificates to permit smartcard/PKINIT logon, and an Enrollment Service that advertises the CA and its templates), so every domain member trusts it.",
+            "Templates are real pKICertificateTemplate objects (seed the standard set or one at a time). Issuance is manual — “Issue certificate” has openssl sign a leaf per the chosen template's policy (key size, EKU, key usage, validity). Directory writes land on the PDC emulator and replicate."] },
         gpo: { title: "Group Policy", body: [
             "Create and edit GPOs. Each GPO is Windows- or Linux-exclusive (the OS column) so a Linux setting never applies on Windows and vice versa; use “set OS” to scope a legacy GPO.",
             "Administrative-Template settings become registry.pol (gpo load); preferences use samba CSEs (gpo manage). The ADMX central store carries both Windows and Linux (Ubuntu/adsys) templates. Writes land on the PDC emulator; SYSVOL replicates within 5 minutes."] },
@@ -588,6 +592,7 @@
         ["spn", "SPNs"],
         ["kerberos", "Kerberos"],
         ["crypto", "Crypto"],
+        ["pki", "PKI"],
         ["gpo", "Group Policy"], ["sites", "Sites & Replication"],
         ["dns", "DNS"], ["domains", "Domains"], ["dcs", "Domain Controllers"],
         ["clients", "Clients"], ["members", "Member Servers"],
@@ -3385,10 +3390,109 @@
         }).catch(function (e) { fSpn(el("div", "al-alert err", String(e))); });
     }
 
+    // -------- AD PKI: CA node + domain-integrated templates + issuance
+    function renderPki() {
+        var m = content();
+        var acts = el("div", "al-actions");
+        acts.appendChild(actionButton("Deploy CA node", "pki-ca-deploy", {}));
+        acts.appendChild(actionButton("Publish to AD", "pki-ca-publish", {}));
+        acts.appendChild(actionButton("Seed templates", "pki-template-seed", {}));
+        acts.appendChild(actionButton("Issue certificate", "pki-issue", {}));
+        var refresh = el("button", "al-btn secondary", "Refresh");
+        refresh.addEventListener("click", function () { refreshTab(); });
+        acts.appendChild(refresh);
+        m.appendChild(acts);
+        m.appendChild(el("div", "al-alert warn",
+            "A domain-integrated PKI. The CA node is a dedicated openssl-CA container " +
+            "with its own self-signed root; “Publish to AD” writes the root into the " +
+            "forest (Certification Authorities root-trust, AIA, NTAuthCertificates for " +
+            "cert logon, and an Enrollment Service) so members trust it. Templates are " +
+            "real pKICertificateTemplate objects. Issuance is manual (Issue certificate) " +
+            "— openssl signs a leaf per the chosen template. Directory writes land on the PDC."));
+        var holder = el("div", "al-grid"); m.appendChild(holder);
+
+        var fCa = slotCard(holder, "Certificate Authority node", true);
+        var fAd = slotCard(holder, "AD registration", true);
+        run("pki-status").then(function (r) {
+            var ca = r.ca_node || {}, ad = r.ad || {};
+            // ---- CA node card
+            var box = el("div");
+            if (!ca.deployed) {
+                box.appendChild(el("div", "al-alert warn",
+                    "No CA node deployed. Click “Deploy CA node” to create the openssl-CA " +
+                    "container and generate a self-signed Enterprise Root CA."));
+            } else if (!ca.root_ca) {
+                box.appendChild(el("div", "al-alert warn",
+                    "CA node container is up but has no root CA yet — re-run Deploy CA node."));
+            } else {
+                box.appendChild(emptyOr([
+                    { k: "CA node", v: badge("running", "ok") },
+                    { k: "Root CA", v: el("code", "al-spn", ca.cert || "(unknown)") },
+                    { k: "Issued certs", v: String(ca.issued != null ? ca.issued : 0) }
+                ], ["property", "value"], function (x) { return [x.k, x.v]; }, "none"));
+                var arow = el("div", "al-actions");
+                arow.appendChild(actionButton("CA detail", "pki-ca-status", {}));
+                arow.appendChild(actionButton("Destroy CA node", "pki-ca-destroy", {}));
+                box.appendChild(arow);
+            }
+            fCa(box, "Certificate Authority node");
+            // ---- AD registration card
+            function mk(label, ok) {
+                var row = el("div", "al-spnrow");
+                row.appendChild(el("span", null, label));
+                row.appendChild(ok ? badge("published", "ok") : badge("not published", "dim"));
+                return row;
+            }
+            var abox = el("div");
+            abox.appendChild(mk("Root trust (Certification Authorities)", ad.root_trust));
+            abox.appendChild(mk("AIA (chain)", ad.aia));
+            abox.appendChild(mk("NTAuthCertificates (cert logon)", ad.ntauth));
+            abox.appendChild(mk("Enrollment Service", ad.enrollment_service));
+            abox.appendChild(el("div", "al-sub", (ad.templates || 0) + " certificate template(s) in AD."));
+            var ar = el("div", "al-actions");
+            ar.appendChild(actionButton("Publish to AD", "pki-ca-publish", {}));
+            ar.appendChild(actionButton("List NTAuth CAs", "pki-ntauth-list", {}));
+            ar.appendChild(actionButton("Unpublish", "pki-ca-unpublish", {}));
+            abox.appendChild(ar);
+            fAd(abox, "AD registration (Public Key Services, on " + (r.pdc || "the PDC") + ")");
+        }).catch(function (e) {
+            fCa(el("div", "al-alert err", String(e)));
+            fAd(el("div", "al-alert err", String(e)));
+        });
+
+        var fTpl = slotCard(holder, "Certificate templates", true);
+        run("pki-template-list").then(function (r) {
+            var box = el("div");
+            box.appendChild(el("h4", null, "In AD (" + (r.live || []).length + ")"));
+            box.appendChild(emptyOr(r.live, ["template", "display", "schema", "EKU", ""],
+                function (t) {
+                    return [el("kbd", "al", t.cn), t.display || "", "v" + (t.schema_version || "?"),
+                            (t.eku || []).join(", "),
+                            actionButton("✕", "pki-template-delete", { name: t.cn })];
+                }, "no templates seeded yet — use “Seed templates”"));
+            box.appendChild(el("h4", null, "Standard set (seedable)"));
+            box.appendChild(emptyOr(r.catalog, ["template", "purpose", "key", "days", ""],
+                function (c) {
+                    return [c.display, c.purpose, String(c.key), String(c.days),
+                            actionButton("Seed", "pki-template-seed", { name: c.name })];
+                }, "none"));
+            fTpl(box, "Certificate templates (pKICertificateTemplate) — " + (r.templates_dn || ""));
+        }).catch(function (e) { fTpl(el("div", "al-alert err", String(e))); });
+
+        var fCerts = slotCard(holder, "Issued certificates", true);
+        run("pki-cert-list").then(function (r) {
+            fCerts(emptyOr(r.certs, ["file", "subject", "expires", "serial"],
+                function (c) {
+                    return [el("code", "al-spn", c.file), c.subject, c.not_after, c.serial];
+                }, "no certificates issued yet"),
+                "Issued certificates — " + (r.count || 0) + " (on " + (r.ca_node || "CA node") + ")");
+        }).catch(function (e) { fCerts(el("div", "al-alert err", String(e))); });
+    }
+
     // ---------------------------------------------------------------- boot
     var RENDER = { overview: renderOverview,
                    objects: renderObjects, spn: renderSpn, kerberos: renderKerberos,
-                   crypto: renderCrypto, gpo: renderGpo,
+                   crypto: renderCrypto, pki: renderPki, gpo: renderGpo,
                    sites: renderSites, dns: renderDns, domains: renderDomains,
                    dcs: renderDcs, clients: renderClients, members: renderMembers,
                    activity: renderActivity };
