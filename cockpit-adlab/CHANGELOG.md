@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.10.0 - 2026-09-19
+
+Domain provisioning can specify a parent domain to join a forest. Since samba AD
+does not support in-forest child domains, "joining a forest" is realized the
+samba-supported way — a **forest/external trust**. See `docs/DOMAIN-TRUSTS.md`.
+
+- **`domain-add --parent <realm>`** — instead of a standalone forest, the new
+  domain is provisioned on the **parent's podman network** (so it can reach the
+  parent DC), each child getting its own address block (`.50`, `.60`, …), and is
+  labelled with its parent. A contiguous `CHILD.parent` namespace best emulates a
+  child domain. Without `--parent`, behaviour is unchanged (independent forest).
+- **`domain-trust-create --realm <local> [--parent <partner>] [--type] [--direction]`**
+  — establish a forest (or external) trust between the two domains, created on
+  **both sides**, run on the local DC (credentials via an authfile, never argv;
+  the partner DC is reached by IP with a temporary resolver entry).
+- **`domain-trust-list [--realm]`** / **`domain-trust-delete --realm [--parent]`**
+  — inspect and remove trusts.
+- `domain-list` now reports each domain's `parent`.
+- **UI** — the "Add domain" form gains a **parent** field (schema-driven); the
+  Domains tab shows a **parent** badge and **Trusts** / **Create trust** actions
+  per domain.
+- Rationale in help/docs: samba AD is single-domain-per-forest; a parent
+  relationship is a trust, and a contiguous child namespace on the parent's
+  network is the closest emulation of a child domain.
+- 6 new unit tests; 223 total. VERSION → 1.10.0.
+
 ## 1.9.0 - 2026-09-19
 
 Crypto control plane — a dedicated "Crypto" tab and schema-backed verbs to

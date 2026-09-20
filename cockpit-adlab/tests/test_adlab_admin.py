@@ -255,7 +255,8 @@ DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "dns-delete", "dc-restart", "dc-shell", "dc-promote", "dc-demote",
                "dc-decommission", "domain-add", "domain-remove",
                "client-remove", "member-deprovision", "spn-delete",
-               "crypto-harden", "crypto-set"}
+               "crypto-harden", "crypto-set",
+               "domain-trust-create", "domain-trust-delete"}
 
 
 class TestSchema(Base):
@@ -367,6 +368,78 @@ class TestDomains(Base):
         rc, out = self.call_main(["dc-decommission", "--dc", "dc1"])
         self.assertEqual(rc, 1)
         self.assertIn("dc1", out["error"])
+
+    # -- child domain via a parent (forest trust) -------------------------
+    def test_domain_add_parent_places_child_on_parent_network(self):
+        self.fake.lab_up()
+        self._no_extra_domains()
+        self.fake.on(lambda a: a[:2] == ["podman", "run"], out="ctrid\n")
+        parent = mod.PRIMARY_LAB["REALM"]
+        rc, out = self.call_main(["domain-add", "--realm", "CORP." + parent,
+                                  "--domain_nb", "CORP", "--parent", parent])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["parent"], parent)
+        self.assertTrue(out["shared_with_parent"])
+        self.assertTrue(out["contiguous_namespace"])
+        self.assertEqual(out["network"], mod.PRIMARY_LAB["NET"])
+        self.assertEqual(out["ip"], mod.PRIMARY_LAB["NET_PREFIX"] + ".50")
+        self.assertTrue(self.fake.argv_containing("--network", mod.PRIMARY_LAB["NET"]))
+        self.assertTrue(self.fake.argv_containing("adlab.parent=" + parent))
+        self.assertTrue(self.fake.argv_containing("ROLE=provision"))
+        self.assertEqual(self.fake.argv_containing("network", "create"), [])  # no new net
+
+    def test_domain_add_parent_unknown(self):
+        self.fake.lab_up()
+        self._no_extra_domains()
+        rc, out = self.call_main(["domain-add", "--realm", "X.NOPE.LAB",
+                                  "--domain_nb", "X", "--parent", "NOPE.LAB"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no such domain", out["error"])
+
+    def test_trust_create_rejects_self(self):
+        self.fake.lab_up()
+        self._no_extra_domains()
+        p = mod.PRIMARY_LAB["REALM"]
+        rc, out = self.call_main(["domain-trust-create", "--realm", p, "--parent", p])
+        self.assertEqual(rc, 1)
+        self.assertIn("itself", out["error"])
+
+    def test_trust_create_missing_parent(self):
+        self.fake.lab_up()
+        self._no_extra_domains()
+        rc, out = self.call_main(["domain-trust-create", "--realm", mod.PRIMARY_LAB["REALM"]])
+        self.assertEqual(rc, 1)
+        self.assertIn("no recorded parent", out["error"])
+
+    def test_trust_list_parses(self):
+        self.fake.lab_up()
+        self._no_extra_domains()
+        self.fake.on(lambda a: "trust" in a and "list" in a,
+                     out="Type[Forest] Transitive[Yes] Direction[BOTH] Name[corp.ad.edt1.lab]\n")
+        rc, out = self.call_main(["domain-trust-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["count"], 1)
+        self.assertEqual(out["trusts"][0]["name"], "corp.ad.edt1.lab")
+        self.assertEqual(out["trusts"][0]["direction"], "BOTH")
+        self.assertEqual(out["trusts"][0]["type"], "Forest")
+
+    def test_trust_create_happy_path(self):
+        self.fake.lab_up()
+        self._one_extra_domain(realm="CORP.AD.EDT1.LAB", slug="corp",
+                               prefix="172.15.4", dcs=("corp-dc1",))
+        self.fake.on(lambda a: "bash" in a and any("domain trust create" in str(x) for x in a),
+                     out="Success\n")
+        rc, out = self.call_main(["domain-trust-create", "--realm", "CORP.AD.EDT1.LAB",
+                                  "--parent", mod.PRIMARY_LAB["REALM"], "--type", "forest"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["partner"], mod.PRIMARY_LAB["REALM"])
+        self.assertTrue(out["created"])
+        script = next(c[0] for c in self.fake.calls
+                      if any("domain trust create" in str(x) for x in c[0]))
+        j = " ".join(map(str, script))
+        self.assertIn("--type=forest", j)
+        self.assertIn("--create-location=both", j)
+        self.assertIn('-A "$af"', j)                    # creds via authfile, not argv
 
     def test_dc_decommission_refuses_last_dc_of_forest(self):
         self.fake.lab_up()
