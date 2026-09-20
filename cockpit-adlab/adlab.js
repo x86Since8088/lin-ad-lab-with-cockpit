@@ -468,6 +468,7 @@
         ["objects", "AD Objects"],
         ["spn", "SPNs"],
         ["kerberos", "Kerberos"],
+        ["crypto", "Crypto"],
         ["gpo", "Group Policy"], ["sites", "Sites & Replication"],
         ["dns", "DNS"], ["domains", "Domains"], ["dcs", "Domain Controllers"],
         ["clients", "Clients"], ["members", "Member Servers"],
@@ -3046,6 +3047,85 @@
         refresh.addEventListener("click", load); load();
     }
 
+    // -------- Crypto control plane (enable/disable encryption per situation)
+    function renderCrypto() {
+        var m = content();
+        var acts = el("div", "al-actions");
+        acts.appendChild(actionButton("Set account etypes", "crypto-account-etypes", {}));
+        acts.appendChild(actionButton("Bulk harden", "crypto-harden", {}));
+        var refresh = el("button", "al-btn secondary", "Refresh");
+        refresh.addEventListener("click", function () { refreshTab(); });
+        acts.appendChild(refresh);
+        m.appendChild(acts);
+        m.appendChild(el("div", "al-alert warn",
+            "Enable or disable encryption per situation. Kerberos account encryption " +
+            "types are set live in the directory; “Bulk harden” applies a preset (e.g. " +
+            "AES-only) across a filter — dry-run first. Server crypto (SMB / NTLM / " +
+            "LDAP-TLS / schannel) writes smb.conf and reloads; some settings only take " +
+            "effect after a DC restart, and a wrong value can break authentication."));
+        var holder = el("div", "al-grid"); m.appendChild(holder);
+        var fAcc = slotCard(holder, "Kerberos account encryption", true);
+        var fSrv = slotCard(holder, "Server crypto settings", true);
+        run("crypto-catalog").then(function (r) {
+            var acc = r.kerberos_accounts;
+            var box = el("div");
+            box.appendChild(el("div", "al-sub",
+                "On " + r.on + ": " + acc.total + " accounts — " + acc.rc4_allowed +
+                " RC4-allowed, " + acc.aes_only + " AES-only, " + acc.rc4_spn_users +
+                " RC4 SPN user account(s) (prime Kerberoast targets)."));
+            var arow = el("div", "al-actions");
+            arow.appendChild(actionButton("Harden SPN users → AES-only", "crypto-harden",
+                { scope: "spn-users", preset: "aes-only" }));
+            arow.appendChild(actionButton("Set one account", "crypto-account-etypes", {}));
+            box.appendChild(arow);
+            fAcc(box, "Kerberos account encryption posture");
+
+            var bySit = {};
+            r.server.forEach(function (s) { (bySit[s.situation] = bySit[s.situation] || []).push(s); });
+            var sbox = el("div");
+            Object.keys(bySit).sort().forEach(function (sit) {
+                sbox.appendChild(el("h4", null, sit));
+                sbox.appendChild(emptyOr(bySit[sit],
+                    ["setting", "current", "recommended", "status", "set"],
+                    function (s) {
+                        var ctl;
+                        if ((s.choices || []).length) {
+                            ctl = el("select");
+                            s.choices.forEach(function (c) {
+                                var o = el("option", null, c); o.value = c;
+                                if (c === s.value) o.selected = true;
+                                ctl.appendChild(o);
+                            });
+                        } else {
+                            ctl = el("input"); ctl.type = "text"; ctl.value = s.value || "";
+                        }
+                        var apply = el("button", "al-btn", "apply");
+                        apply.addEventListener("click", function () {
+                            apply.disabled = true;
+                            run("crypto-set", { id: s.id, value: ctl.value }).then(function () {
+                                refreshTab();
+                            }).catch(function (e) {
+                                apply.disabled = false;
+                                transientModal("crypto-set failed", function (b, close) {
+                                    b.appendChild(el("div", "al-alert err", String(e)));
+                                    var ok = el("button", "al-btn", "Close");
+                                    ok.addEventListener("click", close); b.appendChild(ok);
+                                });
+                            });
+                        });
+                        var cell = el("div", "al-actions"); cell.appendChild(ctl); cell.appendChild(apply);
+                        var status = s.compliant === true ? badge("hardened", "ok")
+                            : (s.compliant === false ? badge("review", "warn") : el("span", "hint", "—"));
+                        return [s.param, s.value || "(default)", s.recommended || "", status, cell];
+                    }, "none"));
+            });
+            fSrv(sbox, "Server crypto settings (smb.conf; reload/restart to apply)");
+        }).catch(function (e) {
+            fAcc(el("div", "al-alert err", String(e)));
+            fSrv(el("div", "al-alert err", String(e)));
+        });
+    }
+
     // -------- Kerberos ticket anomaly detection (Kerberoasting)
     function renderKerberos() {
         var m = content();
@@ -3161,7 +3241,8 @@
 
     // ---------------------------------------------------------------- boot
     var RENDER = { overview: renderOverview,
-                   objects: renderObjects, spn: renderSpn, kerberos: renderKerberos, gpo: renderGpo,
+                   objects: renderObjects, spn: renderSpn, kerberos: renderKerberos,
+                   crypto: renderCrypto, gpo: renderGpo,
                    sites: renderSites, dns: renderDns, domains: renderDomains,
                    dcs: renderDcs, clients: renderClients, members: renderMembers,
                    activity: renderActivity };

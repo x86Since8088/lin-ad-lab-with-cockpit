@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
 
 def _require_config():
@@ -1300,6 +1300,225 @@ def v_kerberos_roast_exposure(a):
             "note": "rc4_allowed = an RC4 service ticket can be obtained (weak, "
                     "fast to crack). Harden by setting the account's "
                     "msDS-SupportedEncryptionTypes to AES-only (0x18)."}
+
+# ---- Crypto control plane (enable/disable encryption per situation) -------
+# Schema-backed: a catalog enumerates every crypto setting across situations
+# with its current value; the set verbs enable/disable a setting.
+#   * Directory (live, ldbmodify): per-account / bulk / krbtgt / domain-object
+#     Kerberos encryption types (msDS-SupportedEncryptionTypes).
+#   * Server (smb.conf + reload; some need a DC restart): Kerberos KDC etypes,
+#     SMB encryption/signing, NTLM, LDAP/TLS, schannel.
+# etype bit flags reuse SUPP_ETYPE_FLAGS / _decode_supp_etypes from the Kerberos
+# section. Presets are the common "situations":
+CRYPTO_ETYPE_PRESETS = {"aes-only": 0x18, "aes+rc4": 0x1C, "rc4-only": 0x4,
+                        "all": 0x1F, "clear": None}
+CRYPTO_HARDEN_SCOPES = {
+    "spn-users": "(&(objectClass=user)(objectCategory=person)(servicePrincipalName=*))",
+    "all-users": "(&(objectClass=user)(objectCategory=person))",
+    "computers": "(objectClass=computer)"}
+# Whitelisted samba server crypto params (id -> smb.conf param), their situation,
+# allowed values and the hardened recommendation. The catalog reads current
+# values with testparm; crypto-set writes them.
+CRYPTO_SERVER_SETTINGS = [
+    {"id": "kerberos-encryption-types", "param": "kerberos encryption types",
+     "situation": "Kerberos", "choices": ["all", "strong", "legacy"], "recommended": "strong"},
+    {"id": "kdc-default-domain-enctypes", "param": "kdc default domain supported enctypes",
+     "situation": "Kerberos", "choices": [], "recommended": "0",
+     "note": "bitmask; 0 = samba default (AES+RC4), 24 = AES-only"},
+    {"id": "kdc-supported-enctypes", "param": "kdc supported enctypes",
+     "situation": "Kerberos", "choices": [], "recommended": "0"},
+    {"id": "kdc-force-rc4-weak-session-keys", "param": "kdc force enable rc4 weak session keys",
+     "situation": "Kerberos", "choices": ["yes", "no"], "recommended": "no"},
+    {"id": "server-smb-encrypt", "param": "server smb encrypt",
+     "situation": "SMB", "choices": ["default", "off", "desired", "required"], "recommended": "required"},
+    {"id": "server-signing", "param": "server signing",
+     "situation": "SMB", "choices": ["default", "auto", "mandatory", "disabled"], "recommended": "mandatory"},
+    {"id": "server-max-protocol", "param": "server max protocol",
+     "situation": "SMB", "choices": ["SMB3", "SMB2", "NT1"], "recommended": "SMB3"},
+    {"id": "ntlm-auth", "param": "ntlm auth",
+     "situation": "NTLM", "choices": ["disabled", "ntlmv2-only", "mschapv2-and-ntlmv2-only", "yes", "no"], "recommended": "ntlmv2-only"},
+    {"id": "raw-ntlmv2-auth", "param": "raw NTLMv2 auth",
+     "situation": "NTLM", "choices": ["yes", "no"], "recommended": "no"},
+    {"id": "reject-md5-clients", "param": "reject md5 clients",
+     "situation": "NTLM", "choices": ["yes", "no"], "recommended": "yes"},
+    {"id": "reject-md5-servers", "param": "reject md5 servers",
+     "situation": "NTLM", "choices": ["yes", "no"], "recommended": "yes"},
+    {"id": "allow-nt4-crypto", "param": "allow nt4 crypto",
+     "situation": "NTLM", "choices": ["yes", "no"], "recommended": "no"},
+    {"id": "ldap-require-strong-auth", "param": "ldap server require strong auth",
+     "situation": "LDAP/TLS", "choices": ["yes", "no", "allow_sasl_over_tls", "allow_sasl_without_tls_channel_bindings"], "recommended": "yes"},
+    {"id": "tls-enabled", "param": "tls enabled",
+     "situation": "LDAP/TLS", "choices": ["yes", "no"], "recommended": "yes"},
+    {"id": "server-schannel", "param": "server schannel",
+     "situation": "Schannel", "choices": ["yes", "no", "auto"], "recommended": "yes"},
+    {"id": "server-schannel-require-seal", "param": "server schannel require seal",
+     "situation": "Schannel", "choices": ["yes", "no", "auto"], "recommended": "yes"},
+]
+
+def _crypto_account(dc, name):
+    """Resolve a user/computer account -> parse_ldif_full entry (dn + etypes)."""
+    rc, out, err = podman(dc, ["ldbsearch", "-H", SAM, "-b", domain_dn(),
+                               _spn_account_query(name),
+                               "sAMAccountName", "msDS-SupportedEncryptionTypes"])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    ents = parse_ldif_full(out)
+    if not ents:
+        raise Fail("no user or computer account named %r" % name)
+    return ents[0]
+
+def _set_supp_etypes(dc, dn, value):
+    """Set msDS-SupportedEncryptionTypes to int `value`, or clear it (value None)."""
+    if value is None:
+        ldif = "dn: %s\nchangetype: modify\ndelete: msDS-SupportedEncryptionTypes\n" % dn
+    else:
+        ldif = ("dn: %s\nchangetype: modify\nreplace: msDS-SupportedEncryptionTypes\n"
+                "msDS-SupportedEncryptionTypes: %d\n" % (dn, int(value)))
+    rc, out, err = podman(dc, ["ldbmodify", "-H", SAM], stdin=ldif)
+    if rc != 0:
+        msg = (err.strip() or out.strip())
+        if value is None and "no such attribute" in msg.lower():
+            return
+        raise Fail(msg[-400:])
+
+def _read_testparm(dc):
+    """Parsed 'param = value' map from testparm -v (effective config)."""
+    rc, out, _ = podman(dc, ["bash", "-c", "testparm -v -s 2>/dev/null"])
+    d = {}
+    for line in (out or "").splitlines():
+        m = re.match(r'^\s+([A-Za-z][A-Za-z0-9 :._-]*?)\s*=\s*(.*)$', line)
+        if m:
+            d[m.group(1).strip().lower()] = m.group(2).strip()
+    return d
+
+def v_crypto_catalog(a):
+    """Schema-backed inventory of every crypto setting across situations, with
+    current values — the source the Crypto tab renders."""
+    d = first_up_dc()
+    tp = _read_testparm(d)
+    server = []
+    for s in CRYPTO_SERVER_SETTINGS:
+        cur = tp.get(s["param"].lower(), "")
+        rec = s.get("recommended")
+        server.append({"id": s["id"], "situation": s["situation"], "param": s["param"],
+                       "value": cur, "choices": s.get("choices", []),
+                       "recommended": rec, "note": s.get("note", ""),
+                       "compliant": (cur.lower() == rec.lower()) if rec is not None and cur else None,
+                       "scope": "server", "writable": True})
+    # Kerberos account posture (directory)
+    rc, out, _ = podman(d, ["ldbsearch", "-H", SAM, "-b", domain_dn(),
+        "(|(objectClass=user)(objectClass=computer))",
+        "sAMAccountName", "objectClass", "msDS-SupportedEncryptionTypes", "servicePrincipalName"])
+    total = rc4 = aeso = spn_rc4 = 0
+    for e in parse_ldif_full(out or ""):
+        at = e["attrs"]
+        _, r4, ao, _n = _decode_supp_etypes(at.get("msDS-SupportedEncryptionTypes", ["0"])[0])
+        total += 1
+        rc4 += 1 if r4 else 0
+        aeso += 1 if ao else 0
+        if r4 and at.get("servicePrincipalName") and "computer" not in at.get("objectClass", []):
+            spn_rc4 += 1
+    accounts = {"situation": "Accounts", "total": total, "rc4_allowed": rc4,
+                "aes_only": aeso, "rc4_spn_users": spn_rc4,
+                "note": "Per-account Kerberos etypes — set with crypto-account-etypes "
+                        "or bulk with crypto-harden."}
+    situations = sorted(set(s["situation"] for s in CRYPTO_SERVER_SETTINGS)) + ["Accounts"]
+    return {"on": d, "situations": situations, "etype_presets": list(CRYPTO_ETYPE_PRESETS),
+            "harden_scopes": list(CRYPTO_HARDEN_SCOPES), "server": server,
+            "kerberos_accounts": accounts}
+
+def v_crypto_account_etypes(a):
+    """Get, or with --set <preset>, set one account's Kerberos encryption types
+    (msDS-SupportedEncryptionTypes). Directory write, live."""
+    setp = a.get("set")
+    d = pdc_emulator() if setp else first_up_dc()
+    name = a["account"].strip()
+    e = _crypto_account(d, name)
+    if setp:
+        if setp not in CRYPTO_ETYPE_PRESETS:
+            raise Fail("set must be one of: %s" % ", ".join(CRYPTO_ETYPE_PRESETS))
+        _set_supp_etypes(d, e["dn"], CRYPTO_ETYPE_PRESETS[setp])
+        e = _crypto_account(d, name)
+    cur = e["attrs"].get("msDS-SupportedEncryptionTypes", ["0"])[0]
+    names, r4, ao, n = _decode_supp_etypes(cur)
+    return {"account": e["attrs"].get("sAMAccountName", [name])[0], "dn": e["dn"], "on": d,
+            "supported_etypes_value": n, "supported_etypes": names,
+            "rc4_allowed": r4, "aes_only": ao, "set": setp or ""}
+
+def v_crypto_harden(a):
+    """Bulk-set Kerberos encryption types across a situational filter (dry-run by
+    default). scope = which accounts; preset = the etype set (default aes-only).
+    Never touches krbtgt (set that individually)."""
+    scope = a["scope"]
+    if scope not in CRYPTO_HARDEN_SCOPES:
+        raise Fail("scope must be one of: %s" % ", ".join(CRYPTO_HARDEN_SCOPES))
+    preset = a.get("preset", "aes-only") or "aes-only"
+    if preset not in CRYPTO_ETYPE_PRESETS or preset == "clear":
+        raise Fail("preset must be one of: %s" % ", ".join(
+            k for k in CRYPTO_ETYPE_PRESETS if k != "clear"))
+    target = CRYPTO_ETYPE_PRESETS[preset]
+    commit = str(a.get("commit", "")).lower() in ("1", "yes", "true")
+    d = pdc_emulator() if commit else first_up_dc()
+    rc, out, err = podman(d, ["ldbsearch", "-H", SAM, "-b", domain_dn(),
+        CRYPTO_HARDEN_SCOPES[scope],
+        "sAMAccountName", "msDS-SupportedEncryptionTypes"])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    changes = []
+    for e in parse_ldif_full(out):
+        at = e["attrs"]
+        sam = at.get("sAMAccountName", [""])[0]
+        if sam.lower() == "krbtgt":
+            continue
+        try:
+            cur = int(at.get("msDS-SupportedEncryptionTypes", ["0"])[0] or 0)
+        except ValueError:
+            cur = 0
+        if cur != target:
+            changes.append({"account": sam, "dn": e["dn"], "from": cur, "to": target})
+    applied = 0
+    if commit:
+        for c in changes:
+            _set_supp_etypes(d, c["dn"], target)
+            applied += 1
+    return {"scope": scope, "preset": preset, "target_value": target, "on": d,
+            "commit": commit, "would_change": len(changes), "applied": applied,
+            "changes": changes[:100],
+            "note": "" if commit else "dry-run — pass --commit true to apply"}
+
+def v_crypto_set(a):
+    """Enable/disable a server crypto setting (by catalog id): writes the smb.conf
+    param and reloads. DANGER — a wrong value can break authentication; some
+    params only take effect after a full DC restart."""
+    sid = a["id"]
+    spec = next((s for s in CRYPTO_SERVER_SETTINGS if s["id"] == sid), None)
+    if not spec:
+        raise Fail("unknown crypto setting id %r — see crypto-catalog" % sid)
+    val = a["value"].strip()
+    if spec.get("choices") and val not in spec["choices"]:
+        raise Fail("value for %s must be one of: %s" % (sid, ", ".join(spec["choices"])))
+    if re.search(r'[\n\r]', val) or '"' in val:
+        raise Fail("invalid value")
+    d = pdc_emulator()
+    param = spec["param"]
+    py = (
+        "import re\n"
+        "p='/etc/samba/smb.conf'; s=open(p).read()\n"
+        "param=%r; val=%r\n"
+        "pat=re.compile(r'(?im)^[ \\t]*'+re.escape(param)+r'[ \\t]*=.*$')\n"
+        "line='\\t'+param+' = '+val\n"
+        "s2=pat.sub(line, s, count=1) if pat.search(s) else "
+        "re.sub(r'(\\[global\\][ \\t]*\\n)', r'\\1'+line+'\\n', s, count=1)\n"
+        "open(p,'w').write(s2)\n" % (param, val))
+    rc, out, err = podman(d, ["python3", "-c", py])
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-300:])
+    podman(d, ["smbcontrol", "samba", "reload-config"])
+    tp = _read_testparm(d)
+    return {"id": sid, "param": param, "requested": val,
+            "effective": tp.get(param.lower(), ""), "on": d,
+            "note": "smb.conf updated + reload-config sent. testparm reflects the "
+                    "file; some crypto params only take full effect after a DC restart."}
 
 # ---- OUs ------------------------------------------------------------------
 
@@ -4755,6 +4974,25 @@ VERBS = {
                                arg("distinct_spn_threshold", "int", required=False, help_="flag >= this many distinct SPNs per account (default 6)"),
                                arg("tgs_threshold", "int", required=False, help_="flag >= this many TGS per account (default 20)"),
                                arg("dc", "enum", required=False, choices=DC_CHOICES)]},
+    "crypto-catalog": {"fn": v_crypto_catalog, "group": "crypto",
+                      "help": "Schema-backed inventory of all crypto settings across situations (Kerberos etypes, SMB, NTLM, LDAP/TLS, schannel) with current values."},
+    "crypto-account-etypes": {"fn": v_crypto_account_etypes, "group": "crypto",
+                      "help": "Get, or with --set, set one account's Kerberos encryption types (msDS-SupportedEncryptionTypes).",
+                      "args": [arg("account"),
+                               arg("set", "enum", required=False, choices=list(CRYPTO_ETYPE_PRESETS),
+                                   help_="etype preset to apply (omit to just read)")]},
+    "crypto-harden": {"fn": v_crypto_harden, "group": "crypto", "danger": True,
+                      "help": "Bulk-set Kerberos encryption types across a situational filter (dry-run unless commit=true). Never touches krbtgt.",
+                      "args": [arg("scope", "enum", choices=list(CRYPTO_HARDEN_SCOPES)),
+                               arg("preset", "enum", required=False,
+                                   choices=[k for k in CRYPTO_ETYPE_PRESETS if k != "clear"],
+                                   help_="etype set to apply (default aes-only)"),
+                               arg("commit", "enum", required=False, choices=["true", "false"],
+                                   help_="true = apply; default is a dry run")]},
+    "crypto-set": {"fn": v_crypto_set, "group": "crypto", "danger": True,
+                      "help": "Enable/disable a server crypto setting by catalog id (smb.conf + reload; some need a DC restart). A wrong value can break authentication.",
+                      "args": [arg("id", help_="a server setting id from crypto-catalog"),
+                               arg("value", help_="new value (must match the setting's choices)")]},
     "rds-status":    {"fn": v_rds_status, "group": "rds",
                       "help": "RD/Terminal Server licensing support: the license-servers group, its members, per-user-CAL schema, delegation ACE, site SCPs."},
     "rds-ensure":    {"fn": v_rds_ensure, "group": "rds",
