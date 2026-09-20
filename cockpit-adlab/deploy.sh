@@ -226,8 +226,16 @@ do_deploy() {
 
     # Keep exactly one previous payload: rollback is then two commands, with no
     # share and no network.
+    #
+    # sort -Vr (VERSION sort, reversed), NOT sort -r. A lexicographic reverse
+    # sorts payload-1.9.0 AFTER payload-1.10.0, so with 1.10.0 in use and 1.9.0
+    # also present, deploying 1.10.1 kept 1.9.0 and removed payload-1.10.0 - the
+    # directory the live /usr/share/cockpit/adlab and /usr/local/sbin/adlab-admin
+    # symlinks still pointed at. That took the plugin down until a manual repair.
+    # Semantic-version order puts the NEWEST previous payload first, so the
+    # newest-N (KEEP) survive and only the genuinely older ones are removed.
     local p keepers
-    mapfile -t keepers < <(ls -1d "$ROOT_D"/payload-* 2>/dev/null | grep -v "payload-$VERSION\$" | sort -r)
+    mapfile -t keepers < <(ls -1d "$ROOT_D"/payload-* 2>/dev/null | grep -v "payload-$VERSION\$" | sort -Vr)
     for p in "${keepers[@]:$KEEP}"; do [[ -n "$p" ]] && remove_old_payload "$p"; done
 
     printf '\nrunning the INSTALLED install.sh (not this checkout copy)\n'
