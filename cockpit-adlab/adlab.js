@@ -51,6 +51,110 @@
     function clear(n) { while (n && n.firstChild) n.removeChild(n.firstChild); }
     function badge(text, kind) { return el("span", "badge " + (kind || "dim"), text); }
 
+    // ---- contextual help: a "?" on every tab and modal --------------------
+    // Set by dispatchModal so a routed modal's inner modal()/transientModal()
+    // picks up the right key without every builder passing it.
+    var _currentModalHelpKey = null;
+    var HELP = {
+        overview: { title: "Overview", body: [
+            "A live snapshot of the lab: domain identity and functional levels, the seven FSMO role holders, per-DC replication health, SYSVOL status, and every lab container with its state and IP.",
+            "Read-only — use the other tabs to act on the directory."] },
+        objects: { title: "AD Objects", body: [
+            "A dsa.msc-style console: a container/OU tree, a searchable object table (object-type toggles, selectable columns, Advanced Features) and a docked preview with Edit / Attribute Editor / Rename / Delete.",
+            "Right-click a tree node or row (or use the ⋯ kebab) for New / Rename / Delete / Properties. The Group Policy Objects folder lists GPOs and both directions of their links.",
+            "Reads go to any DC; writes target the PDC emulator, and critical objects are protected from deletion."] },
+        spn: { title: "SPNs (Service Principal Names)", body: [
+            "Every account that carries a servicePrincipalName, setspn-style. Add / delete SPNs, query which account holds one, and find Kerberos-breaking duplicates.",
+            "Add SPN = setspn -S (refuses a duplicate; force = -A); the ✕ = setspn -D; Query = -Q; Find duplicates = -X. Writes land on the PDC emulator."] },
+        kerberos: { title: "Kerberos anomaly detection", body: [
+            "Detects Kerberoasting: service tickets requested/issued with RC4 (etype 0x17) instead of AES, and accounts pulling many TGS tickets for distinct SPNs in a short window.",
+            "Live detection needs KDC auditing on — click “Enable audit” (runtime; resets on a DC restart). The Kerberoast-exposure table (which SPN accounts allow RC4) is always available.",
+            "Harden the exposed accounts to AES-only on the Crypto tab."] },
+        crypto: { title: "Crypto control plane", body: [
+            "Enable or disable encryption per situation. Kerberos account encryption types are set live in the directory; “Bulk harden” applies a preset (e.g. AES-only) across a filter — dry-run first.",
+            "Server crypto (SMB / NTLM / LDAP-TLS / schannel) writes smb.conf and reloads; some settings only take effect after a DC restart, and a wrong value can break authentication."] },
+        gpo: { title: "Group Policy", body: [
+            "Create and edit GPOs. Each GPO is Windows- or Linux-exclusive (the OS column) so a Linux setting never applies on Windows and vice versa; use “set OS” to scope a legacy GPO.",
+            "Administrative-Template settings become registry.pol (gpo load); preferences use samba CSEs (gpo manage). The ADMX central store carries both Windows and Linux (Ubuntu/adsys) templates. Writes land on the PDC emulator; SYSVOL replicates within 5 minutes."] },
+        sites: { title: "Sites & Replication", body: [
+            "AD sites, subnets and site links, and the replication topology and health between the domain controllers."] },
+        dns: { title: "DNS", body: [
+            "The AD-integrated DNS zones served by the DCs — forward and reverse zones and the records within them."] },
+        domains: { title: "Domains (forests)", body: [
+            "Each domain is a Samba forest on its own podman network. Add a domain to deploy its first DC; specify a parent to place it on the parent's network and join the parent's forest via a trust (samba has no in-forest child domains).",
+            "Per domain: Manage DCs, Back up, Trusts / Create trust, and (non-primary) Remove."] },
+        dcs: { title: "Domain Controllers", body: [
+            "The DCs of the selected forest: promote an additional DC (replication partner), read a DC's logs, and demote / decommission — never the primary dc1 or a forest's last DC."] },
+        clients: { title: "Clients", body: [
+            "The lab's member client machines and their domain-join state; onboard the next client here."] },
+        members: { title: "Member Servers", body: [
+            "Windows member servers via offline domain join (ODJ): provision a machine account and a join blob a stock Windows answer file can consume — no interactive credential on the box."] },
+        activity: { title: "Activity", body: [
+            "The audit trail: every adlab-admin invocation is appended to a log (never with secret values). This tab is that log."] },
+        // routed (non-verb) modals
+        "gpo-edit": { title: "Edit GPO", body: [
+            "A two-pane GPO editor. The left pane browses ALL available settings by OS type and subsystem (ADMX central store + samba CSEs, cached); the right pane is the selected key's values with a filter, selectable columns and add/edit/remove.",
+            "Editing a setting composes it into this GPO (registry.pol via gpo load, or a CSE preference via gpo manage); only settings matching the GPO's OS scope are accepted."] },
+        "gpo-compose": { title: "Compose Group Policy", body: [
+            "Stack ordered layers into the GPO — template GPOs, ADMX policies, raw registry entries and samba CSE preferences — then apply. Registry layers merge into one gpo load (later overrides); preferences each run gpo manage.",
+            "The current settings load on open; apply is surgical — adds/edits merge and removed entries are deleted."] },
+        "gpo-prefs": { title: "GPO preferences", body: [
+            "The samba Unix CSE preferences (sudoers, motd, issue, smb_conf, …) for this GPO — Linux client policy. Filter by OS and subsystem; every CSE is Linux."] },
+        "gpo-detail": { title: "GPO settings", body: [
+            "A read-only detail of this GPO: metadata, its linked containers, and its registry.pol settings."] },
+        "gpo-admx": { title: "ADMX central store", body: [
+            "The SYSVOL PolicyDefinitions store, separating Windows from Linux (Ubuntu/adsys) administrative templates — load samba's ADMX, install the generated Ubuntu (adsys) Linux set, or review what is present."] },
+        "gpo-templates": { title: "GPO templates", body: [
+            "Reusable GPO snapshots: back a GPO up into the template store, stack template settings into a target GPO, or restore a template as a new GPO."] },
+        "object-edit": { title: "Edit object", body: [
+            "Edit an object's attributes through class-aware tabs (General, Account, …) validated against the live schema. Only changed, writable attributes are sent; read-only / binary / back-link attributes are not editable."] },
+        "object-attrs": { title: "Attribute Editor", body: [
+            "The raw Attribute Editor: every attribute the object's classes allow, typed from the live schema. Binary / SID / security-descriptor values are shown but not editable here."] }
+    };
+
+    function _verbHelp(key) {
+        if (!(SCHEMA && SCHEMA.verbs && SCHEMA.verbs[key])) return null;
+        var v = SCHEMA.verbs[key], body = [v.help || "No description."];
+        if ((v.args || []).length) {
+            body.push("Arguments:");
+            (v.args || []).forEach(function (a) {
+                body.push("• " + a.name + (a.required ? "" : " (optional)") +
+                    (a.help ? " — " + a.help : "") +
+                    (a.choices ? "  [" + a.choices.join(" | ") + "]" : ""));
+            });
+        }
+        if (v.danger) body.push("⚠ Destructive — double-check before confirming.");
+        return { title: key, body: body };
+    }
+    function helpContent(key) {
+        return HELP[key] || _verbHelp(key) ||
+            { title: "Help", body: ["No help is available for this view yet."] };
+    }
+    function helpModal(key) {
+        var h = helpContent(key);
+        transientModal("Help — " + h.title, function (box, close) {
+            (h.body || []).forEach(function (p) {
+                box.appendChild(typeof p === "string" ? el("p", "al-help-p", p) : p);
+            });
+            var ok = el("button", "al-btn", "Close");
+            ok.addEventListener("click", close);
+            box.appendChild(ok);
+        }, false);   // the help modal itself carries no help button
+    }
+    function helpButton(key, label) {
+        var b = el("button", "al-btn secondary al-help", label || "? Help");
+        b.type = "button";
+        b.setAttribute("aria-label", "Help for this view");
+        b.addEventListener("click", function () { helpModal(key); });
+        return b;
+    }
+    function _modalHelpBtn(key) {
+        var b = el("button", "al-help-btn", "?");
+        b.type = "button"; b.title = "Help"; b.setAttribute("aria-label", "Help");
+        b.addEventListener("click", function () { helpModal(key); });
+        return b;
+    }
+
     function classify(err) {
         var problem = err && err.problem;
         var msg = (err && (err.message || err.toString())) || "failed";
@@ -181,6 +285,7 @@
     /* Build the modal named by one stack descriptor. */
     function dispatchModal(desc) {
         var key = desc.modal, target = desc.target;
+        _currentModalHelpKey = key;   // routed modals' inner modal() picks this up
         if (SCHEMA && SCHEMA.verbs && SCHEMA.verbs[key]) {
             var presets = {};
             try { presets = JSON.parse(target || "{}"); } catch (e) { presets = {}; }
@@ -232,12 +337,17 @@
 
     /* Append a modal backdrop onto the stack host (does NOT clear — modals
      * layer). Backdrop click / Escape pop the TOP modal via the URL. */
-    function modal(title, bodyBuilder, wide) {
+    function modal(title, bodyBuilder, wide, helpKey) {
         var host = document.getElementById("al-modal-host");
         var back = el("div", "al-backdrop");
         back.style.zIndex = String(50 + host.children.length * 2);
         var box = el("div", "al-modal" + (wide ? " wide" : ""));
-        var h2 = el("h2", null, title); box.appendChild(h2);
+        var h2 = el("h2", null, title);
+        var head = el("div", "al-modal-head");
+        head.appendChild(h2);
+        head.appendChild(_modalHelpBtn(helpKey || _currentModalHelpKey || title));
+        _currentModalHelpKey = null;
+        box.appendChild(head);
         back.addEventListener("click", function (ev) { if (ev.target === back) closeModal(); });
         back.appendChild(box);
         host.appendChild(back);
@@ -249,12 +359,21 @@
 
     /* A self-closing overlay NOT tied to the URL stack — for transient result
      * / error popups (e.g. an immediate no-arg verb run). */
-    function transientModal(title, bodyBuilder) {
+    function transientModal(title, bodyBuilder, helpKey) {
         var host = document.getElementById("al-modal-host");
         var back = el("div", "al-backdrop");
         back.style.zIndex = String(400 + host.children.length * 2);
         var box = el("div", "al-modal");
-        var h2 = el("h2", null, title); box.appendChild(h2);
+        var h2 = el("h2", null, title);
+        if (helpKey === false) {           // the help modal itself: no "?"
+            box.appendChild(h2);
+        } else {
+            var head = el("div", "al-modal-head");
+            head.appendChild(h2);
+            head.appendChild(_modalHelpBtn(helpKey || _currentModalHelpKey || title));
+            box.appendChild(head);
+        }
+        _currentModalHelpKey = null;
         var restore = null;
         function close() { if (back.parentNode) back.parentNode.removeChild(back); if (restore) restore(); }
         back.addEventListener("click", function (ev) { if (ev.target === back) close(); });
@@ -525,6 +644,9 @@
     function content() {
         var m = document.getElementById("al-content");
         clear(m);
+        var hb = el("div", "al-tabhelp");
+        hb.appendChild(helpButton(currentTab));   // per-tab "? Help"
+        m.appendChild(hb);
         return m;
     }
 

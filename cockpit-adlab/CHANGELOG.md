@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.11.0 - 2026-09-19
+
+Contextual help everywhere — a help button on every page tab and every modal
+opens a help modal for that view.
+
+- **Every tab** gets a "? Help" button (added centrally in `content()`, keyed by
+  the current tab) that opens a help modal describing the tab.
+- **Every modal** gets a "?" in its header (added centrally in `modal()` and
+  `transientModal()`), so routed modals, schema-driven verb forms and transient
+  result/error popups all carry help. The help modal itself has no "?".
+- Help content is a curated `HELP` registry for the 13 tabs and the routed GPO/
+  object modals; for **verb modals it is schema-backed** — derived from the
+  verb's `help` text and its arguments (name, required, choices), so it stays
+  accurate as verbs change.
+- UI-only (adlab.js/adlab.css); no helper/API change. Verified live in a browser
+  (tab help + verb-modal help). VERSION → 1.11.0.
+
 ## 1.10.1 - 2026-09-19
 
 Safety fix for the parent-domain feature: `domain-remove` now removes the
