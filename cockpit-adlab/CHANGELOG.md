@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.7.1 - 2026-09-19
+
+SPN fixes found by live validation against the lab:
+
+- **Long SPNs were truncated.** `ldbsearch` folds attribute values longer than
+  ~79 chars onto continuation lines; the SPN reads used `parse_ldif_entries`,
+  which does not unfold, so GUID-based SPNs (e.g. the DRS
+  `E3514235-…/…/ad.edt1.lab`) came back cut off — and `spn-query` for one then
+  matched nothing. Switched `spn-list`/`spn-list-all`/`spn-query`/
+  `spn-find-duplicates` to `parse_ldif_full`, which unfolds. Regression test added.
+- **`spn-add --force` now works.** `samba-tool spn add` has no `--force` option,
+  so the previous `-A` path errored. Force now writes `servicePrincipalName`
+  directly with `ldbmodify` (bypassing the uniqueness check), which is the real
+  `setspn -A` behavior.
+- Removed a duplicate `_ldap_escape` the SPN block had introduced (the shared one
+  is reused). 196 tests. VERSION → 1.7.1.
+
 ## 1.7.0 - 2026-09-19
 
 Service Principal Names — a setspn-compatible control plane, a dedicated SPNs

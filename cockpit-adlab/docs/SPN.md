@@ -17,7 +17,7 @@ that mirror Windows `setspn.exe`.
 |---|---|---|
 | `setspn -L <acct>` | `spn-list --account <acct>` | `samba-tool spn list` / ldbsearch |
 | `setspn -S <spn> <acct>` | `spn-add --account <acct> --spn <spn>` | `samba-tool spn add` (refuses a duplicate) |
-| `setspn -A <spn> <acct>` | `spn-add … --force true` | `samba-tool spn add --force` (no duplicate check) |
+| `setspn -A <spn> <acct>` | `spn-add … --force true` | `ldbmodify` (add the value directly — `samba-tool spn add` has no `--force`) |
 | `setspn -D <spn> <acct>` | `spn-delete --account <acct> --spn <spn>` | `samba-tool spn delete` |
 | `setspn -Q <spn>` | `spn-query --spn <spn>` | ldbsearch `(servicePrincipalName=<spn>)` |
 | `setspn -X` | `spn-find-duplicates` | ldbsearch all SPNs, group by value |
@@ -27,8 +27,10 @@ Notes on the mapping:
 
 - **`-S` is the default add.** `samba-tool spn add` refuses an SPN that is already
   registered anywhere, which is exactly `setspn -S` (add-with-duplicate-check).
-  `--force true` reproduces the older `setspn -A` (add without the check) — use it
-  only when you know what you are doing.
+  `--force true` reproduces the older `setspn -A` (add without the check). Because
+  `samba-tool spn add` has no `--force`, that path writes `servicePrincipalName`
+  directly with `ldbmodify` — use it only when you know what you are doing, since
+  it can create a duplicate SPN.
 - **Account name.** A computer account may be given with or without the trailing
   `$` (`WEB01` or `WEB01$`); a user is its `sAMAccountName`.
 - **SPN format.** `serviceClass/host[:port][/serviceName]`, e.g.
