@@ -257,7 +257,8 @@ class Base(unittest.TestCase):
 KNOWN_TYPES = {"str", "int", "bool", "enum", "password-stdin"}
 KNOWN_GROUPS = {"meta", "overview", "fsmo", "users", "groups", "gpo", "objects",
                 "sites", "dns", "dcs", "clients", "activity", "domains",
-                "members", "rds", "spn", "kerberos", "crypto", "pki"}
+                "members", "rds", "spn", "kerberos", "crypto", "pki",
+                "delegation", "authpolicy"}
 DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "ou-delete", "gpo-delete", "gpo-unlink", "gpo-settings-remove",
                "dns-delete", "dc-restart", "dc-shell", "dc-promote", "dc-demote",
@@ -265,7 +266,11 @@ DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "client-remove", "member-deprovision", "spn-delete",
                "crypto-harden", "crypto-set",
                "domain-trust-create", "domain-trust-delete",
-               "pki-ca-destroy", "pki-ca-unpublish", "pki-template-delete"}
+               "pki-ca-destroy", "pki-ca-unpublish", "pki-template-delete",
+               "delegation-set-unconstrained", "delegation-set-protocol-transition",
+               "delegation-remove-service", "rbcd-remove",
+               "protected-users-add", "protected-users-remove",
+               "authpolicy-delete", "authsilo-delete", "authsilo-member-revoke"}
 
 
 class TestSchema(Base):
@@ -3070,6 +3075,128 @@ class TestPki(Base):
         signed = [b(c[0]) for c in f.calls if "x509 -req" in b(c[0])]
         self.assertTrue(signed)
         self.assertIn("extendedKeyUsage=1.3.6.1.5.5.7.3.1", signed[0])   # serverAuth
+
+
+DELEG_LDIF = """dn: CN=DC1,OU=Domain Controllers,DC=ad,DC=edt1,DC=lab
+sAMAccountName: DC1$
+userAccountControl: 532480
+objectClass: computer
+
+dn: CN=edy-adweb,CN=Users,DC=ad,DC=edt1,DC=lab
+sAMAccountName: edy-adweb
+userAccountControl: 16777216
+msDS-AllowedToDelegateTo: ldap/dc1.ad.edt1.lab
+objectClass: user
+
+dn: CN=web01,CN=Computers,DC=ad,DC=edt1,DC=lab
+sAMAccountName: web01$
+userAccountControl: 4096
+msDS-AllowedToActOnBehalfOfOtherIdentity:: AQID
+objectClass: computer
+"""
+
+
+class TestDelegation(Base):
+    """S4U / delegation + Protected Users + authentication policies."""
+
+    def test_delegation_list_classifies_and_ranks(self):
+        f = self.fake
+        f.on(lambda a: "ldbsearch" in a and "userAccountControl" in a
+                       and "msDS-AllowedToDelegateTo" in a, out=DELEG_LDIF)
+        f.lab_up()
+        rc, out = self.call_main(["delegation-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["count"], 3)
+        by = {r["account"]: r for r in out["accounts"]}
+        self.assertTrue(by["DC1$"]["unconstrained"])
+        self.assertEqual(by["DC1$"]["risk"], "high")
+        self.assertIn("constrained+protocol-transition", by["edy-adweb"]["kinds"])
+        self.assertEqual(by["edy-adweb"]["allowed_to"], ["ldap/dc1.ad.edt1.lab"])
+        self.assertTrue(by["web01$"]["rbcd"])
+        self.assertIn("rbcd-target", by["web01$"]["kinds"])
+        # high-risk sorts first
+        self.assertEqual(out["accounts"][0]["account"], "DC1$")
+
+    def _fake_account(self, sam):
+        # _spn_account/_deleg_sam does an ldbsearch whose filter embeds the name;
+        # return a matching entry (match on the bare name inside the filter).
+        bare = sam.rstrip("$")
+        self.fake.on(lambda a: "ldbsearch" in a and "servicePrincipalName" in a
+                     and any(bare in str(x) for x in a),
+                     out="dn: CN=%s,CN=Users,DC=ad,DC=edt1,DC=lab\nsAMAccountName: %s\n" % (bare, sam))
+
+    def test_set_unconstrained_calls_samba_tool(self):
+        f = self.fake
+        self._fake_account("web01$")
+        f.on(lambda a: "samba-tool" in a and "for-any-service" in a, out="")
+        f.lab_up()
+        rc, out = self.call_main(["delegation-set-unconstrained", "--account", "web01$", "--state", "on"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["unconstrained"])
+        hits = f.argv_containing("delegation", "for-any-service", "web01$", "on")
+        self.assertTrue(hits and "-H" in hits[0])
+
+    def test_add_service_constrained(self):
+        f = self.fake
+        self._fake_account("edy-adweb")
+        f.on(lambda a: "samba-tool" in a and "add-service" in a, out="")
+        f.lab_up()
+        rc, out = self.call_main(["delegation-add-service", "--account", "edy-adweb",
+                                  "--service", "cifs/fs01.ad.edt1.lab"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["added_service"], "cifs/fs01.ad.edt1.lab")
+        self.assertTrue(f.argv_containing("delegation", "add-service", "cifs/fs01.ad.edt1.lab"))
+
+    def test_rbcd_add_principal(self):
+        f = self.fake
+        self._fake_account("web01$")
+        self._fake_account("app01$")
+        f.on(lambda a: "samba-tool" in a and "add-principal" in a, out="")
+        f.lab_up()
+        rc, out = self.call_main(["rbcd-add", "--account", "web01$", "--principal", "app01$"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["added_principal"], "app01$")
+
+    def test_protected_users_add(self):
+        f = self.fake
+        f.on(lambda a: "samba-tool" in a and "addmembers" in a, out="")
+        f.lab_up()
+        rc, out = self.call_main(["protected-users-add", "--member", "alice"])
+        self.assertEqual(rc, 0, out)
+        hits = f.argv_containing("group", "addmembers", "Protected Users", "alice")
+        self.assertTrue(hits)
+
+    def test_authpolicy_create_defaults_to_audit(self):
+        f = self.fake
+        f.on(lambda a: "samba-tool" in a and "policy" in a and "create" in a, out="")
+        f.lab_up()
+        rc, out = self.call_main(["authpolicy-create", "--name", "P1"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(out["enforced"])
+        hits = f.argv_containing("auth", "policy", "create", "--audit")
+        self.assertTrue(hits)
+        self.assertFalse(any("--enforce" in h for h in hits))
+
+    def test_authpolicy_create_enforce(self):
+        f = self.fake
+        f.on(lambda a: "samba-tool" in a and "policy" in a and "create" in a, out="")
+        f.lab_up()
+        rc, out = self.call_main(["authpolicy-create", "--name", "P2", "--enforce", "true",
+                                  "--tgt_lifetime_mins", "240"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["enforced"])
+        self.assertTrue(f.argv_containing("auth", "policy", "create", "--enforce"))
+        self.assertTrue(f.argv_containing("--user-tgt-lifetime-mins", "240"))
+
+    def test_authsilo_create_binds_policies(self):
+        f = self.fake
+        f.on(lambda a: "samba-tool" in a and "silo" in a and "create" in a, out="")
+        f.lab_up()
+        rc, out = self.call_main(["authsilo-create", "--name", "S1",
+                                  "--user_policy", "P1", "--enforce", "true"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(f.argv_containing("silo", "create", "--user-authentication-policy", "P1"))
+        self.assertTrue(f.argv_containing("silo", "create", "--enforce"))
 
 
 if __name__ == "__main__":

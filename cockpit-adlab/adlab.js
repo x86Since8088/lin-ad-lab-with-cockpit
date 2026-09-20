@@ -73,6 +73,10 @@
         crypto: { title: "Crypto control plane", body: [
             "Enable or disable encryption per situation. Kerberos account encryption types are set live in the directory; “Bulk harden” applies a preset (e.g. AES-only) across a filter — dry-run first.",
             "Server crypto (SMB / NTLM / LDAP-TLS / schannel) writes smb.conf and reloads; some settings only take effect after a DC restart, and a wrong value can break authentication."] },
+        delegation: { title: "Delegation & authentication", body: [
+            "Kerberos delegation (S4U) and authentication hardening in one place. The inventory ranks every account with delegation by risk: unconstrained (TRUSTED_FOR_DELEGATION) is highest — a compromise of that host can impersonate any user to any service; DCs hold it by design.",
+            "Constrained delegation limits an account to specific service SPNs (msDS-AllowedToDelegateTo); protocol transition (S4U2Proxy) lets it do so for any protocol. Resource-based constrained delegation (RBCD) is set on the TARGET — it names which principals may impersonate to it.",
+            "Harden with the Protected Users group (no NTLM/DES/RC4, no delegation, short TGT) and authentication policies / silos (create audit-first; enforcement is by samba's KDC). Writes land on the PDC emulator."] },
         pki: { title: "AD PKI", body: [
             "A domain-integrated public-key infrastructure. The CA node is a dedicated openssl-CA container with its own self-signed Enterprise Root CA — samba is only a certificate consumer, never a CA.",
             "“Publish to AD” writes the root into the forest's Public Key Services tree (Certification Authorities root-trust, AIA for chain-building, NTAuthCertificates to permit smartcard/PKINIT logon, and an Enrollment Service that advertises the CA and its templates), so every domain member trusts it.",
@@ -593,6 +597,7 @@
         ["kerberos", "Kerberos"],
         ["crypto", "Crypto"],
         ["pki", "PKI"],
+        ["delegation", "Delegation"],
         ["gpo", "Group Policy"], ["sites", "Sites & Replication"],
         ["dns", "DNS"], ["domains", "Domains"], ["dcs", "Domain Controllers"],
         ["clients", "Clients"], ["members", "Member Servers"],
@@ -3489,10 +3494,101 @@
         }).catch(function (e) { fCerts(el("div", "al-alert err", String(e))); });
     }
 
+    // -------- S4U / delegation + authentication policies
+    function renderDelegation() {
+        var m = content();
+        var acts = el("div", "al-actions");
+        acts.appendChild(actionButton("Add constrained service", "delegation-add-service", {}));
+        acts.appendChild(actionButton("Grant RBCD", "rbcd-add", {}));
+        acts.appendChild(actionButton("Set unconstrained", "delegation-set-unconstrained", {}));
+        var refresh = el("button", "al-btn secondary", "Refresh");
+        refresh.addEventListener("click", function () { refreshTab(); });
+        acts.appendChild(refresh);
+        m.appendChild(acts);
+        m.appendChild(el("div", "al-alert warn",
+            "Kerberos delegation (S4U) and authentication hardening. Three delegation " +
+            "types: unconstrained (TRUSTED_FOR_DELEGATION — a compromise of that host " +
+            "impersonates anyone; DCs hold it by design), constrained " +
+            "(msDS-AllowedToDelegateTo, + protocol transition = S4U2Proxy), and " +
+            "resource-based (RBCD — the target names who may impersonate to it). Harden " +
+            "with the Protected Users group and authentication policies / silos. Writes " +
+            "land on the PDC emulator."));
+        var holder = el("div", "al-grid"); m.appendChild(holder);
+
+        function riskBadge(r) {
+            return r === "high" ? badge("high", "err")
+                 : r === "medium" ? badge("review", "warn") : badge("low", "dim");
+        }
+        var fInv = slotCard(holder, "Delegation inventory", true);
+        run("delegation-list").then(function (r) {
+            fInv(emptyOr(r.accounts, ["account", "type", "kinds", "delegates to", "risk", ""],
+                function (x) {
+                    var actbox = el("div", "al-actions");
+                    actbox.appendChild(actionButton("show", "delegation-show", { account: x.account }));
+                    if (x.rbcd) actbox.appendChild(actionButton("RBCD", "rbcd-show", { account: x.account }));
+                    return [el("kbd", "al", x.account),
+                            badge(x["class"] === "computer" ? "computer" : "user", "dim"),
+                            (x.kinds || []).join(", "),
+                            (x.allowed_to || []).join("  ") || "—",
+                            riskBadge(x.risk), actbox];
+                }, "no account has delegation configured"),
+                "Delegation inventory — " + (r.count || 0) + " account(s) (on " + (r.on || "") + ")");
+        }).catch(function (e) { fInv(el("div", "al-alert err", String(e))); });
+
+        var fProt = slotCard(holder, "Protected Users", true);
+        run("protected-users-list").then(function (r) {
+            var box = el("div");
+            box.appendChild(el("div", "al-sub",
+                "Members get hardened credentials: no NTLM/DES/RC4, no delegation, short TGT."));
+            var arow = el("div", "al-actions");
+            arow.appendChild(actionButton("Add member", "protected-users-add", {}));
+            box.appendChild(arow);
+            box.appendChild(emptyOr((r.members || []).map(function (dn) { return { dn: dn }; }),
+                ["member DN", ""], function (x) {
+                    return [el("code", "al-spn", x.dn),
+                            actionButton("✕", "protected-users-remove", { member: x.dn })];
+                }, "no members"));
+            fProt(box, "Protected Users — " + (r.count || 0) + " member(s)");
+        }).catch(function (e) { fProt(el("div", "al-alert err", String(e))); });
+
+        var fPol = slotCard(holder, "Authentication policies & silos", true);
+        Promise.all([run("authpolicy-list").catch(function () { return { policies: [] }; }),
+                     run("authsilo-list").catch(function () { return { silos: [] }; })])
+            .then(function (rs) {
+                var box = el("div");
+                box.appendChild(el("div", "al-alert warn",
+                    "Create policies audit-first (enforce off); enforcement is by samba's " +
+                    "KDC for accounts in an assigned silo or with the policy set directly."));
+                var arow = el("div", "al-actions");
+                arow.appendChild(actionButton("New policy", "authpolicy-create", {}));
+                arow.appendChild(actionButton("New silo", "authsilo-create", {}));
+                box.appendChild(arow);
+                box.appendChild(el("h4", null, "Policies (" + (rs[0].policies || []).length + ")"));
+                box.appendChild(emptyOr((rs[0].policies || []).map(function (n) { return { n: n }; }),
+                    ["policy", ""], function (x) {
+                        var b = el("div", "al-actions");
+                        b.appendChild(actionButton("view", "authpolicy-show", { name: x.n }));
+                        b.appendChild(actionButton("✕", "authpolicy-delete", { name: x.n }));
+                        return [el("kbd", "al", x.n), b];
+                    }, "no authentication policies"));
+                box.appendChild(el("h4", null, "Silos (" + (rs[1].silos || []).length + ")"));
+                box.appendChild(emptyOr((rs[1].silos || []).map(function (n) { return { n: n }; }),
+                    ["silo", ""], function (x) {
+                        var b = el("div", "al-actions");
+                        b.appendChild(actionButton("view", "authsilo-show", { name: x.n }));
+                        b.appendChild(actionButton("grant", "authsilo-member-grant", { name: x.n }));
+                        b.appendChild(actionButton("✕", "authsilo-delete", { name: x.n }));
+                        return [el("kbd", "al", x.n), b];
+                    }, "no authentication silos"));
+                fPol(box, "Authentication policies & silos");
+            }).catch(function (e) { fPol(el("div", "al-alert err", String(e))); });
+    }
+
     // ---------------------------------------------------------------- boot
     var RENDER = { overview: renderOverview,
                    objects: renderObjects, spn: renderSpn, kerberos: renderKerberos,
-                   crypto: renderCrypto, pki: renderPki, gpo: renderGpo,
+                   crypto: renderCrypto, pki: renderPki, delegation: renderDelegation,
+                   gpo: renderGpo,
                    sites: renderSites, dns: renderDns, domains: renderDomains,
                    dcs: renderDcs, clients: renderClients, members: renderMembers,
                    activity: renderActivity };
