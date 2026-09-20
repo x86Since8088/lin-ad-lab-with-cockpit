@@ -249,12 +249,13 @@ class Base(unittest.TestCase):
 KNOWN_TYPES = {"str", "int", "bool", "enum", "password-stdin"}
 KNOWN_GROUPS = {"meta", "overview", "fsmo", "users", "groups", "gpo", "objects",
                 "sites", "dns", "dcs", "clients", "activity", "domains",
-                "members", "rds", "spn", "kerberos"}
+                "members", "rds", "spn", "kerberos", "crypto"}
 DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "ou-delete", "gpo-delete", "gpo-unlink", "gpo-settings-remove",
                "dns-delete", "dc-restart", "dc-shell", "dc-promote", "dc-demote",
                "dc-decommission", "domain-add", "domain-remove",
-               "client-remove", "member-deprovision", "spn-delete"}
+               "client-remove", "member-deprovision", "spn-delete",
+               "crypto-harden", "crypto-set"}
 
 
 class TestSchema(Base):
@@ -989,6 +990,115 @@ class TestGpoVerbs(Base):
 import base64 as _base64
 def _b64(blob):
     return _base64.b64encode(blob).decode()
+
+
+class TestCrypto(Base):
+    """Crypto control plane: schema catalog, per-account/bulk Kerberos etypes,
+    and server crypto settings."""
+    def test_etype_presets(self):
+        self.assertEqual(mod.CRYPTO_ETYPE_PRESETS["aes-only"], 0x18)
+        self.assertEqual(mod.CRYPTO_ETYPE_PRESETS["rc4-only"], 0x4)
+        self.assertIsNone(mod.CRYPTO_ETYPE_PRESETS["clear"])
+
+    def test_account_etypes_get(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=(
+            "dn: CN=svc,CN=Users,DC=ad,DC=edt1,DC=lab\nsAMAccountName: svc\n"
+            "msDS-SupportedEncryptionTypes: 24\n\n"))
+        rc, out = self.call_main(["crypto-account-etypes", "--account", "svc"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["supported_etypes_value"], 24)
+        self.assertTrue(out["aes_only"]); self.assertFalse(out["rc4_allowed"])
+
+    def test_account_etypes_set_replaces(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=(
+            "dn: CN=svc,CN=Users,DC=ad,DC=edt1,DC=lab\nsAMAccountName: svc\n"
+            "msDS-SupportedEncryptionTypes: 24\n\n"))
+        self.fake.on(lambda a: "ldbmodify" in a, out="Modified 1")
+        rc, out = self.call_main(["crypto-account-etypes", "--account", "svc", "--set", "aes-only"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["set"], "aes-only")
+        mc = next(c for c in self.fake.calls if "ldbmodify" in c[0])
+        self.assertIn("replace: msDS-SupportedEncryptionTypes", mc[1])
+        self.assertIn("msDS-SupportedEncryptionTypes: 24", mc[1])   # 0x18
+
+    def test_account_etypes_clear_deletes(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=(
+            "dn: CN=svc,CN=Users,DC=ad,DC=edt1,DC=lab\nsAMAccountName: svc\n\n"))
+        self.fake.on(lambda a: "ldbmodify" in a, out="ok")
+        rc, out = self.call_main(["crypto-account-etypes", "--account", "svc", "--set", "clear"])
+        self.assertEqual(rc, 0, out)
+        mc = next(c for c in self.fake.calls if "ldbmodify" in c[0])
+        self.assertIn("delete: msDS-SupportedEncryptionTypes", mc[1])
+
+    def test_harden_dryrun_excludes_krbtgt_and_compliant(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=(
+            "dn: CN=a,DC=x\nsAMAccountName: a\nmsDS-SupportedEncryptionTypes: 0\n\n"
+            "dn: CN=krbtgt,DC=x\nsAMAccountName: krbtgt\nmsDS-SupportedEncryptionTypes: 0\n\n"
+            "dn: CN=b,DC=x\nsAMAccountName: b\nmsDS-SupportedEncryptionTypes: 24\n\n"))
+        rc, out = self.call_main(["crypto-harden", "--scope", "spn-users"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(out["commit"])
+        self.assertEqual(out["would_change"], 1)          # only 'a' (0 != 24)
+        self.assertEqual(out["applied"], 0)
+        self.assertEqual(out["changes"][0]["account"], "a")
+
+    def test_harden_commit_applies(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out=(
+            "dn: CN=a,DC=x\nsAMAccountName: a\nmsDS-SupportedEncryptionTypes: 0\n\n"))
+        self.fake.on(lambda a: "ldbmodify" in a, out="ok")
+        rc, out = self.call_main(["crypto-harden", "--scope", "spn-users", "--commit", "true"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["commit"]); self.assertEqual(out["applied"], 1)
+
+    def test_crypto_set_writes_and_reloads(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "python3" in a, out="")
+        self.fake.on(lambda a: "smbcontrol" in a and "reload-config" in a, out="")
+        self.fake.on(lambda a: "bash" in a and any("testparm" in str(x) for x in a),
+                     out="\tkerberos encryption types = strong\n")
+        rc, out = self.call_main(["crypto-set", "--id", "kerberos-encryption-types", "--value", "strong"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["effective"], "strong")
+        pc = next(c for c in self.fake.calls if "python3" in c[0])
+        self.assertIn("kerberos encryption types", " ".join(map(str, pc[0])))
+
+    def test_crypto_set_rejects_bad_value(self):
+        self.fake.lab_up()
+        rc, out = self.call_main(["crypto-set", "--id", "ntlm-auth", "--value", "bogus"])
+        self.assertEqual(rc, 1)
+        self.assertIn("must be one of", out["error"])
+
+    def test_crypto_set_rejects_unknown_id(self):
+        self.fake.lab_up()
+        rc, out = self.call_main(["crypto-set", "--id", "nope", "--value", "x"])
+        self.assertEqual(rc, 1)
+        self.assertIn("unknown crypto setting", out["error"])
+
+    def test_catalog_server_and_accounts(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "bash" in a and any("testparm" in str(x) for x in a), out=(
+            "\tkerberos encryption types = all\n\tntlm auth = ntlmv2-only\n"
+            "\tserver smb encrypt = default\n"))
+        self.fake.on(lambda a: "ldbsearch" in a, out=(
+            "dn: CN=a,DC=x\nsAMAccountName: a\nobjectClass: user\n"
+            "servicePrincipalName: HTTP/a\nmsDS-SupportedEncryptionTypes: 0\n\n"
+            "dn: CN=b,DC=x\nsAMAccountName: b\nobjectClass: user\n"
+            "msDS-SupportedEncryptionTypes: 24\n\n"))
+        rc, out = self.call_main(["crypto-catalog"])
+        self.assertEqual(rc, 0, out)
+        ids = {s["id"]: s for s in out["server"]}
+        self.assertEqual(ids["kerberos-encryption-types"]["value"], "all")
+        self.assertFalse(ids["kerberos-encryption-types"]["compliant"])   # all != strong
+        self.assertTrue(ids["ntlm-auth"]["compliant"])                    # ntlmv2-only
+        self.assertEqual(out["kerberos_accounts"]["total"], 2)
+        self.assertEqual(out["kerberos_accounts"]["rc4_allowed"], 1)      # a (unset)
+        self.assertEqual(out["kerberos_accounts"]["aes_only"], 1)         # b
+        self.assertEqual(out["kerberos_accounts"]["rc4_spn_users"], 1)    # a: spn user, rc4
 
 
 class TestKerberos(Base):

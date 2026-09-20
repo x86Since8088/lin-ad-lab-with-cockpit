@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.9.0 - 2026-09-19
+
+Crypto control plane — a dedicated "Crypto" tab and schema-backed verbs to
+enable or disable encryption per situation across the lab. See
+`docs/CRYPTO-CONTROL.md`.
+
+- **`crypto-catalog`** — the schema-backed inventory of every crypto setting
+  across situations (Kerberos account etypes posture, Kerberos KDC etypes, SMB
+  encryption/signing, NTLM, LDAP/TLS, schannel) with current values, allowed
+  choices and the hardened recommendation. This is what the Crypto tab renders.
+- **`crypto-account-etypes --account [--set <preset>]`** — read, or set, one
+  account's Kerberos encryption types (`msDS-SupportedEncryptionTypes`) live via
+  ldbmodify. Presets: `aes-only` (0x18), `aes+rc4` (0x1C), `rc4-only` (0x4),
+  `all` (0x1F), `clear` (unset).
+- **`crypto-harden --scope <spn-users|all-users|computers> [--preset] [--commit]`**
+  — bulk-set etypes across a situational filter; **dry-run by default** (shows
+  what would change), applies only with `--commit true`. Never touches krbtgt.
+- **`crypto-set --id <catalog id> --value <v>`** — enable/disable a server crypto
+  setting (writes the smb.conf param + reload). Danger: a wrong value can break
+  authentication, and some params only take effect after a DC restart.
+- **UI** — a "Crypto" tab: the account-encryption posture (RC4-allowed vs
+  AES-only counts, RC4 SPN-user targets) with one-click SPN-user hardening, and
+  the server crypto settings grouped by situation with inline apply and a
+  hardened/review status per setting.
+- 10 new unit tests (`TestCrypto`); 217 total. VERSION → 1.9.0.
+
 ## 1.8.0 - 2026-09-19
 
 Kerberos ticket anomaly detection (Kerberoasting) — a dedicated "Kerberos" tab
