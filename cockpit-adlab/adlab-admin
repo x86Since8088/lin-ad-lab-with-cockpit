@@ -664,6 +664,7 @@ def _admx_element(e):
     list key/prefix, text maxlen)."""
     kind = _admx_local(e.tag)
     el = {"kind": kind, "id": e.get("id", ""), "valuename": e.get("valueName", ""),
+          "key": e.get("key", ""),      # per-element key override (else the policy key)
           "required": (e.get("required", "") or "").lower() == "true"}
     if kind in ("decimal", "longDecimal"):
         el["type"] = "REG_QWORD" if kind == "longDecimal" else "REG_DWORD"
@@ -678,9 +679,10 @@ def _admx_element(e):
     elif kind == "multiText":
         el["type"] = "REG_MULTI_SZ"
     elif kind == "boolean":
-        el["type"] = "REG_DWORD"
         el["true_value"] = _admx_bool_side(e, "trueValue", 1)
         el["false_value"] = _admx_bool_side(e, "falseValue", 0)
+        # a string trueValue/falseValue means the value is REG_SZ, not REG_DWORD
+        el["type"] = "REG_SZ" if isinstance(el["true_value"], str) or isinstance(el["false_value"], str) else "REG_DWORD"
     elif kind == "enum":
         items = []
         for it in list(e):
@@ -692,7 +694,8 @@ def _admx_element(e):
         el["items"] = items
         el["type"] = items[0]["type"] if items else "REG_SZ"
     elif kind == "list":
-        el["type"] = "REG_SZ"
+        el["expandable"] = (e.get("expandable", "") or "").lower() == "true"
+        el["type"] = "REG_EXPAND_SZ" if el["expandable"] else "REG_SZ"
         el["list_key"] = e.get("key", "")
         el["value_prefix"] = e.get("valuePrefix", "")
         el["explicit"] = (e.get("explicitValue", "") or "").lower() == "true"
@@ -812,7 +815,7 @@ def parse_adml_presentations(xml_text):
             ctl = {"control": ct, "refId": c.get("refId", "")}
             if ct == "text":                       # a static label line
                 ctl["label"] = "".join(c.itertext()).strip()
-            elif ct == "decimalTextBox":
+            elif ct in ("decimalTextBox", "longDecimalTextBox"):
                 ctl["label"] = (c.text or "").strip()
                 ctl["default"] = _int_or_none(c.get("defaultValue"))
                 ctl["spin"] = (c.get("spin", "") or "").lower() != "false"
@@ -823,10 +826,18 @@ def parse_adml_presentations(xml_text):
                         ctl["label"] = "".join(cc.itertext()).strip()
                     elif lt == "defaultValue":
                         ctl["default"] = "".join(cc.itertext()).strip()
-            elif ct in ("dropdownList", "comboBox"):
+            elif ct == "dropdownList":
                 ctl["label"] = (c.text or "").strip()
                 ctl["default_item"] = _int_or_none(c.get("defaultItem"))
                 ctl["nosort"] = (c.get("noSort", "") or "").lower() == "true"
+            elif ct == "comboBox":                 # free text + suggestions (a text element)
+                ctl["label"] = (c.text or "").strip()
+                for cc in list(c):
+                    lt = _admx_local(cc.tag)
+                    if lt == "label" and not ctl["label"]:
+                        ctl["label"] = "".join(cc.itertext()).strip()
+                    elif lt == "default":
+                        ctl["default"] = "".join(cc.itertext()).strip()
             elif ct == "checkBox":
                 ctl["label"] = "".join(c.itertext()).strip()
                 ctl["default"] = (c.get("defaultChecked", "") or "").lower() == "true"
@@ -2990,7 +3001,7 @@ def _write_catalog_tags(tags):
 # detection), and keeps the rest. OS/subsystem facets + operator tag overrides
 # are applied at SERVE time, not cached, so retagging never needs a re-parse.
 CATALOG_CACHE_FILE = "/var/lib/adlab/catalog-cache.json"   # host, world-readable
-CATALOG_CACHE_VERSION = 2                                  # bump to invalidate
+CATALOG_CACHE_VERSION = 3                                  # bump to invalidate
 
 
 def _now_iso():
@@ -3211,6 +3222,14 @@ def _build_category_index(cache, tags, os_filter=None):
         n["count"] = len(n["policies"]) + sum(c["count"] for c in n["children"])
         return n if n["count"] else None
     tree = [t for t in (prune(r) for r in roots) if t is not None]
+    # A parentCategory cycle with no path to a root leaves nodes unreachable from
+    # `roots`; promote any still-unvisited node so its policies aren't silently
+    # dropped (prune's `seen` guard then breaks the cycle within it).
+    for gid, n in cats.items():
+        if gid not in seen:
+            p = prune(n)
+            if p is not None:
+                tree.append(p)
     tree.sort(key=lambda x: x["display"].lower())
     return cats, tree
 
@@ -3257,9 +3276,13 @@ def _policy_schema(cache, tags, pid):
     cls = (p.get("class") or "BOTH").upper()
     if cls not in ("MACHINE", "USER"):
         cls = "BOTH"
+    # supportedOn is a cross-file ref (e.g. "windows:SUPPORTED_Windows7"); full
+    # prose lives in another ADMX's supportedOn definitions. Strip the namespace
+    # prefix so the UI shows the requirement token rather than a qualified ref.
+    supported = (p.get("supported", "") or "").split(":", 1)[-1]
     return {"id": pid, "name": p.get("display") or p.get("id", ""),
             "explain": p.get("explain", ""), "class": cls,
-            "supported": p.get("supported", ""), "os_type": _policy_os(p, tags),
+            "supported": supported, "os_type": _policy_os(p, tags),
             "key": p.get("key", ""), "valuename": p.get("valuename", ""),
             "has_enabled": p.get("has_enabled"), "has_disabled": p.get("has_disabled"),
             "enabled_type": p.get("enabled_type"), "enabled_data": p.get("enabled_data"),
@@ -3338,6 +3361,8 @@ def _compile_policy(schema, state, values, cls):
             st(key, base_vn, schema.get("disabled_type") or "REG_DWORD", schema.get("disabled_data"))
         for li in schema.get("disabled_list", []):
             st(li.get("key"), li.get("valuename"), li.get("type") or "REG_DWORD", li.get("data"))
+        for li in schema.get("enabled_list", []):    # clear the opposite state's list rows
+            rm(li.get("key"), li.get("valuename"))
         for el in schema.get("elements", []):        # elements are suppressed when disabled
             if el.get("kind") != "list":
                 rm(el.get("key"), el.get("valuename"))
@@ -3348,14 +3373,17 @@ def _compile_policy(schema, state, values, cls):
         st(key, base_vn, schema.get("enabled_type") or "REG_DWORD", schema.get("enabled_data"))
     for li in schema.get("enabled_list", []):
         st(li.get("key"), li.get("valuename"), li.get("type") or "REG_DWORD", li.get("data"))
+    for li in schema.get("disabled_list", []):       # clear the opposite state's list rows
+        rm(li.get("key"), li.get("valuename"))
     for el in schema.get("elements", []):
         vn, kind = el.get("valuename", ""), el.get("kind")
+        ek = el.get("key") or key                    # per-element key override, else policy key
         raw = values.get(el.get("id"))
         if kind == "list":
             lk = el.get("list_key") or key
             items = raw if isinstance(raw, list) else \
                 ([] if raw in (None, "") else str(raw).splitlines())
-            rtype = "REG_EXPAND_SZ" if el.get("expandable") else "REG_SZ"
+            rtype = el.get("type") or "REG_SZ"
             i = 0
             for item in items:
                 item = (item or "").strip()
@@ -3371,26 +3399,26 @@ def _compile_policy(schema, state, values, cls):
         if raw is None or raw == "":
             if el.get("required"):
                 raise Fail("element '%s' is required" % (el.get("label") or el.get("id")))
-            rm(el.get("key"), vn)                    # clear any stale optional value
+            rm(ek, vn)                               # clear any stale optional value
             continue
         if kind in ("decimal", "longDecimal"):
             data = int(raw)
             t = el.get("type") or ("REG_QWORD" if kind == "longDecimal" else "REG_DWORD")
             if el.get("store_as_text"):
                 data, t = str(data), "REG_SZ"
-            st(key, vn, t, data)
+            st(ek, vn, t, data)
         elif kind == "boolean":
-            st(key, vn, "REG_DWORD",
+            st(ek, vn, el.get("type") or "REG_DWORD",
                el.get("true_value", 1) if _truthy(raw) else el.get("false_value", 0))
         elif kind == "enum":
             t = el.get("type") or "REG_SZ"
             data = int(raw) if t in ("REG_DWORD", "REG_QWORD") else str(raw)
-            st(key, vn, t, data)
+            st(ek, vn, t, data)
         elif kind == "multiText":
             vals = raw if isinstance(raw, list) else str(raw).splitlines()
-            st(key, vn, "REG_MULTI_SZ", [v for v in vals if v != ""])
+            st(ek, vn, "REG_MULTI_SZ", [v for v in vals if v != ""])
         else:                                        # text
-            st(key, vn, el.get("type") or "REG_SZ", str(raw))
+            st(ek, vn, el.get("type") or "REG_SZ", str(raw))
     return load, remove
 
 def v_gpo_policy_compile(a):
@@ -3427,6 +3455,21 @@ def v_gpo_policy_compile(a):
         raise Fail("policy is %s-only but GPO %s is scoped %s — use a %s GPO"
                    % (schema["os_type"], gpo, scope, schema["os_type"]))
     load, remove = _compile_policy(schema, state, values, cls)
+    # Authoritative lists: a merge `gpo load` only ADDS rows, so shrinking a list,
+    # disabling, or Not Configured would leave stale rows behind. Delete any value
+    # under a list element's key that we are NOT re-writing this time. (remove runs
+    # after load, so a value being re-written is never in this set.)
+    list_keys = set()
+    for el in schema.get("elements", []):
+        if el.get("kind") == "list":
+            list_keys.add((el.get("list_key") or schema.get("key", "")).lower())
+    if list_keys:
+        writing = set((e["keyname"].lower(), e["valuename"].lower()) for e in load)
+        for pe in _read_registry_pol(d, gpo):
+            k = pe.get("keyname", "").lower()
+            if k in list_keys and (k, pe.get("valuename", "").lower()) not in writing:
+                remove.append({"keyname": pe["keyname"], "valuename": pe["valuename"],
+                               "class": pe.get("class", cls)})
     result = {"gpo": gpo, "id": a["id"], "state": state, "class": cls,
               "entries": load, "removed": remove, "applied": False,
               "os_scope": scope or "", "os_auto_set": auto, "on": d}
@@ -3464,23 +3507,39 @@ def v_gpo_policy_read(a):
     if base is not None:
         state = "disabled" if (schema.get("has_disabled")
                                and base.get("data") == schema.get("disabled_data")) else "enabled"
-    for li in schema.get("enabled_list", []):
-        if idx.get(((li.get("key") or key).lower(), (li.get("valuename") or "").lower())):
-            state = "enabled"
+    # list-based enable/disable: the whole enabled/disabled list value-set must
+    # match. Check disabled first so a disabledList policy reads as Disabled, and
+    # never let a stray element presence override an explicit Disabled below.
+    def _list_matches(lst):
+        if not lst:
+            return False
+        for li in lst:
+            e = idx.get(((li.get("key") or key).lower(), (li.get("valuename") or "").lower()))
+            if e is None or e.get("data") != li.get("data"):
+                return False
+        return True
+    if _list_matches(schema.get("disabled_list", [])):
+        state = "disabled"
+    elif _list_matches(schema.get("enabled_list", [])):
+        state = "enabled"
     for el in schema.get("elements", []):
         if el.get("kind") == "list":
             lk = (el.get("list_key") or key).lower()
             rows = [e for (kk, _vv), e in idx.items() if kk == lk]
             if rows:
-                state = "enabled"
+                if state == "notconfigured":
+                    state = "enabled"
                 values[el["id"]] = ["%s=%s" % (e["valuename"], e["data"]) if el.get("explicit")
                                     else str(e["data"]) for e in rows]
             continue
         hit = idx.get(((el.get("key") or key).lower(), (el.get("valuename") or "").lower())) \
             if el.get("valuename") else None
         if hit is not None:
-            state = "enabled"
-            values[el["id"]] = hit.get("data")
+            if state == "notconfigured":
+                state = "enabled"
+            # decode a boolean back through its true/false value, not the raw int
+            values[el["id"]] = (hit.get("data") == el.get("true_value")) \
+                if el.get("kind") == "boolean" else hit.get("data")
     return {"gpo": gpo, "id": a["id"], "state": state, "values": values,
             "class": schema["class"], "on": d}
 

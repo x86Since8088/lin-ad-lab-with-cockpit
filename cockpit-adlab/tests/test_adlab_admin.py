@@ -3269,6 +3269,19 @@ GPOED_ADMX = """<?xml version="1.0"?>
     <policy name="ELPol" class="Machine" displayName="$(string.ELPol)" key="Software\\Test" valueName="ELBase">
       <parentCategory ref="test:Root"/>
       <enabledList><item key="Software\\Test\\EL" valueName="A"><value><decimal value="1"/></value></item></enabledList>
+      <disabledList><item key="Software\\Test\\DL" valueName="B"><value><decimal value="0"/></value></item></disabledList>
+    </policy>
+    <policy name="KeyPol" class="Machine" displayName="$(string.KeyPol)" key="Software\\Test">
+      <parentCategory ref="test:Root"/>
+      <elements><text id="KeyEl" key="Software\\Other\\Sub" valueName="TVal"/></elements>
+    </policy>
+    <policy name="SBoolPol" class="Machine" displayName="$(string.SBoolPol)" key="Software\\Test">
+      <parentCategory ref="test:Root"/>
+      <elements><boolean id="SBEl" valueName="SBVal"><trueValue><string>yes</string></trueValue><falseValue><string>no</string></falseValue></boolean></elements>
+    </policy>
+    <policy name="ExpPol" class="Machine" displayName="$(string.ExpPol)" key="Software\\Test">
+      <parentCategory ref="test:Root"/>
+      <elements><list id="ExpEl" key="Software\\Test\\ExpList" valuePrefix="P" expandable="true"/></elements>
     </policy>
   </policies>
 </policyDefinitions>"""
@@ -3280,7 +3293,8 @@ GPOED_ADML = """<?xml version="1.0"?>
     <string id="DecPol">Decimal Policy</string><string id="DecPolHelp">Help text.</string>
     <string id="EnumPol">Enum Policy</string><string id="Opt0">Zero</string><string id="Opt1">One</string>
     <string id="BoolPol">Bool Policy</string><string id="ListPol">List Policy</string>
-    <string id="ELPol">EnabledList Policy</string>
+    <string id="ELPol">EnabledList Policy</string><string id="KeyPol">Key Override Policy</string>
+    <string id="SBoolPol">String Bool Policy</string><string id="ExpPol">Expandable List Policy</string>
   </stringTable>
   <presentationTable>
     <presentation id="DecPol"><decimalTextBox refId="DecEl" defaultValue="10">Days:</decimalTextBox></presentation>
@@ -3343,9 +3357,9 @@ class TestGpoEditor(unittest.TestCase):
         self.assertEqual(root["display"], "Root Cat")
         child = next(c for c in root["children"] if c["name"] == "Child")
         self.assertEqual(child["display"], "Child Cat")
-        # DecPol + EnumPol live under Child; Root holds BoolPol/ListPol/ELPol
+        # DecPol + EnumPol live under Child; Root holds the other 6
         self.assertEqual(len(child["policies"]), 2)
-        self.assertEqual(root["count"], 5)             # recursive
+        self.assertEqual(root["count"], 8)             # recursive (6 direct + Child's 2)
 
     def test_policy_schema_merges_presentation(self):
         schema = mod._policy_schema(self._cache(), {}, "admx:Test.admx:DecPol")
@@ -3397,6 +3411,35 @@ class TestGpoEditor(unittest.TestCase):
         sch["elements"][0]["required"] = True
         with self.assertRaises(mod.Fail):
             mod._compile_policy(sch, "enabled", {}, "MACHINE")
+
+    def test_compile_element_key_override(self):
+        # Regression [1]: an element's own key must be honored, not the policy key.
+        sch = mod._policy_schema(self._cache(), {}, "admx:Test.admx:KeyPol")
+        load, _ = mod._compile_policy(sch, "enabled", {"KeyEl": "hello"}, "MACHINE")
+        self.assertEqual(load[0]["keyname"], "Software\\Other\\Sub")
+        self.assertEqual((load[0]["valuename"], load[0]["data"]), ("TVal", "hello"))
+
+    def test_compile_opposite_state_lists_removed(self):
+        # Regression [3]: switching state must remove the other state's list rows.
+        sch = mod._policy_schema(self._cache(), {}, "admx:Test.admx:ELPol")
+        _l, rem = mod._compile_policy(sch, "enabled", {}, "MACHINE")   # removes disabled_list
+        self.assertIn(("Software\\Test\\DL", "B"), {(r["keyname"], r["valuename"]) for r in rem})
+        _l, rem = mod._compile_policy(sch, "disabled", {}, "MACHINE")  # removes enabled_list
+        self.assertIn(("Software\\Test\\EL", "A"), {(r["keyname"], r["valuename"]) for r in rem})
+
+    def test_compile_string_boolean_type(self):
+        # Regression [5]: a string trueValue/falseValue must write REG_SZ.
+        sch = mod._policy_schema(self._cache(), {}, "admx:Test.admx:SBoolPol")
+        load, _ = mod._compile_policy(sch, "enabled", {"SBEl": True}, "MACHINE")
+        e = [x for x in load if x["valuename"] == "SBVal"][0]
+        self.assertEqual((e["type"], e["data"]), ("REG_SZ", "yes"))
+
+    def test_compile_expandable_list_type(self):
+        # Regression [6]: an expandable list writes REG_EXPAND_SZ rows.
+        sch = mod._policy_schema(self._cache(), {}, "admx:Test.admx:ExpPol")
+        load, _ = mod._compile_policy(sch, "enabled", {"ExpEl": ["x"]}, "MACHINE")
+        self.assertEqual(load[0]["type"], "REG_EXPAND_SZ")
+        self.assertEqual((load[0]["keyname"], load[0]["valuename"]), ("Software\\Test\\ExpList", "P1"))
 
 
 if __name__ == "__main__":

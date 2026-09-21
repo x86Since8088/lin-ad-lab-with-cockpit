@@ -2058,7 +2058,7 @@
                 if (!catMatches(node)) return;
                 var hasKids = (node.children || []).length > 0;
                 var open = !!expanded[node.gid] || !!treeFilter;
-                var row = el("div", "al-tree-row");
+                var row = el("div", "al-tree-row" + (lastCat && lastCat.gid === node.gid ? " sel" : ""));
                 row.style.paddingLeft = (depth * 14 + 6) + "px";
                 row.appendChild(el("span", "al-tree-tog", hasKids ? (open ? "▾" : "▸") : ""));
                 row.appendChild(el("span", "al-tree-label", node.display));
