@@ -216,6 +216,27 @@ kbd.al { background: var(--al-code-bg); border: 1px solid var(--al-border);
 .al-tree-tog { display: inline-block; width: 1rem; text-align: center; color: var(--al-sub); }
 .al-tree-label { overflow: hidden; text-overflow: ellipsis; }
 
+/* ADMX policy editor: right pane scrolls (policy list / detail form) */
+.al-edit-list { overflow: auto; }
+.al-edit-cat { margin: 0.3rem 0 0.5rem; font-size: 1rem; }
+.al-pol-list { display: flex; flex-direction: column; }
+.al-pol-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0.4rem;
+    border-bottom: 1px solid var(--al-border); cursor: pointer; font-size: 0.88rem; }
+.al-pol-row:hover { background: var(--al-code-bg); }
+.al-pol-name { flex: 1 1 auto; }
+.al-explain { color: var(--al-sub); font-size: 0.84rem; white-space: pre-wrap;
+    max-height: 9rem; overflow: auto; margin: 0.4rem 0 0.6rem;
+    padding: 0.4rem 0.5rem; background: var(--al-code-bg); border-radius: 4px; }
+.al-tri { display: flex; gap: 1rem; margin: 0.3rem 0 0.6rem; }
+.al-tri-opt { display: inline-flex; align-items: center; gap: 0.25rem; font-weight: 600; }
+.al-el-block { display: flex; flex-direction: column; gap: 0.6rem; }
+.al-el { display: flex; flex-direction: column; gap: 0.2rem; }
+.al-el-label { font-weight: 600; font-size: 0.85rem; }
+.al-el-ctl { width: 100%; box-sizing: border-box; padding: 0.35rem 0.45rem;
+    border: 1px solid var(--al-border); border-radius: 4px;
+    background: var(--al-bg); color: var(--al-ink); font-size: 0.88rem; }
+input.al-el-ctl[type="checkbox"] { width: auto; }
+
 /* GPO edit tree: filter bar (setting / os / subsystem) + facet chips */
 .al-tree-filters { position: sticky; top: 0; background: var(--al-card); z-index: 2;
     padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--al-border); }
