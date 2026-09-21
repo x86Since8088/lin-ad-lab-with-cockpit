@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 
 
 def _require_config():
@@ -3476,6 +3476,10 @@ def v_dns_delete(a):
 # ---- DCs: logs, tracing, RPC, promote/demote, remoting --------------------
 
 def v_dc_list(a):
+    # Enumerate the CURRENT domain's ACTUAL DCs, never a fixed slot count: for the
+    # primary that is dc1..DC_COUNT (the designed topology, state reported), for an
+    # additional forest it is the live labelled containers (all_dcs -> _live_dcs_of),
+    # so a one-DC forest shows one DC — not five inherited from PRIMARY_LAB.
     roles = {}
     try:
         d = first_up_dc()
@@ -3485,10 +3489,11 @@ def v_dc_list(a):
     except Fail:
         pass
     dcs = []
-    for i in range(1, LAB["DC_COUNT"] + 1):
-        n = dc_name(i)
+    for n in all_dcs():
         held = sorted(r for r, h in roles.items() if h == n)
-        dcs.append({"dc": n, "ip": ctr_ip(n) or dc_ip(i),
+        m = re.search(r'(\d+)$', n)
+        idx = int(m.group(1)) if m else 1
+        dcs.append({"dc": n, "ip": ctr_ip(n) or dc_ip(idx),
                     "state": ctr_state(n), "fsmo_roles": held})
     return {"dcs": dcs}
 

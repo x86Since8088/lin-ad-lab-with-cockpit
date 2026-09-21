@@ -104,6 +104,8 @@ pre.al-log { background: var(--al-code-bg); border: 1px solid var(--al-border);
     width: 100%; box-sizing: border-box; padding: 0.42rem 0.5rem;
     border: 1px solid var(--al-border); border-radius: 4px;
     background: var(--al-bg); color: var(--al-ink); font-size: 0.9rem; }
+.al-form input.al-ro { background: var(--al-code-bg); color: var(--al-sub);
+    cursor: default; }
 .al-form .row { display: flex; gap: 0.6rem; margin-top: 0.9rem; }
 
 /* modal */

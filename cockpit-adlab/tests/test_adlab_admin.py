@@ -487,6 +487,22 @@ class TestDomains(Base):
         self.assertEqual(rc, 1)
         self.assertIn("last DC", out["error"])
 
+    def test_dc_list_dynamic_for_additional_forest(self):
+        # Regression: an additional forest with ONE DC must show ONE DC on the
+        # DCs tab, not five inherited from PRIMARY_LAB["DC_COUNT"].
+        self.fake.lab_up()
+        self._one_extra_domain(realm="CORP.EXAMPLE.LAB", slug="corp", dcs=("corp-dc1",))
+        rc, out = self.call_main(["--domain", "CORP.EXAMPLE.LAB", "dc-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([d["dc"] for d in out["dcs"]], ["corp-dc1"])
+
+    def test_dc_list_primary_uses_configured_topology(self):
+        self.fake.lab_up()
+        self._no_extra_domains()
+        rc, out = self.call_main(["dc-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(out["dcs"]), mod.PRIMARY_LAB["DC_COUNT"])
+
     def test_domain_remove_refuses_primary(self):
         self.fake.lab_up()
         self._no_extra_domains()
