@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 
 
 def _require_config():
@@ -623,11 +623,93 @@ def _admx_value(node):
             return "REG_SZ", (c.text or "")
     return None, None
 
+def _int_or_none(s):
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+def _admx_item_value(item):
+    """<item ...><value><decimal value='0'/></value></item> -> ('REG_DWORD', 0)."""
+    for c in list(item):
+        if _admx_local(c.tag) == "value":
+            return _admx_value(c)
+    return None, None
+
+def _admx_value_list(node):
+    """<enabledList>/<disabledList> -> [{key, valuename, type, data}]. Each <item>
+    carries an optional key override, a valueName, and a <value>."""
+    out = []
+    for it in list(node):
+        if _admx_local(it.tag) != "item":
+            continue
+        t, v = _admx_item_value(it)
+        out.append({"key": it.get("key", ""), "valuename": it.get("valueName", ""),
+                    "type": t or "REG_SZ", "data": v})
+    return out
+
+def _admx_bool_side(e, tag, default):
+    """<trueValue>/<falseValue> child of a <boolean> element -> its value, or the
+    ADMX default (1/0) when the element gives none."""
+    for c in list(e):
+        if _admx_local(c.tag) == tag:
+            _, v = _admx_value(c)
+            return v if v is not None else default
+    return default
+
+def _admx_element(e):
+    """One <elements> child -> a full editor schema entry: the control kind, its
+    registry valueName + REG type, and every type-specific field the UI needs to
+    render the right control (enum items, decimal min/max, boolean true/false,
+    list key/prefix, text maxlen)."""
+    kind = _admx_local(e.tag)
+    el = {"kind": kind, "id": e.get("id", ""), "valuename": e.get("valueName", ""),
+          "key": e.get("key", ""),      # per-element key override (else the policy key)
+          "required": (e.get("required", "") or "").lower() == "true"}
+    if kind in ("decimal", "longDecimal"):
+        el["type"] = "REG_QWORD" if kind == "longDecimal" else "REG_DWORD"
+        el["min"] = _int_or_none(e.get("minValue"))
+        el["max"] = _int_or_none(e.get("maxValue"))
+        el["store_as_text"] = (e.get("storeAsText", "") or "").lower() == "true"
+        if el["store_as_text"]:
+            el["type"] = "REG_SZ"
+    elif kind == "text":
+        el["type"] = "REG_EXPAND_SZ" if (e.get("expandable", "") or "").lower() == "true" else "REG_SZ"
+        el["maxlen"] = _int_or_none(e.get("maxLength"))
+    elif kind == "multiText":
+        el["type"] = "REG_MULTI_SZ"
+    elif kind == "boolean":
+        el["true_value"] = _admx_bool_side(e, "trueValue", 1)
+        el["false_value"] = _admx_bool_side(e, "falseValue", 0)
+        # a string trueValue/falseValue means the value is REG_SZ, not REG_DWORD
+        el["type"] = "REG_SZ" if isinstance(el["true_value"], str) or isinstance(el["false_value"], str) else "REG_DWORD"
+    elif kind == "enum":
+        items = []
+        for it in list(e):
+            if _admx_local(it.tag) != "item":
+                continue
+            vt, vv = _admx_item_value(it)
+            items.append({"display": (it.get("displayName", "") or "").strip("$()"),
+                          "value": vv, "type": vt or "REG_SZ"})
+        el["items"] = items
+        el["type"] = items[0]["type"] if items else "REG_SZ"
+    elif kind == "list":
+        el["expandable"] = (e.get("expandable", "") or "").lower() == "true"
+        el["type"] = "REG_EXPAND_SZ" if el["expandable"] else "REG_SZ"
+        el["list_key"] = e.get("key", "")
+        el["value_prefix"] = e.get("valuePrefix", "")
+        el["explicit"] = (e.get("explicitValue", "") or "").lower() == "true"
+        el["additive"] = (e.get("additive", "") or "").lower() == "true"
+    else:
+        el["type"] = "REG_SZ"
+    return el
+
 def parse_admx(xml_text):
-    """samba/Windows ADMX -> [{id, class, key, valuename, has_enabled,
-    has_disabled, enabled_type/data, disabled_type/data, elements:[...]}].
-    Captures enough to write the right registry.pol entry when a policy is
-    toggled Enabled/Disabled. Best-effort over the common policy shape."""
+    """samba/Windows ADMX -> [{id, class, key, valuename, category, supported,
+    presentation, has_enabled, has_disabled, enabled_type/data, disabled_type/data,
+    elements:[full schema per element]}]. Captures the full per-policy schema the
+    ADMX editor needs (category tree membership, supported-on, and every element's
+    control type + registry mapping), not just the base Enabled/Disabled toggle."""
     out = []
     try:
         root = _admx_fromstring(xml_text)
@@ -640,9 +722,12 @@ def parse_admx(xml_text):
              "key": pol.get("key", ""), "valuename": pol.get("valueName", ""),
              "display": (pol.get("displayName", "") or "").strip("$()"),
              "explain": (pol.get("explainText", "") or "").strip("$()"),
+             "presentation": (pol.get("presentation", "") or "").strip("$()"),
+             "category": "", "supported": "",
              "has_enabled": False, "has_disabled": False,
              "enabled_type": None, "enabled_data": None,
-             "disabled_type": None, "disabled_data": None, "elements": []}
+             "disabled_type": None, "disabled_data": None,
+             "enabled_list": [], "disabled_list": [], "elements": []}
         for ch in list(pol):
             t = _admx_local(ch.tag)
             if t == "enabledValue":
@@ -651,23 +736,117 @@ def parse_admx(xml_text):
             elif t == "disabledValue":
                 p["has_disabled"] = True
                 p["disabled_type"], p["disabled_data"] = _admx_value(ch)
+            elif t == "enabledList":
+                p["has_enabled"] = True
+                p["enabled_list"] = _admx_value_list(ch)
+            elif t == "disabledList":
+                p["has_disabled"] = True
+                p["disabled_list"] = _admx_value_list(ch)
+            elif t == "parentCategory":
+                p["category"] = ch.get("ref", "")
+            elif t == "supportedOn":
+                p["supported"] = ch.get("ref", "")
             elif t == "elements":
                 for e in list(ch):
-                    kind = _admx_local(e.tag)
-                    reg = {"boolean": "REG_DWORD", "decimal": "REG_DWORD",
-                           "longDecimal": "REG_QWORD", "text": "REG_SZ",
-                           "enum": "REG_SZ", "multiText": "REG_MULTI_SZ"}.get(kind, "REG_SZ")
-                    p["elements"].append({"kind": kind, "id": e.get("id", ""),
-                                          "valuename": e.get("valueName", ""),
-                                          "type": reg})
-        # a bare enabled policy with no explicit enabledValue still enables by
-        # writing its valueName=1 (the ADMX default), so treat it as enable-able
-        if p["valuename"] and not p["has_enabled"] and not p["elements"]:
+                    p["elements"].append(_admx_element(e))
+        # a policy with a base valueName but no explicit enabledVALUE still toggles
+        # that value (ADMX implicit default: enabled=1, disabled=0). Driven by
+        # enabled_data (set only by <enabledValue>), so it ALSO fires alongside an
+        # <enabledList> (base + list) and alongside elements (base + options);
+        # element-only policies (no valueName) are unaffected and enable only their
+        # elements.
+        if p["valuename"] and p["enabled_data"] is None:
             p["has_enabled"] = True
             p["enabled_type"], p["enabled_data"] = "REG_DWORD", 1
-            p["has_disabled"] = True
-            p["disabled_type"], p["disabled_data"] = "REG_DWORD", 0
+            if p["disabled_data"] is None:
+                p["has_disabled"] = True
+                p["disabled_type"], p["disabled_data"] = "REG_DWORD", 0
         out.append(p)
+    return out
+
+def parse_admx_meta(xml_text):
+    """ADMX namespaces + category declarations, for building the GPMC category
+    tree. Returns {namespace, prefixes:{prefix:namespace}, categories:[{name,
+    display, parent}]}. `prefixes` includes the file's own target prefix and every
+    `using`, so a parentCategory ref like 'windows:Network' resolves to a global
+    '<namespace>:<name>' key."""
+    meta = {"namespace": "", "prefixes": {}, "categories": []}
+    try:
+        root = _admx_fromstring(xml_text)
+    except ET.ParseError:
+        return meta
+    for node in root.iter():
+        t = _admx_local(node.tag)
+        if t == "target":
+            meta["namespace"] = node.get("namespace", "")
+            if node.get("prefix"):
+                meta["prefixes"][node.get("prefix")] = node.get("namespace", "")
+        elif t == "using":
+            if node.get("prefix"):
+                meta["prefixes"][node.get("prefix")] = node.get("namespace", "")
+        elif t == "category":
+            parent = ""
+            for c in list(node):
+                if _admx_local(c.tag) == "parentCategory":
+                    parent = c.get("ref", "")
+            meta["categories"].append({
+                "name": node.get("name", ""),
+                "display": (node.get("displayName", "") or "").strip("$()"),
+                "parent": parent})
+    return meta
+
+def parse_adml_presentations(xml_text):
+    """ADML <presentation id> blocks -> {presId: [{control, refId, label, default,
+    ...}]}. This is where a policy's control TYPES (dropdownList vs textBox vs
+    checkBox), field labels and default values live — the ADMX <elements> give the
+    data/registry mapping, the ADML presentation gives the rendering."""
+    out = {}
+    try:
+        root = _admx_fromstring(xml_text)
+    except ET.ParseError:
+        return out
+    for pres in root.iter():
+        if _admx_local(pres.tag) != "presentation":
+            continue
+        pid = pres.get("id", "")
+        controls = []
+        for c in list(pres):
+            ct = _admx_local(c.tag)
+            ctl = {"control": ct, "refId": c.get("refId", "")}
+            if ct == "text":                       # a static label line
+                ctl["label"] = "".join(c.itertext()).strip()
+            elif ct in ("decimalTextBox", "longDecimalTextBox"):
+                ctl["label"] = (c.text or "").strip()
+                ctl["default"] = _int_or_none(c.get("defaultValue"))
+                ctl["spin"] = (c.get("spin", "") or "").lower() != "false"
+            elif ct == "textBox":
+                for cc in list(c):
+                    lt = _admx_local(cc.tag)
+                    if lt == "label":
+                        ctl["label"] = "".join(cc.itertext()).strip()
+                    elif lt == "defaultValue":
+                        ctl["default"] = "".join(cc.itertext()).strip()
+            elif ct == "dropdownList":
+                ctl["label"] = (c.text or "").strip()
+                ctl["default_item"] = _int_or_none(c.get("defaultItem"))
+                ctl["nosort"] = (c.get("noSort", "") or "").lower() == "true"
+            elif ct == "comboBox":                 # free text + suggestions (a text element)
+                ctl["label"] = (c.text or "").strip()
+                for cc in list(c):
+                    lt = _admx_local(cc.tag)
+                    if lt == "label" and not ctl["label"]:
+                        ctl["label"] = "".join(cc.itertext()).strip()
+                    elif lt == "default":
+                        ctl["default"] = "".join(cc.itertext()).strip()
+            elif ct == "checkBox":
+                ctl["label"] = "".join(c.itertext()).strip()
+                ctl["default"] = (c.get("defaultChecked", "") or "").lower() == "true"
+            elif ct in ("listBox", "multiTextBox"):
+                ctl["label"] = (c.text or "").strip()
+            else:
+                ctl["label"] = "".join(c.itertext()).strip()
+            controls.append(ctl)
+        out[pid] = controls
     return out
 
 def parse_gpo_manage_list(text):
@@ -2822,7 +3001,7 @@ def _write_catalog_tags(tags):
 # detection), and keeps the rest. OS/subsystem facets + operator tag overrides
 # are applied at SERVE time, not cached, so retagging never needs a re-parse.
 CATALOG_CACHE_FILE = "/var/lib/adlab/catalog-cache.json"   # host, world-readable
-CATALOG_CACHE_VERSION = 1                                  # bump to invalidate
+CATALOG_CACHE_VERSION = 3                                  # bump to invalidate
 
 
 def _now_iso():
@@ -2906,23 +3085,34 @@ def _catalog_diff(cached_admx, cur_admx_sigs, adml_by_lower, force=False):
 
 
 def _parse_one_admx(dc, admx_path, adml_path):
-    """Parse ONE ADMX file's policies, names resolved against its ADML."""
+    """Parse ONE ADMX file into {policies, meta, presentations}, with every ADML
+    $(string.X) reference (policy display/explain, category display, enum item
+    labels) resolved. meta carries the namespace + category declarations for the
+    tree; presentations carry the per-policy control types/labels/defaults."""
     xml = _read_b64(dc, admx_path)
     if xml is None:
-        return []
+        return {"policies": [], "meta": {"namespace": "", "prefixes": {}, "categories": []},
+                "presentations": {}}
     name = admx_path.rsplit("/", 1)[-1]
     adml = _read_b64(dc, adml_path) if adml_path else None
     strings = parse_adml(adml) if adml else {}
-    out = []
+    pols = []
     for p in parse_admx(xml):
         p["admx"] = name
         p["display"] = _resolve_ref(p.get("display", ""), strings) or p.get("id", "")
         p["explain"] = _resolve_ref(p.get("explain", ""), strings)
+        for el in p.get("elements", []):
+            for it in el.get("items", []):
+                it["display"] = _resolve_ref(it.get("display", ""), strings)
         disp = p["display"]
         p["unresolved"] = (not disp) or disp.startswith("string.") \
             or bool(re.match(r'^POL_[0-9A-Fa-f_]+$', disp))
-        out.append(p)
-    return out
+        pols.append(p)
+    meta = parse_admx_meta(xml)
+    for c in meta.get("categories", []):
+        c["display"] = _resolve_ref(c.get("display", ""), strings) or c.get("name", "")
+    return {"policies": pols, "meta": meta,
+            "presentations": parse_adml_presentations(adml) if adml else {}}
 
 
 def _refresh_catalog_cache(force=False):
@@ -2945,8 +3135,10 @@ def _refresh_catalog_cache(force=False):
     for p in deleted:
         admx.pop(p, None)
     for path, adml_path, sig, adml_sig in to_parse:
+        parsed = _parse_one_admx(dc, path, adml_path)
         admx[path] = {"sig": sig, "adml_sig": adml_sig,
-                      "policies": _parse_one_admx(dc, path, adml_path)}
+                      "policies": parsed["policies"], "meta": parsed["meta"],
+                      "presentations": parsed["presentations"]}
     changed = bool(to_parse or deleted)
     if changed:
         cache["built"] = _now_iso()
@@ -2961,6 +3153,418 @@ def _catalog_policies_from_cache(cache):
     for _path, e in sorted((cache.get("admx") or {}).items()):
         pols.extend(e.get("policies", []))
     return pols
+
+# ---- ADMX category tree + per-policy schema (the ADMX editor) --------------
+def _resolve_catref(ref, prefixes, own_ns):
+    """A parentCategory/policy category ref -> a global '<namespace>:<name>' id.
+    'windows:Network' uses the file's prefix map; a bare 'BITS' is local."""
+    if not ref:
+        return ""
+    if ":" in ref:
+        pfx, name = ref.split(":", 1)
+        return (prefixes.get(pfx) or own_ns) + ":" + name
+    return own_ns + ":" + ref
+
+def _policy_os(p, tags):
+    eid = "admx:%s:%s" % (p.get("admx", ""), p.get("id", ""))
+    os_t, _ = _derive_tags("admx", p.get("admx", ""))
+    ov = tags.get(eid)
+    if ov and ov.get("os_type"):
+        os_t = ov["os_type"]
+    return os_t
+
+def _build_category_index(cache, tags, os_filter=None):
+    """Global category map {gid: node} with policies attached and empty subtrees
+    pruned. node = {gid,name,display,parent,children,policies,count}. os_filter
+    keeps only policies of that OS (plus 'shared')."""
+    cats = {}
+    def node(gid):
+        return cats.setdefault(gid, {"gid": gid, "name": gid.split(":", 1)[-1],
+                                     "display": gid.split(":", 1)[-1], "parent": "",
+                                     "children": [], "policies": []})
+    for _p, e in (cache.get("admx") or {}).items():
+        meta = e.get("meta") or {}
+        ns, prefixes = meta.get("namespace", ""), meta.get("prefixes", {})
+        for c in meta.get("categories", []):
+            n = node(ns + ":" + c.get("name", ""))
+            n["name"] = c.get("name", "")
+            if c.get("display"):
+                n["display"] = c["display"]
+            n["parent"] = _resolve_catref(c.get("parent", ""), prefixes, ns)
+    for _p, e in (cache.get("admx") or {}).items():
+        meta = e.get("meta") or {}
+        ns, prefixes = meta.get("namespace", ""), meta.get("prefixes", {})
+        for p in e.get("policies", []):
+            if os_filter and _policy_os(p, tags) not in (os_filter, "shared"):
+                continue
+            gid = _resolve_catref(p.get("category", ""), prefixes, ns) or (ns + ":?")
+            node(gid)["policies"].append({
+                "id": "admx:%s:%s" % (p.get("admx", ""), p.get("id", "")),
+                "name": p.get("display") or p.get("id", ""),
+                "class": (p.get("class") or "BOTH").upper(),
+                "unresolved": bool(p.get("unresolved"))})
+    # link children under parents (cycle-guarded)
+    roots = []
+    for gid, n in cats.items():
+        parent = n["parent"]
+        if parent and parent in cats and parent != gid:
+            cats[parent]["children"].append(n)
+        else:
+            roots.append(n)
+    seen = set()
+    def prune(n):
+        if n["gid"] in seen:            # defend against a malformed parent cycle
+            return None
+        seen.add(n["gid"])
+        n["children"] = [c for c in (prune(c) for c in n["children"]) if c is not None]
+        n["children"].sort(key=lambda x: x["display"].lower())
+        n["policies"].sort(key=lambda x: x["name"].lower())
+        n["count"] = len(n["policies"]) + sum(c["count"] for c in n["children"])
+        return n if n["count"] else None
+    tree = [t for t in (prune(r) for r in roots) if t is not None]
+    # A parentCategory cycle with no path to a root leaves nodes unreachable from
+    # `roots`; promote any still-unvisited node so its policies aren't silently
+    # dropped (prune's `seen` guard then breaks the cycle within it).
+    for gid, n in cats.items():
+        if gid not in seen:
+            p = prune(n)
+            if p is not None:
+                tree.append(p)
+    tree.sort(key=lambda x: x["display"].lower())
+    return cats, tree
+
+def _strip_policies(nodes):
+    """Tree view without inline policies (folders + counts only)."""
+    out = []
+    for n in nodes:
+        out.append({"gid": n["gid"], "name": n["name"], "display": n["display"],
+                    "count": n["count"], "policy_count": len(n["policies"]),
+                    "children": _strip_policies(n["children"])})
+    return out
+
+def _find_policy(cache, pid):
+    """Locate a cached policy by its 'admx:<file>:<name>' id -> (policy, file_entry)."""
+    for _p, e in (cache.get("admx") or {}).items():
+        for p in e.get("policies", []):
+            if "admx:%s:%s" % (p.get("admx", ""), p.get("id", "")) == pid:
+                return p, e
+    return None, None
+
+def _policy_schema(cache, tags, pid):
+    """Full editor schema for one policy: base + elements MERGED with the ADML
+    presentation (control type, label, default) by refId."""
+    p, e = _find_policy(cache, pid)
+    if not p:
+        raise Fail("no such policy: %s (see gpo-policy-list)" % pid)
+    # policy presentation attr is stored as "presentation.<id>"; ADML keys it "<id>"
+    pres_id = p.get("presentation", "")
+    if pres_id.startswith("presentation."):
+        pres_id = pres_id[len("presentation."):]
+    pres = (e.get("presentations") or {}).get(pres_id) or []
+    pres_by_ref = {c.get("refId"): c for c in pres if c.get("refId")}
+    elements = []
+    for el in p.get("elements", []):
+        c = pres_by_ref.get(el.get("id"), {})
+        m = dict(el)
+        m["control"] = c.get("control", "")
+        m["label"] = c.get("label", "") or el.get("id", "")
+        if "default" in c:
+            m["default"] = c["default"]
+        if "default_item" in c:
+            m["default_item"] = c["default_item"]
+        elements.append(m)
+    cls = (p.get("class") or "BOTH").upper()
+    if cls not in ("MACHINE", "USER"):
+        cls = "BOTH"
+    # supportedOn is a cross-file ref (e.g. "windows:SUPPORTED_Windows7"); full
+    # prose lives in another ADMX's supportedOn definitions. Strip the namespace
+    # prefix so the UI shows the requirement token rather than a qualified ref.
+    supported = (p.get("supported", "") or "").split(":", 1)[-1]
+    return {"id": pid, "name": p.get("display") or p.get("id", ""),
+            "explain": p.get("explain", ""), "class": cls,
+            "supported": supported, "os_type": _policy_os(p, tags),
+            "key": p.get("key", ""), "valuename": p.get("valuename", ""),
+            "has_enabled": p.get("has_enabled"), "has_disabled": p.get("has_disabled"),
+            "enabled_type": p.get("enabled_type"), "enabled_data": p.get("enabled_data"),
+            "disabled_type": p.get("disabled_type"), "disabled_data": p.get("disabled_data"),
+            "enabled_list": p.get("enabled_list", []), "disabled_list": p.get("disabled_list", []),
+            "elements": elements}
+
+def _ensure_catalog(refresh=False):
+    cache = _read_catalog_cache()
+    # A stale-version cache (older schema, e.g. pre-category/pre-element-detail)
+    # must be rebuilt, not reused — _refresh_catalog_cache resets on a version bump.
+    if refresh or not cache.get("admx") or cache.get("version") != CATALOG_CACHE_VERSION:
+        cache, _c, _s = _refresh_catalog_cache(force=False)
+    return cache
+
+def v_gpo_policy_tree(a):
+    """The ADMX category tree (folders + policy counts, no policies inline) for
+    the ADMX editor's left pane. --os Windows|Linux filters to that OS's policies;
+    empty categories are pruned. Served from the persistent catalog cache."""
+    tags = _read_catalog_tags()
+    cache = _ensure_catalog(str(a.get("refresh", "")).lower() in ("1", "true", "yes"))
+    os_f = _norm_gpo_os(a["os"]) if a.get("os") else None
+    _cats, tree = _build_category_index(cache, tags, os_f)
+    return {"os": os_f or "", "tree": _strip_policies(tree),
+            "cache_file": CATALOG_CACHE_FILE}
+
+def v_gpo_policy_list(a):
+    """Policies directly in one category (clicked in the tree). --os filters."""
+    tags = _read_catalog_tags()
+    cache = _ensure_catalog()
+    os_f = _norm_gpo_os(a["os"]) if a.get("os") else None
+    cats, _tree = _build_category_index(cache, tags, os_f)
+    n = cats.get(a["category"])
+    if not n:
+        raise Fail("no such category: %s" % a["category"])
+    return {"category": n["gid"], "display": n["display"], "policies": n["policies"]}
+
+def v_gpo_policy_schema(a):
+    """Full editor schema for one policy: display/explain/class/supported-on, and
+    each ADMX element merged with its ADML presentation (control type, label,
+    default, enum items) so the UI can render the right control per element."""
+    tags = _read_catalog_tags()
+    cache = _ensure_catalog()
+    return _policy_schema(cache, tags, a["id"])
+
+def _truthy(v):
+    return v is True or str(v).lower() in ("1", "true", "yes", "on")
+
+def _compile_policy(schema, state, values, cls):
+    """PURE: a policy's desired state -> (load_entries, remove_keys). load_entries
+    are {keyname,valuename,class,type,data} for `gpo load`; remove_keys are
+    {keyname,valuename,class} for `gpo remove`. This is the ADMX->registry.pol
+    compiler — the single place element control values become registry writes."""
+    key = schema.get("key", "")
+    values = values or {}
+    load, remove = [], []
+    def st(k, vn, t, data):
+        load.append({"keyname": k or key, "valuename": vn, "class": cls, "type": t, "data": data})
+    def rm(k, vn):
+        if vn:
+            remove.append({"keyname": k or key, "valuename": vn, "class": cls})
+    base_vn = schema.get("valuename") or ""
+
+    if state == "notconfigured":
+        if base_vn:
+            rm(key, base_vn)
+        for li in (schema.get("enabled_list", []) + schema.get("disabled_list", [])):
+            rm(li.get("key"), li.get("valuename"))
+        for el in schema.get("elements", []):
+            if el.get("kind") != "list":
+                rm(el.get("key"), el.get("valuename"))
+        return load, remove
+
+    if state == "disabled":
+        if schema.get("has_disabled") and base_vn and schema.get("disabled_data") is not None:
+            st(key, base_vn, schema.get("disabled_type") or "REG_DWORD", schema.get("disabled_data"))
+        for li in schema.get("disabled_list", []):
+            st(li.get("key"), li.get("valuename"), li.get("type") or "REG_DWORD", li.get("data"))
+        for li in schema.get("enabled_list", []):    # clear the opposite state's list rows
+            rm(li.get("key"), li.get("valuename"))
+        for el in schema.get("elements", []):        # elements are suppressed when disabled
+            if el.get("kind") != "list":
+                rm(el.get("key"), el.get("valuename"))
+        return load, remove
+
+    # enabled
+    if base_vn and schema.get("has_enabled") and schema.get("enabled_data") is not None:
+        st(key, base_vn, schema.get("enabled_type") or "REG_DWORD", schema.get("enabled_data"))
+    for li in schema.get("enabled_list", []):
+        st(li.get("key"), li.get("valuename"), li.get("type") or "REG_DWORD", li.get("data"))
+    for li in schema.get("disabled_list", []):       # clear the opposite state's list rows
+        rm(li.get("key"), li.get("valuename"))
+    for el in schema.get("elements", []):
+        vn, kind = el.get("valuename", ""), el.get("kind")
+        ek = el.get("key") or key                    # per-element key override, else policy key
+        raw = values.get(el.get("id"))
+        if kind == "list":
+            lk = el.get("list_key") or key
+            items = raw if isinstance(raw, list) else \
+                ([] if raw in (None, "") else str(raw).splitlines())
+            rtype = el.get("type") or "REG_SZ"
+            i = 0
+            for item in items:
+                item = (item or "").strip()
+                if not item:
+                    continue
+                i += 1
+                if el.get("explicit") and "=" in item:
+                    nm, v = item.split("=", 1)
+                    st(lk, nm, rtype, v)
+                else:
+                    st(lk, (el.get("value_prefix", "") or "") + str(i), rtype, item)
+            continue
+        if raw is None or raw == "":
+            if el.get("required"):
+                raise Fail("element '%s' is required" % (el.get("label") or el.get("id")))
+            rm(ek, vn)                               # clear any stale optional value
+            continue
+        if kind in ("decimal", "longDecimal"):
+            data = int(raw)
+            t = el.get("type") or ("REG_QWORD" if kind == "longDecimal" else "REG_DWORD")
+            if el.get("store_as_text"):
+                data, t = str(data), "REG_SZ"
+            st(ek, vn, t, data)
+        elif kind == "boolean":
+            st(ek, vn, el.get("type") or "REG_DWORD",
+               el.get("true_value", 1) if _truthy(raw) else el.get("false_value", 0))
+        elif kind == "enum":
+            t = el.get("type") or "REG_SZ"
+            data = int(raw) if t in ("REG_DWORD", "REG_QWORD") else str(raw)
+            st(ek, vn, t, data)
+        elif kind == "multiText":
+            vals = raw if isinstance(raw, list) else str(raw).splitlines()
+            st(ek, vn, "REG_MULTI_SZ", [v for v in vals if v != ""])
+        else:                                        # text
+            st(ek, vn, el.get("type") or "REG_SZ", str(raw))
+    return load, remove
+
+def v_gpo_policy_compile(a):
+    """Compile a policy's desired state (enabled/disabled/notconfigured + element
+    values) into registry.pol writes and, with apply=true, apply them (gpo load +
+    gpo remove) on the PDC. apply=false returns the computed entries for preview.
+    Auto-declares the GPO's OS scope from the policy when the GPO has none."""
+    d = pdc_emulator()
+    gpo = _gpo_guid(a)
+    tags = _read_catalog_tags()
+    cache = _ensure_catalog()
+    schema = _policy_schema(cache, tags, a["id"])
+    state = (a.get("state") or "enabled").lower()
+    if state not in ("enabled", "disabled", "notconfigured"):
+        raise Fail("state must be enabled|disabled|notconfigured")
+    cls = (a.get("class") or "").upper()
+    if cls not in ("MACHINE", "USER"):
+        cls = schema["class"] if schema["class"] in ("MACHINE", "USER") else "MACHINE"
+    values = {}
+    if a.get("values"):
+        try:
+            values = json.loads(a["values"])
+        except Exception as e:
+            raise Fail("values is not valid JSON: %s" % e)
+    apply = _truthy(a.get("apply", ""))
+    scope = _declared_gpo_os(gpo)
+    auto = ""
+    if apply and not scope and schema.get("os_type") in OS_TYPES:
+        _set_gpo_os(gpo, schema["os_type"])         # user: "set the OS if missing"
+        scope, auto = schema["os_type"], schema["os_type"]
+    # ADMX policies carry an authoritative OS; refuse a cross-OS write rather than
+    # trust the per-key namespace gate (which can misclassify a policy's own keys).
+    if scope and schema.get("os_type") in OS_TYPES and schema["os_type"] != scope:
+        raise Fail("policy is %s-only but GPO %s is scoped %s — use a %s GPO"
+                   % (schema["os_type"], gpo, scope, schema["os_type"]))
+    load, remove = _compile_policy(schema, state, values, cls)
+    # Authoritative lists: a merge `gpo load` only ADDS rows, so shrinking a list,
+    # disabling, or Not Configured would leave stale rows behind. Delete any value
+    # under a list element's key that we are NOT re-writing this time. (remove runs
+    # after load, so a value being re-written is never in this set.)
+    list_keys = set()
+    for el in schema.get("elements", []):
+        if el.get("kind") == "list":
+            list_keys.add((el.get("list_key") or schema.get("key", "")).lower())
+    if list_keys:
+        writing = set((e["keyname"].lower(), e["valuename"].lower()) for e in load)
+        for pe in _read_registry_pol(d, gpo):
+            k = pe.get("keyname", "").lower()
+            if k in list_keys and (k, pe.get("valuename", "").lower()) not in writing:
+                remove.append({"keyname": pe["keyname"], "valuename": pe["valuename"],
+                               "class": pe.get("class", cls)})
+    result = {"gpo": gpo, "id": a["id"], "state": state, "class": cls,
+              "entries": load, "removed": remove, "applied": False,
+              "os_scope": scope or "", "os_auto_set": auto, "on": d}
+    if not apply:
+        return result
+    if load:
+        entries = _validate_entries(json.dumps(load))
+        cmd = "samba-tool gpo load %s --machine-ext-name=%s --user-ext-name=%s" % (
+            shq(gpo), shq(DEFAULT_REG_CSE), shq(DEFAULT_REG_CSE))
+        rc, out, err = podman_auth(d, cmd, stdin=json.dumps(entries), timeout=180)
+        if rc != 0:
+            raise Fail((err.strip() or out.strip())[-600:])
+    if remove:
+        # tolerate removing values not present (a fresh policy / a state change)
+        podman_auth(d, "samba-tool gpo remove " + shq(gpo),
+                    stdin=json.dumps(remove), timeout=120)
+    result["applied"] = True
+    return result
+
+def v_gpo_policy_read(a):
+    """Decode a GPO's registry.pol back into one policy's state + element values,
+    so the editor can pre-fill controls when editing an existing GPO."""
+    d = pdc_emulator()
+    gpo = _gpo_guid(a)
+    tags = _read_catalog_tags()
+    cache = _ensure_catalog()
+    schema = _policy_schema(cache, tags, a["id"])
+    idx = {}
+    for e in _read_registry_pol(d, gpo):
+        idx[(e.get("keyname", "").lower(), e.get("valuename", "").lower())] = e
+    key = schema.get("key", "")
+    base_vn = schema.get("valuename") or ""
+    state, values = "notconfigured", {}
+    base = idx.get((key.lower(), base_vn.lower())) if base_vn else None
+    if base is not None:
+        state = "disabled" if (schema.get("has_disabled")
+                               and base.get("data") == schema.get("disabled_data")) else "enabled"
+    # list-based enable/disable: the whole enabled/disabled list value-set must
+    # match. Check disabled first so a disabledList policy reads as Disabled, and
+    # never let a stray element presence override an explicit Disabled below.
+    def _list_matches(lst):
+        if not lst:
+            return False
+        for li in lst:
+            e = idx.get(((li.get("key") or key).lower(), (li.get("valuename") or "").lower()))
+            if e is None or e.get("data") != li.get("data"):
+                return False
+        return True
+    if _list_matches(schema.get("disabled_list", [])):
+        state = "disabled"
+    elif _list_matches(schema.get("enabled_list", [])):
+        state = "enabled"
+    for el in schema.get("elements", []):
+        if el.get("kind") == "list":
+            lk = (el.get("list_key") or key).lower()
+            rows = [e for (kk, _vv), e in idx.items() if kk == lk]
+            if rows:
+                if state == "notconfigured":
+                    state = "enabled"
+                values[el["id"]] = ["%s=%s" % (e["valuename"], e["data"]) if el.get("explicit")
+                                    else str(e["data"]) for e in rows]
+            continue
+        hit = idx.get(((el.get("key") or key).lower(), (el.get("valuename") or "").lower())) \
+            if el.get("valuename") else None
+        if hit is not None:
+            if state == "notconfigured":
+                state = "enabled"
+            # decode a boolean back through its true/false value, not the raw int
+            values[el["id"]] = (hit.get("data") == el.get("true_value")) \
+                if el.get("kind") == "boolean" else hit.get("data")
+    return {"gpo": gpo, "id": a["id"], "state": state, "values": values,
+            "class": schema["class"], "on": d}
+
+def v_gpo_edit_context(a):
+    """One-shot editor bootstrap: resolve (and, if undeclared, DECLARE) the GPO's
+    OS scope, then return the OS-filtered ADMX category tree. Satisfies "auto
+    filter by GPO OS, set it if missing"."""
+    d = pdc_emulator()
+    gpo = _gpo_guid(a)
+    declared = _declared_gpo_os(gpo)
+    if declared:
+        os_, src = declared, "declared"
+    else:
+        os_, src = _infer_gpo_os(d, gpo)
+        if os_ in OS_TYPES:                          # inferred one OS -> declare it
+            _set_gpo_os(gpo, os_); src = "set (inferred)"
+        elif src == "unknown":                       # empty GPO -> default Windows
+            os_ = "Windows"; _set_gpo_os(gpo, os_); src = "set (default)"
+        # mixed -> leave undeclared; the tree stays unfiltered
+    tags = _read_catalog_tags()
+    cache = _ensure_catalog(_truthy(a.get("refresh", "")))
+    os_f = os_ if os_ in OS_TYPES else None
+    _cats, tree = _build_category_index(cache, tags, os_f)
+    return {"gpo": gpo, "os": os_ or "", "os_source": src,
+            "tree": _strip_policies(tree), "cache_file": CATALOG_CACHE_FILE, "on": d}
 
 def _gpo_guid(a, key="gpo"):
     g = a[key].strip()
@@ -6120,6 +6724,35 @@ VERBS = {
     "gpo-admx-list": {"fn": v_gpo_admx_list, "group": "gpo",
                       "help": "List ADMX files in the central store and their policies (names resolved via ADML).",
                       "args": [arg("lang", required=False, help_="ADML language dir (default en-US)")]},
+    "gpo-policy-tree": {"fn": v_gpo_policy_tree, "group": "gpo",
+                      "help": "ADMX category tree (folders + policy counts) for the editor's left pane; --os filters by OS.",
+                      "args": [arg("os", "enum", required=False, choices=OS_TYPES,
+                                   help_="Windows|Linux (default: all)"),
+                               arg("refresh", "enum", required=False, choices=["true", "false"])]},
+    "gpo-policy-list": {"fn": v_gpo_policy_list, "group": "gpo",
+                      "help": "Policies directly under one ADMX category (clicked in the tree).",
+                      "args": [arg("category", help_="category gid from gpo-policy-tree"),
+                               arg("os", "enum", required=False, choices=OS_TYPES)]},
+    "gpo-policy-schema": {"fn": v_gpo_policy_schema, "group": "gpo",
+                      "help": "Full ADMX schema for one policy: explain/class/supported-on + each element's control type, label, default and items — drives the policy editor.",
+                      "args": [arg("id", help_="policy id (admx:<file>:<name>) from gpo-policy-list")]},
+    "gpo-edit-context": {"fn": v_gpo_edit_context, "group": "gpo",
+                      "help": "Editor bootstrap for a GPO: resolve + declare its OS scope (set if missing) and return the OS-filtered ADMX category tree.",
+                      "args": [arg("gpo", help_="{GUID}"),
+                               arg("refresh", "enum", required=False, choices=["true", "false"])]},
+    "gpo-policy-read": {"fn": v_gpo_policy_read, "group": "gpo",
+                      "help": "Decode a GPO's registry.pol into one policy's state (enabled/disabled/not-configured) + element values, to pre-fill the editor.",
+                      "args": [arg("gpo", help_="{GUID}"), arg("id", help_="policy id")]},
+    "gpo-policy-compile": {"fn": v_gpo_policy_compile, "group": "gpo", "danger": True,
+                      "help": "Compile a policy's state + element values into registry.pol writes; apply=true applies them (gpo load/remove on the PDC), apply=false previews. Auto-declares the GPO OS if missing.",
+                      "args": [arg("gpo", help_="{GUID}"),
+                               arg("id", help_="policy id (admx:<file>:<name>)"),
+                               arg("state", "enum", choices=["enabled", "disabled", "notconfigured"]),
+                               arg("values", required=False, help_="JSON {elementId: value}"),
+                               arg("class", "enum", required=False, choices=["MACHINE", "USER"],
+                                   help_="hive for a Both-class policy (default MACHINE)"),
+                               arg("apply", "enum", required=False, choices=["true", "false"],
+                                   help_="true = write; default previews the entries")]},
     "gpo-catalog":   {"fn": v_gpo_catalog, "group": "gpo",
                       "help": "All available settings, tagged with OS type + subsystems (the edit tree's source).",
                       "args": [arg("os_type", "enum", required=False, choices=OS_TYPES),

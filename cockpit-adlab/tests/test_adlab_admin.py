@@ -3233,5 +3233,214 @@ class TestDelegation(Base):
         self.assertTrue(f.argv_containing("silo", "create", "--enforce"))
 
 
+GPOED_ADMX = """<?xml version="1.0"?>
+<policyDefinitions>
+  <policyNamespaces>
+    <target prefix="test" namespace="Test.Policies"/>
+    <using prefix="windows" namespace="Microsoft.Policies.Windows"/>
+  </policyNamespaces>
+  <categories>
+    <category name="Root" displayName="$(string.Root)"/>
+    <category name="Child" displayName="$(string.Child)"><parentCategory ref="test:Root"/></category>
+  </categories>
+  <policies>
+    <policy name="DecPol" class="Machine" displayName="$(string.DecPol)" explainText="$(string.DecPolHelp)" presentation="$(presentation.DecPol)" key="Software\\Test">
+      <parentCategory ref="test:Child"/>
+      <supportedOn ref="windows:SUPPORTED_Windows7"/>
+      <elements><decimal id="DecEl" valueName="DecVal" minValue="1" maxValue="100"/></elements>
+    </policy>
+    <policy name="EnumPol" class="Machine" displayName="$(string.EnumPol)" key="Software\\Test">
+      <parentCategory ref="test:Child"/>
+      <elements>
+        <enum id="EnumEl" valueName="EnumVal">
+          <item displayName="$(string.Opt0)"><value><decimal value="0"/></value></item>
+          <item displayName="$(string.Opt1)"><value><decimal value="1"/></value></item>
+        </enum>
+      </elements>
+    </policy>
+    <policy name="BoolPol" class="Machine" displayName="$(string.BoolPol)" key="Software\\Test" valueName="BoolBase">
+      <parentCategory ref="test:Root"/>
+      <elements><boolean id="BoolEl" valueName="BoolVal"><trueValue><decimal value="1"/></trueValue><falseValue><decimal value="0"/></falseValue></boolean></elements>
+    </policy>
+    <policy name="ListPol" class="Machine" displayName="$(string.ListPol)" key="Software\\Test">
+      <parentCategory ref="test:Root"/>
+      <elements><list id="ListEl" key="Software\\Test\\List" valuePrefix="Item"/></elements>
+    </policy>
+    <policy name="ELPol" class="Machine" displayName="$(string.ELPol)" key="Software\\Test" valueName="ELBase">
+      <parentCategory ref="test:Root"/>
+      <enabledList><item key="Software\\Test\\EL" valueName="A"><value><decimal value="1"/></value></item></enabledList>
+      <disabledList><item key="Software\\Test\\DL" valueName="B"><value><decimal value="0"/></value></item></disabledList>
+    </policy>
+    <policy name="KeyPol" class="Machine" displayName="$(string.KeyPol)" key="Software\\Test">
+      <parentCategory ref="test:Root"/>
+      <elements><text id="KeyEl" key="Software\\Other\\Sub" valueName="TVal"/></elements>
+    </policy>
+    <policy name="SBoolPol" class="Machine" displayName="$(string.SBoolPol)" key="Software\\Test">
+      <parentCategory ref="test:Root"/>
+      <elements><boolean id="SBEl" valueName="SBVal"><trueValue><string>yes</string></trueValue><falseValue><string>no</string></falseValue></boolean></elements>
+    </policy>
+    <policy name="ExpPol" class="Machine" displayName="$(string.ExpPol)" key="Software\\Test">
+      <parentCategory ref="test:Root"/>
+      <elements><list id="ExpEl" key="Software\\Test\\ExpList" valuePrefix="P" expandable="true"/></elements>
+    </policy>
+  </policies>
+</policyDefinitions>"""
+
+GPOED_ADML = """<?xml version="1.0"?>
+<policyDefinitionResources><resources>
+  <stringTable>
+    <string id="Root">Root Cat</string><string id="Child">Child Cat</string>
+    <string id="DecPol">Decimal Policy</string><string id="DecPolHelp">Help text.</string>
+    <string id="EnumPol">Enum Policy</string><string id="Opt0">Zero</string><string id="Opt1">One</string>
+    <string id="BoolPol">Bool Policy</string><string id="ListPol">List Policy</string>
+    <string id="ELPol">EnabledList Policy</string><string id="KeyPol">Key Override Policy</string>
+    <string id="SBoolPol">String Bool Policy</string><string id="ExpPol">Expandable List Policy</string>
+  </stringTable>
+  <presentationTable>
+    <presentation id="DecPol"><decimalTextBox refId="DecEl" defaultValue="10">Days:</decimalTextBox></presentation>
+  </presentationTable>
+</resources></policyDefinitionResources>"""
+
+
+class TestGpoEditor(unittest.TestCase):
+    """The ADMX policy-editor pipeline: parsers, category tree, schema, compiler."""
+
+    def _cache(self):
+        strings = mod.parse_adml(GPOED_ADML)
+        pols = mod.parse_admx(GPOED_ADMX)
+        for p in pols:
+            p["admx"] = "Test.admx"
+            p["display"] = mod._resolve_ref(p["display"], strings) or p["id"]
+            p["explain"] = mod._resolve_ref(p["explain"], strings)
+            for el in p.get("elements", []):
+                for it in el.get("items", []):
+                    it["display"] = mod._resolve_ref(it["display"], strings)
+            p["unresolved"] = False
+        meta = mod.parse_admx_meta(GPOED_ADMX)
+        for c in meta["categories"]:
+            c["display"] = mod._resolve_ref(c["display"], strings) or c["name"]
+        pres = mod.parse_adml_presentations(GPOED_ADML)
+        return {"admx": {"Test.admx": {"policies": pols, "meta": meta, "presentations": pres}}}
+
+    def _pol(self, pols, name):
+        return next(p for p in pols if p["id"] == name)
+
+    def test_parse_admx_elements(self):
+        pols = mod.parse_admx(GPOED_ADMX)
+        dec = self._pol(pols, "DecPol")["elements"][0]
+        self.assertEqual((dec["kind"], dec["valuename"], dec["min"], dec["max"], dec["type"]),
+                         ("decimal", "DecVal", 1, 100, "REG_DWORD"))
+        enum = self._pol(pols, "EnumPol")["elements"][0]
+        self.assertEqual([(i["value"], i["type"]) for i in enum["items"]],
+                         [(0, "REG_DWORD"), (1, "REG_DWORD")])
+        boolp = self._pol(pols, "BoolPol")
+        self.assertTrue(boolp["has_enabled"])          # valueName + elements still toggles base
+        self.assertEqual(boolp["elements"][0]["true_value"], 1)
+        el = self._pol(pols, "ELPol")
+        self.assertTrue(el["has_enabled"])
+        self.assertEqual(el["enabled_list"][0], {"key": "Software\\Test\\EL", "valuename": "A",
+                                                 "type": "REG_DWORD", "data": 1})
+
+    def test_parse_meta_and_presentations(self):
+        meta = mod.parse_admx_meta(GPOED_ADMX)
+        self.assertEqual(meta["namespace"], "Test.Policies")
+        self.assertEqual(meta["prefixes"]["windows"], "Microsoft.Policies.Windows")
+        names = {c["name"]: c["parent"] for c in meta["categories"]}
+        self.assertEqual(names["Child"], "test:Root")
+        pres = mod.parse_adml_presentations(GPOED_ADML)["DecPol"][0]
+        self.assertEqual((pres["control"], pres["refId"], pres["label"], pres["default"]),
+                         ("decimalTextBox", "DecEl", "Days:", 10))
+
+    def test_category_tree_nesting(self):
+        cats, tree = mod._build_category_index(self._cache(), {})
+        root = next(n for n in tree if n["name"] == "Root")
+        self.assertEqual(root["display"], "Root Cat")
+        child = next(c for c in root["children"] if c["name"] == "Child")
+        self.assertEqual(child["display"], "Child Cat")
+        # DecPol + EnumPol live under Child; Root holds the other 6
+        self.assertEqual(len(child["policies"]), 2)
+        self.assertEqual(root["count"], 8)             # recursive (6 direct + Child's 2)
+
+    def test_policy_schema_merges_presentation(self):
+        schema = mod._policy_schema(self._cache(), {}, "admx:Test.admx:DecPol")
+        self.assertEqual(schema["explain"], "Help text.")
+        el = schema["elements"][0]
+        self.assertEqual((el["control"], el["label"], el["default"], el["min"], el["max"]),
+                         ("decimalTextBox", "Days:", 10, 1, 100))
+        enum = mod._policy_schema(self._cache(), {}, "admx:Test.admx:EnumPol")["elements"][0]
+        self.assertEqual([i["display"] for i in enum["items"]], ["Zero", "One"])
+
+    def test_compile_enabled_decimal_and_enum(self):
+        cache = self._cache()
+        sch = mod._policy_schema(cache, {}, "admx:Test.admx:DecPol")
+        load, remove = mod._compile_policy(sch, "enabled", {"DecEl": 42}, "MACHINE")
+        self.assertEqual(load, [{"keyname": "Software\\Test", "valuename": "DecVal",
+                                 "class": "MACHINE", "type": "REG_DWORD", "data": 42}])
+        sch = mod._policy_schema(cache, {}, "admx:Test.admx:EnumPol")
+        load, _ = mod._compile_policy(sch, "enabled", {"EnumEl": 1}, "MACHINE")
+        self.assertEqual(load[0]["data"], 1)
+        self.assertEqual(load[0]["type"], "REG_DWORD")
+
+    def test_compile_boolean_base_plus_element(self):
+        sch = mod._policy_schema(self._cache(), {}, "admx:Test.admx:BoolPol")
+        load, _ = mod._compile_policy(sch, "enabled", {"BoolEl": False}, "MACHINE")
+        by = {e["valuename"]: e["data"] for e in load}
+        self.assertEqual(by["BoolBase"], 1)            # base on/off written
+        self.assertEqual(by["BoolVal"], 0)             # unchecked -> false_value
+
+    def test_compile_list_indexed(self):
+        sch = mod._policy_schema(self._cache(), {}, "admx:Test.admx:ListPol")
+        load, _ = mod._compile_policy(sch, "enabled", {"ListEl": ["aaa", "bbb"]}, "MACHINE")
+        self.assertEqual([(e["keyname"], e["valuename"], e["data"]) for e in load],
+                         [("Software\\Test\\List", "Item1", "aaa"),
+                          ("Software\\Test\\List", "Item2", "bbb")])
+
+    def test_compile_enabledlist_and_notconfigured(self):
+        sch = mod._policy_schema(self._cache(), {}, "admx:Test.admx:ELPol")
+        load, _ = mod._compile_policy(sch, "enabled", {}, "MACHINE")
+        vns = {(e["keyname"], e["valuename"]): e["data"] for e in load}
+        self.assertEqual(vns[("Software\\Test\\EL", "A")], 1)      # enabledList row
+        self.assertEqual(vns[("Software\\Test", "ELBase")], 1)     # base implicit-enable
+        _l, remove = mod._compile_policy(sch, "notconfigured", {}, "MACHINE")
+        pairs = {(r["keyname"], r["valuename"]) for r in remove}
+        self.assertIn(("Software\\Test", "ELBase"), pairs)
+        self.assertIn(("Software\\Test\\EL", "A"), pairs)
+
+    def test_compile_required_element_missing(self):
+        sch = mod._policy_schema(self._cache(), {}, "admx:Test.admx:DecPol")
+        sch["elements"][0]["required"] = True
+        with self.assertRaises(mod.Fail):
+            mod._compile_policy(sch, "enabled", {}, "MACHINE")
+
+    def test_compile_element_key_override(self):
+        # Regression [1]: an element's own key must be honored, not the policy key.
+        sch = mod._policy_schema(self._cache(), {}, "admx:Test.admx:KeyPol")
+        load, _ = mod._compile_policy(sch, "enabled", {"KeyEl": "hello"}, "MACHINE")
+        self.assertEqual(load[0]["keyname"], "Software\\Other\\Sub")
+        self.assertEqual((load[0]["valuename"], load[0]["data"]), ("TVal", "hello"))
+
+    def test_compile_opposite_state_lists_removed(self):
+        # Regression [3]: switching state must remove the other state's list rows.
+        sch = mod._policy_schema(self._cache(), {}, "admx:Test.admx:ELPol")
+        _l, rem = mod._compile_policy(sch, "enabled", {}, "MACHINE")   # removes disabled_list
+        self.assertIn(("Software\\Test\\DL", "B"), {(r["keyname"], r["valuename"]) for r in rem})
+        _l, rem = mod._compile_policy(sch, "disabled", {}, "MACHINE")  # removes enabled_list
+        self.assertIn(("Software\\Test\\EL", "A"), {(r["keyname"], r["valuename"]) for r in rem})
+
+    def test_compile_string_boolean_type(self):
+        # Regression [5]: a string trueValue/falseValue must write REG_SZ.
+        sch = mod._policy_schema(self._cache(), {}, "admx:Test.admx:SBoolPol")
+        load, _ = mod._compile_policy(sch, "enabled", {"SBEl": True}, "MACHINE")
+        e = [x for x in load if x["valuename"] == "SBVal"][0]
+        self.assertEqual((e["type"], e["data"]), ("REG_SZ", "yes"))
+
+    def test_compile_expandable_list_type(self):
+        # Regression [6]: an expandable list writes REG_EXPAND_SZ rows.
+        sch = mod._policy_schema(self._cache(), {}, "admx:Test.admx:ExpPol")
+        load, _ = mod._compile_policy(sch, "enabled", {"ExpEl": ["x"]}, "MACHINE")
+        self.assertEqual(load[0]["type"], "REG_EXPAND_SZ")
+        self.assertEqual((load[0]["keyname"], load[0]["valuename"]), ("Software\\Test\\ExpList", "P1"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
