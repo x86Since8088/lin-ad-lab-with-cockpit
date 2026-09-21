@@ -3,8 +3,19 @@
 # Runs on the HOST as root; reaches the DCs with `podman exec`.
 
 _here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# Locate lab.env across both layouts: the dev checkout keeps it one level up
+# (sysvol/../lab.env); a deployed install puts the scripts under
+# /usr/local/libexec/samba-ad-lab and the config under /etc/samba-ad-lab, where
+# ../lab.env would resolve to a nonexistent /usr/local/libexec/lab.env. Try an
+# explicit override first, then the checkout, then the deployed config dir.
+_lab_env=""
+for _c in "${SYSVOL_LAB_ENV:-}" "$_here/../lab.env" "$_here/lab.env" /etc/samba-ad-lab/lab.env; do
+    [ -n "$_c" ] && [ -f "$_c" ] && { _lab_env="$_c"; break; }
+done
+[ -n "$_lab_env" ] || { echo "sysvol-lib.sh: lab.env not found (set SYSVOL_LAB_ENV, or place it at $_here/../lab.env or /etc/samba-ad-lab/lab.env)" >&2; exit 1; }
 # shellcheck source=../lab.env
-. "$_here/../lab.env"
+. "$_lab_env"
+# sysvol.env ships alongside these scripts in both the checkout and the install.
 # shellcheck source=./sysvol.env
 . "$_here/sysvol.env"
 
