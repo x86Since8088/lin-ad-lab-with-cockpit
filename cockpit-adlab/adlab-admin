@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 
 
 def _require_config():
@@ -283,7 +283,15 @@ def client_ip(i):   return "%s.%d" % (PRIMARY_LAB["NET_PREFIX"], PRIMARY_LAB["CL
 def all_dcs(dom=None):
     d = dom or _cur()
     if d.get("PRIMARY", True):
-        return [dc_name(i, d) for i in range(1, d["DC_COUNT"] + 1)]
+        # Primary DCs = the designed topology (dc1..DC_COUNT, shown even if a slot
+        # is stopped) UNION any live `dc<N>` container beyond it, so a promoted dc6
+        # is not invisible. Additional-forest DCs (`<slug>-dcN`) and clients don't
+        # match `^dc\d+$`, so they are never mistaken for primary DCs.
+        slots = set("dc%d" % i for i in range(1, d["DC_COUNT"] + 1))
+        rc, out, _ = RUN.run(["podman", "ps", "-a", "--format", "{{.Names}}"])
+        if rc == 0:
+            slots |= set(n for n in out.split() if re.match(r'^dc\d+$', n))
+        return sorted(slots, key=lambda n: int(n[2:]))
     return _live_dcs_of(d["REALM"])
 
 
@@ -3476,6 +3484,10 @@ def v_dns_delete(a):
 # ---- DCs: logs, tracing, RPC, promote/demote, remoting --------------------
 
 def v_dc_list(a):
+    # Enumerate the CURRENT domain's ACTUAL DCs, never a fixed slot count: for the
+    # primary that is dc1..DC_COUNT (the designed topology, state reported), for an
+    # additional forest it is the live labelled containers (all_dcs -> _live_dcs_of),
+    # so a one-DC forest shows one DC — not five inherited from PRIMARY_LAB.
     roles = {}
     try:
         d = first_up_dc()
@@ -3485,10 +3497,11 @@ def v_dc_list(a):
     except Fail:
         pass
     dcs = []
-    for i in range(1, LAB["DC_COUNT"] + 1):
-        n = dc_name(i)
+    for n in all_dcs():
         held = sorted(r for r, h in roles.items() if h == n)
-        dcs.append({"dc": n, "ip": ctr_ip(n) or dc_ip(i),
+        m = re.search(r'(\d+)$', n)
+        idx = int(m.group(1)) if m else 1
+        dcs.append({"dc": n, "ip": ctr_ip(n) or dc_ip(idx),
                     "state": ctr_state(n), "fsmo_roles": held})
     return {"dcs": dcs}
 
@@ -5030,7 +5043,12 @@ def arg(name, type_="str", required=True, help_="", choices=None, default=None):
     if default is not None: a["default"] = default
     return a
 
-DC_CHOICES = all_dcs()
+# all_dcs() now consults podman (to catch a promoted dc6); never let that break
+# import — fall back to the configured primary topology if podman is unavailable.
+try:
+    DC_CHOICES = all_dcs()
+except Exception:
+    DC_CHOICES = ["dc%d" % i for i in range(1, PRIMARY_LAB["DC_COUNT"] + 1)]
 
 
 # ---------------------------------------------------------------------------

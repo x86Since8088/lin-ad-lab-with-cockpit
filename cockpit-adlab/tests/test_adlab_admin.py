@@ -334,9 +334,11 @@ class TestDomains(Base):
         self.fake.lab_up()
         self._no_extra_domains()
         self.call_main(["domain-list"])
+        # The DISCOVERY ps is the one that reads the realm label (all_dcs' plain
+        # `{{.Names}}` primary-DC probe also runs now, so filter on the label field).
         disc = [a for a, _ in self.fake.calls
-                if a[:3] == ["podman", "ps", "-a"] and any("{{.Names}}" in x for x in a)]
-        self.assertTrue(disc, "domain-list must run a discovery `podman ps`")
+                if a[:3] == ["podman", "ps", "-a"] and any(".Labels" in x for x in a)]
+        self.assertTrue(disc, "domain-list must run a label-based discovery `podman ps`")
         for a in disc:
             joined = " ".join(a)
             self.assertNotIn(".Config.Labels", joined,
@@ -486,6 +488,36 @@ class TestDomains(Base):
         rc, out = self.call_main(["dc-decommission", "--dc", "corp-dc1"])
         self.assertEqual(rc, 1)
         self.assertIn("last DC", out["error"])
+
+    def test_dc_list_dynamic_for_additional_forest(self):
+        # Regression: an additional forest with ONE DC must show ONE DC on the
+        # DCs tab, not five inherited from PRIMARY_LAB["DC_COUNT"].
+        self.fake.lab_up()
+        self._one_extra_domain(realm="CORP.EXAMPLE.LAB", slug="corp", dcs=("corp-dc1",))
+        rc, out = self.call_main(["--domain", "CORP.EXAMPLE.LAB", "dc-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([d["dc"] for d in out["dcs"]], ["corp-dc1"])
+
+    def test_dc_list_primary_uses_configured_topology(self):
+        self.fake.lab_up()
+        self._no_extra_domains()
+        rc, out = self.call_main(["dc-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(out["dcs"]), mod.PRIMARY_LAB["DC_COUNT"])
+
+    def test_dc_list_primary_includes_promoted_dc6(self):
+        # Regression [6]: a primary DC promoted beyond DC_COUNT must not be
+        # invisible, and only real primary DCs (^dc\d+$) count — not the CA node,
+        # clients, or another forest's <slug>-dcN containers.
+        self.fake.lab_up()
+        self._no_extra_domains()
+        self.fake.on(lambda a: a[:3] == ["podman", "ps", "-a"] and a[-1] == "{{.Names}}",
+                     out="dc1\ndc2\ndc3\ndc4\ndc5\ndc6\nclient1\nadlab-ca\nad2-dc1\n")
+        rc, out = self.call_main(["dc-list"])
+        self.assertEqual(rc, 0, out)
+        names = [d["dc"] for d in out["dcs"]]
+        self.assertIn("dc6", names)
+        self.assertEqual(names, ["dc1", "dc2", "dc3", "dc4", "dc5", "dc6"])
 
     def test_domain_remove_refuses_primary(self):
         self.fake.lab_up()
@@ -825,6 +857,8 @@ class TestHandlers(Base):
             self.fake.calls.append((list(argv), stdin))
             if argv[:2] == ["podman", "inspect"]:
                 return 0, "running\n", ""
+            if argv[:2] == ["podman", "ps"]:
+                return 0, "", ""   # all_dcs' primary-DC discovery — not part of the hash seq
             return 0, next(seq), ""
         mod.RUN = type("R", (), {"run": staticmethod(dyn)})()
         rc, out = self.call_main(["sysvol-status"])

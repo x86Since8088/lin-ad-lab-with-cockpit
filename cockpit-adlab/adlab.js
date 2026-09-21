@@ -37,6 +37,7 @@
     };
     var currentTab = "overview";
     var lastRenderedTab = null;
+    var lastRenderedDomain = null; // forest the body was last rendered for (URL-backed)
     var shownStack = [];           // [{sig, back}] — the open modal backdrops,
                                    // reconciled against the URL modal stack
     var _lastBackdrop = null;      // set by modal() so the reconciler can track it
@@ -211,7 +212,16 @@
     function nav(path, options) {
         cockpit.location.go(path, options || {});
     }
-    function goTab(tab) { nav([tab]); }
+    /* The selected forest lives in the URL (?domain=<realm>) so it is
+     * deep-linkable and survives Back/Forward/reload. domOpts() carries it onto
+     * every navigation; the primary forest is the absence of the param. */
+    function domOpts(extra) {
+        var o = {};
+        if (extra) Object.keys(extra).forEach(function (k) { o[k] = extra[k]; });
+        if (currentDomain) o.domain = currentDomain;
+        return o;
+    }
+    function goTab(tab) { nav([tab], domOpts()); }
 
     /* The modal STACK lives in the URL as parallel arrays: each open modal is
      * a (modal, target) pair, so the URL reads
@@ -226,9 +236,9 @@
         return mods.map(function (m, i) { return { modal: m, target: tgts[i] === undefined ? "" : tgts[i] }; });
     }
     function writeStack(stack) {
-        if (!stack.length) { nav([currentTab], {}); return; }
-        nav([currentTab], { modal: stack.map(function (s) { return s.modal; }),
-                            target: stack.map(function (s) { return s.target; }) });
+        if (!stack.length) { nav([currentTab], domOpts()); return; }
+        nav([currentTab], domOpts({ modal: stack.map(function (s) { return s.modal; }),
+                                    target: stack.map(function (s) { return s.target; }) }));
     }
     /* Push a modal onto the stack (navigates; the router opens it). */
     function openModal(key, extra) {
@@ -260,9 +270,20 @@
         if (tab === "users") { nav("/objects", loc.options); return; }
         if (!RENDER[tab]) tab = "overview";
         currentTab = tab;
-        if (tab !== lastRenderedTab) {
+        // The forest scope is URL state: read it back so a deep link / reload /
+        // Back-Forward lands on the right forest, and re-render the body when it
+        // changes (every scoped verb reads currentDomain when run() builds argv).
+        var dom = (loc.options && loc.options.domain) || null;
+        currentDomain = dom;          // the URL is the source of truth for the scope
+        // Re-render when the tab OR the forest differs from what is ON SCREEN
+        // (lastRenderedDomain), NOT from currentDomain — the selector handler
+        // pre-sets currentDomain before navigating, so comparing against it would
+        // always read "unchanged" and skip the re-render (body/scope desync).
+        if (tab !== lastRenderedTab || (dom || "") !== (lastRenderedDomain || "")) {
             lastRenderedTab = tab;
+            lastRenderedDomain = dom;
             renderTabs();
+            renderDomainSelector();   // keep the header <select> in sync with the URL
             RENDER[tab]();
         }
         reconcileModals(readStack());
@@ -395,7 +416,7 @@
 
     /* Render a verb result INTO an existing modal box (in place), so a form
      * modal becomes its own result view without a second navigation. */
-    function fillResult(box, title, res) {
+    function fillResult(box, title, res, reRun) {
         clear(box);
         box.appendChild(el("h2", null, title));
         if (res && res.password) {
@@ -404,8 +425,29 @@
             w.appendChild(el("kbd", "al", res.password));
             box.appendChild(w);
         }
+        // Preview-then-apply: a dry-run result (commit:false with pending changes,
+        // e.g. crypto-harden) reports what WOULD change but applies nothing. Make
+        // that explicit and offer a one-click Apply that re-runs with commit=true,
+        // so a deep-linked harden modal never looks like it silently did nothing.
+        if (reRun && res && res.commit === false && (res.would_change || 0) > 0) {
+            var dn = el("div", "al-alert warn");
+            dn.textContent = "Dry run — " + res.would_change + " account(s) would change. "
+                + "Nothing has been applied yet.";
+            box.appendChild(dn);
+            var applyBtn = el("button", "al-btn danger",
+                "Apply " + res.would_change + " change" + (res.would_change === 1 ? "" : "s") + " now");
+            applyBtn.addEventListener("click", function () {
+                applyBtn.disabled = true;
+                reRun().then(function (r2) { fillResult(box, title, r2); })
+                       .catch(function (e) {
+                           applyBtn.disabled = false;
+                           box.appendChild(el("div", "al-alert err", String(e)));
+                       });
+            });
+            box.appendChild(applyBtn);
+        }
         box.appendChild(el("pre", "al-log", JSON.stringify(res, null, 2)));
-        var ok = el("button", "al-btn", "Close");
+        var ok = el("button", "al-btn secondary", "Close");
         ok.addEventListener("click", function () { closeModal(); refreshTab(); });
         box.appendChild(ok);
     }
@@ -423,9 +465,24 @@
             var form = el("form", "al-form");
             var inputs = {};
             (spec.args || []).forEach(function (a) {
-                if (a.name in presets) return;
                 var lab = el("label", null, a.name + (a.required ? "" : " (optional)"));
                 if (a.help) lab.appendChild(el("span", "hint", " — " + a.help));
+                // A preset argument (from a deep link's decoded target or the
+                // opening context) is shown READ-ONLY and pre-filled, so the modal
+                // always presents the decoded data rather than hiding it. It stays
+                // out of `inputs`, so submit still takes its value from `presets`.
+                // A password (password-stdin) is NEVER honored as a preset: it
+                // would show in cleartext and be mis-routed onto argv — always
+                // render its own (empty) field, which routes via stdin.
+                if ((a.name in presets) && a.type !== "password-stdin") {
+                    form.appendChild(lab);
+                    var ro = el("input", "al-ro");
+                    ro.type = "text";
+                    ro.value = String(presets[a.name]);
+                    ro.readOnly = true; ro.tabIndex = -1;
+                    form.appendChild(ro);
+                    return;
+                }
                 form.appendChild(lab);
                 var input;
                 if (a.type === "enum") {
@@ -476,7 +533,14 @@
                     return;
                 }
                 var args = {}, stdinData, bad = null;
-                Object.keys(presets).forEach(function (k) { args[k] = presets[k]; });
+                var specByName = {};
+                (spec.args || []).forEach(function (x) { specByName[x.name] = x; });
+                Object.keys(presets).forEach(function (k) {
+                    // A password preset is ignored (it must come from its field via
+                    // stdin, never argv) — matches the read-only-render exclusion.
+                    if (specByName[k] && specByName[k].type === "password-stdin") return;
+                    args[k] = presets[k];
+                });
                 Object.keys(inputs).forEach(function (k) {
                     var i = inputs[k], v = i.node.value;
                     if (i.spec.type === "password-stdin") {
@@ -489,7 +553,13 @@
                 if (bad) { alertBox.textContent = bad; return; }
                 go.disabled = true;
                 run(verb, args, stdinData).then(function (res) {
-                    fillResult(box, verb, res);
+                    // reRun re-applies a dry-run verb with commit=true (fillResult
+                    // only offers it when the result is an unapplied dry-run).
+                    fillResult(box, verb, res, function () {
+                        var applyArgs = {}; Object.keys(args).forEach(function (k) { applyArgs[k] = args[k]; });
+                        applyArgs.commit = "true";
+                        return run(verb, applyArgs, stdinData);
+                    });
                 }).catch(function (e) {
                     go.disabled = false; alertBox.textContent = String(e);
                 });
@@ -625,14 +695,20 @@
         host.appendChild(el("span", "al-dom-label", "Forest"));
         var sel = el("select", "al-dom-select");
         DOMAINS.forEach(function (d) {
-            var o = el("option", null, d.realm + (d.primary ? " (primary)" : ""));
+            // Label shows the forest and, for a parent-linked child, its parent —
+            // so subdomains read as such in the chooser.
+            var label = d.realm + (d.primary ? " (primary)"
+                        : (d.parent ? " ← " + d.parent : ""));
+            var o = el("option", null, label);
             o.value = d.primary ? "" : d.realm;   // "" = primary = unscoped
             if ((currentDomain || "") === o.value) o.selected = true;
             sel.appendChild(o);
         });
         sel.addEventListener("change", function () {
+            // Update the URL (deep-linkable, Back/Forward-aware); route() re-renders
+            // and drops any open modal, whose target may reference the old forest.
             currentDomain = sel.value || null;
-            refreshTab();
+            nav([currentTab], domOpts());
         });
         host.appendChild(sel);
     }
@@ -644,8 +720,14 @@
         return run("domain-list").then(function (r) {
             DOMAINS = (r && r.domains) || [];
             if (currentDomain &&
-                !DOMAINS.some(function (d) { return !d.primary && d.realm === currentDomain; }))
+                !DOMAINS.some(function (d) { return !d.primary && d.realm === currentDomain; })) {
+                // The scoped forest is gone (removed/renamed, or a stale deep link).
+                // Reset AND scrub it from the URL, otherwise the dead realm keeps
+                // coming back on Back/Forward and every scoped verb re-targets it.
                 currentDomain = null;
+                var o = (cockpit.location && cockpit.location.options) || {};
+                if (o.domain) { nav([currentTab], {}); return DOMAINS; }  // route() re-renders on primary
+            }
             renderDomainSelector();
             return DOMAINS;
         }).catch(function () { DOMAINS = []; renderDomainSelector(); return DOMAINS; });
@@ -3015,6 +3097,46 @@
     // first. "Add domain" provisions a NEW forest (its own podman network + a
     // first DC); each additional forest can be backed up or removed whole.
     // Per-DC promote/decommission lives on the DCs tab, scoped by the selector.
+    /* Run a verb scoped to a specific forest without disturbing the global
+     * selector. run() builds its argv synchronously from currentDomain, so a
+     * save/restore around the call is safe. realm null = the primary forest. */
+    function runIn(realm, verb, args, stdin) {
+        var saved = currentDomain;
+        currentDomain = realm || null;
+        try { return run(verb, args, stdin); }
+        finally { currentDomain = saved; }
+    }
+
+    /* Confirm, then promote a new replication-partner DC into one forest. Used
+     * by the per-domain "Add DC" action and the DCs-tab "Promote new DC". */
+    function promoteDcPrompt(realm, label) {
+        transientModal("Add a DC to " + label, function (b, close) {
+            b.appendChild(el("div", "hint",
+                "Promotes a new replication-partner DC into " + label + ". The join "
+                + "runs in the background — watch it with the DC's “logs”. The new "
+                + "DC's ordinal and IP are chosen automatically."));
+            var alertBox = el("div", "al-alert err");
+            var row = el("div", "row");
+            var go = el("button", "al-btn", "Add DC");
+            var cancel = el("button", "al-btn secondary", "Cancel");
+            cancel.addEventListener("click", close);
+            go.addEventListener("click", function () {
+                go.disabled = true; alertBox.textContent = "";
+                runIn(realm, "dc-promote", {}).then(function (res) {
+                    close();
+                    transientModal("Promoting a DC", function (bb, cc) {
+                        bb.appendChild(el("pre", "al-log", JSON.stringify(res, null, 2)));
+                        var ok = el("button", "al-btn", "Close");
+                        ok.addEventListener("click", cc); bb.appendChild(ok);
+                    });
+                    refreshTab();
+                }).catch(function (e) { go.disabled = false; alertBox.textContent = String(e); });
+            });
+            row.appendChild(go); row.appendChild(cancel);
+            b.appendChild(alertBox); b.appendChild(row);
+        });
+    }
+
     function renderDomains() {
         var m = content();
         var acts = el("div", "al-actions");
@@ -3047,11 +3169,15 @@
                 var box = el("div", "al-actions");
                 var manage = el("button", "al-btn secondary", "Manage DCs");
                 manage.addEventListener("click", function () {
-                    currentDomain = d.primary ? null : d.realm;
-                    renderDomainSelector();
+                    currentDomain = d.primary ? null : d.realm;   // goTab carries it in the URL
                     goTab("dcs");
                 });
                 box.appendChild(manage);
+                var addDc = el("button", "al-btn", "Add DC");
+                addDc.addEventListener("click", function () {
+                    promoteDcPrompt(d.primary ? null : d.realm, d.realm);
+                });
+                box.appendChild(addDc);
                 box.appendChild(actionButton("Back up", "domain-backup", { realm: d.realm }));
                 var trustsBtn = el("button", "al-btn secondary", "Trusts");
                 trustsBtn.addEventListener("click", function () {
@@ -3089,7 +3215,11 @@
             : ("Forest in view: primary (" + (IDENT ? IDENT.realm : "") + ").");
         m.appendChild(el("div", "hint", scope));
         var acts = el("div", "al-actions");
-        acts.appendChild(actionButton("Promote new DC", "dc-promote", {}, ""));
+        var promote = el("button", "al-btn", "Promote new DC");
+        promote.addEventListener("click", function () {
+            promoteDcPrompt(currentDomain, currentDomain || (IDENT ? IDENT.realm : "primary"));
+        });
+        acts.appendChild(promote);
         acts.appendChild(actionButton("Transfer FSMO role", "fsmo-transfer", {}));
         acts.appendChild(actionButton("Seize FSMO role", "fsmo-seize", {}, "danger"));
         m.appendChild(acts);
