@@ -274,9 +274,12 @@
         // Back-Forward lands on the right forest, and re-render the body when it
         // changes (every scoped verb reads currentDomain when run() builds argv).
         var dom = (loc.options && loc.options.domain) || null;
-        var domChanged = (dom || "") !== (currentDomain || "");
-        currentDomain = dom;
-        if (tab !== lastRenderedTab || domChanged) {
+        currentDomain = dom;          // the URL is the source of truth for the scope
+        // Re-render when the tab OR the forest differs from what is ON SCREEN
+        // (lastRenderedDomain), NOT from currentDomain — the selector handler
+        // pre-sets currentDomain before navigating, so comparing against it would
+        // always read "unchanged" and skip the re-render (body/scope desync).
+        if (tab !== lastRenderedTab || (dom || "") !== (lastRenderedDomain || "")) {
             lastRenderedTab = tab;
             lastRenderedDomain = dom;
             renderTabs();
@@ -468,7 +471,10 @@
                 // opening context) is shown READ-ONLY and pre-filled, so the modal
                 // always presents the decoded data rather than hiding it. It stays
                 // out of `inputs`, so submit still takes its value from `presets`.
-                if (a.name in presets) {
+                // A password (password-stdin) is NEVER honored as a preset: it
+                // would show in cleartext and be mis-routed onto argv — always
+                // render its own (empty) field, which routes via stdin.
+                if ((a.name in presets) && a.type !== "password-stdin") {
                     form.appendChild(lab);
                     var ro = el("input", "al-ro");
                     ro.type = "text";
@@ -527,7 +533,14 @@
                     return;
                 }
                 var args = {}, stdinData, bad = null;
-                Object.keys(presets).forEach(function (k) { args[k] = presets[k]; });
+                var specByName = {};
+                (spec.args || []).forEach(function (x) { specByName[x.name] = x; });
+                Object.keys(presets).forEach(function (k) {
+                    // A password preset is ignored (it must come from its field via
+                    // stdin, never argv) — matches the read-only-render exclusion.
+                    if (specByName[k] && specByName[k].type === "password-stdin") return;
+                    args[k] = presets[k];
+                });
                 Object.keys(inputs).forEach(function (k) {
                     var i = inputs[k], v = i.node.value;
                     if (i.spec.type === "password-stdin") {
@@ -707,8 +720,14 @@
         return run("domain-list").then(function (r) {
             DOMAINS = (r && r.domains) || [];
             if (currentDomain &&
-                !DOMAINS.some(function (d) { return !d.primary && d.realm === currentDomain; }))
+                !DOMAINS.some(function (d) { return !d.primary && d.realm === currentDomain; })) {
+                // The scoped forest is gone (removed/renamed, or a stale deep link).
+                // Reset AND scrub it from the URL, otherwise the dead realm keeps
+                // coming back on Back/Forward and every scoped verb re-targets it.
                 currentDomain = null;
+                var o = (cockpit.location && cockpit.location.options) || {};
+                if (o.domain) { nav([currentTab], {}); return DOMAINS; }  // route() re-renders on primary
+            }
             renderDomainSelector();
             return DOMAINS;
         }).catch(function () { DOMAINS = []; renderDomainSelector(); return DOMAINS; });
