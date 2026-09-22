@@ -98,6 +98,10 @@
             "The lab's member client machines and their domain-join state; onboard the next client here."] },
         members: { title: "Member Servers", body: [
             "Windows member servers via offline domain join (ODJ): provision a machine account and a join blob a stock Windows answer file can consume — no interactive credential on the box."] },
+        containers: { title: "Containers", body: [
+            "Every lab container (all forests' DCs, clients, RDP, the CA node) with its state, health, restart count and IP — plus Start / Stop / Restart / inspect controls, the host container-runtime system view, recent podman events, and error/log tails for anything down or unhealthy.",
+            "The lab's containers have no podman restart policy. Enable the auto-restart supervisor to have a DOWN container started again automatically — up to 5 retries with a +1-minute incremental backoff (1, 2, 3, 4, 5 minutes), then it gives up until you fix it and Reset retries. It runs every minute via a systemd timer and only starts existing containers (it never recreates a removed one).",
+            "Stopping a container here parks it so the supervisor won't restart it; Start or Reset retries re-arms it."] },
         activity: { title: "Activity", body: [
             "The audit trail: every adlab-admin invocation is appended to a log (never with secret values). This tab is that log."] },
         // routed (non-verb) modals
@@ -667,6 +671,7 @@
         ["gpo", "Group Policy"], ["sites", "Sites & Replication"],
         ["dns", "DNS"], ["domains", "Domains"], ["dcs", "Domain Controllers"],
         ["clients", "Clients"], ["members", "Member Servers"],
+        ["containers", "Containers"],
         ["activity", "Activity"],
     ];
 
@@ -3206,6 +3211,110 @@
             }).catch(function (e) { fPol(el("div", "al-alert err", String(e))); });
     }
 
+    // -------- Containers: startup supervisor (retry+backoff), controls, system
+    function renderContainers() {
+        var m = content();
+        var acts = el("div", "al-actions");
+        var refresh = el("button", "al-btn secondary", "Refresh");
+        refresh.addEventListener("click", function () { refreshTab(); });
+        acts.appendChild(refresh);
+        acts.appendChild(actionButton("Run supervisor now", "container-supervise", {}));
+        var supHost = el("span", "al-sup-toggle");
+        acts.appendChild(supHost);
+        m.appendChild(acts);
+        m.appendChild(el("div", "al-alert warn",
+            "The lab's containers carry no podman restart policy. Enable the auto-restart " +
+            "supervisor to have any DOWN container started again automatically — up to 5 " +
+            "retries with a +1-minute incremental backoff (1, 2, 3, 4, 5 min), then it gives " +
+            "up until you fix it and reset. Stopping a container here PARKS it so the " +
+            "supervisor won't fight you; Start / Reset retries re-arm it."));
+        var holder = el("div", "al-grid"); m.appendChild(holder);
+
+        function toggleFail(e) {
+            transientModal("supervisor change failed", function (b, close) {
+                b.appendChild(el("div", "al-alert err", String(e)));
+                var ok = el("button", "al-btn", "Close"); ok.addEventListener("click", close); b.appendChild(ok);
+            });
+        }
+        var fCtr = slotCard(holder, "Containers", true);
+        run("container-list").then(function (r) {
+            var sup = r.supervisor || {};
+            clear(supHost);
+            supHost.appendChild(el("span", "hint", "auto-restart: " + (sup.enabled ? "on" : "off") + "  "));
+            var b;
+            if (sup.enabled) {
+                b = actionButton("Disable auto-restart", "container-supervise-disable", {});
+            } else {
+                b = el("button", "al-btn", "Enable auto-restart");
+                b.addEventListener("click", function () {
+                    b.disabled = true;
+                    run("container-supervise-enable", {}).then(function () { refreshTab(); })
+                        .catch(function (e) { b.disabled = false; toggleFail(e); });
+                });
+            }
+            supHost.appendChild(b);
+            fCtr(emptyOr(r.containers,
+                ["container", "kind", "state", "health", "restarts", "IP", "supervisor", "actions"],
+                function (c) {
+                    var sb = c.state === "running" ? badge("running", "ok")
+                        : (c.state === "missing" ? badge("missing", "dim") : badge(c.state, "err"));
+                    var supTxt = "—", s = c.supervisor;
+                    if (s) {
+                        if (s.parked) supTxt = "parked";
+                        else if (s.gave_up) supTxt = "gave up (" + s.attempts + ")";
+                        else if (s.attempts) supTxt = "retry " + s.attempts + "/" + r.max_retries +
+                            (s.next_try_in ? " in " + s.next_try_in + "s" : "");
+                        else if (s.starts) supTxt = "auto-started " + s.starts + "×";
+                    }
+                    var box = el("div", "al-actions");
+                    if (c.state !== "missing") {
+                        box.appendChild(actionButton("inspect", "container-inspect", { name: c.name }));
+                        box.appendChild(c.state === "running"
+                            ? actionButton("restart", "container-restart", { name: c.name })
+                            : actionButton("start", "container-start", { name: c.name }));
+                        if (c.state === "running")
+                            box.appendChild(actionButton("stop", "container-stop", { name: c.name }));
+                        if (s) box.appendChild(actionButton("reset", "container-supervise-reset", { name: c.name }));
+                    }
+                    return [el("kbd", "al", c.name), c.kind, sb, c.health || "—",
+                            String(c.restart_count != null ? c.restart_count : ""),
+                            c.ip || "—", supTxt, box];
+                }, "no lab containers"),
+                "Containers — auto-restart " + (sup.enabled ? "ON" : "OFF") + " (5 retries, +1min backoff)");
+        }).catch(function (e) { clear(supHost); fCtr(el("div", "al-alert err", String(e))); });
+
+        var fSys = slotCard(holder, "Container system", true);
+        run("container-system").then(function (r) {
+            var rows = [["podman", r.podman_version], ["storage driver", r.graph_driver],
+                        ["graph root", r.graph_root], ["platform", r.platform],
+                        ["total containers", r.total_containers],
+                        ["lab states", Object.keys(r.lab_state_tally || {}).map(function (k) {
+                            return k + "=" + r.lab_state_tally[k]; }).join("  ")]];
+            (r.disk || []).forEach(function (d) { rows.push(["disk", d]); });
+            fSys(emptyOr(rows.map(function (x) { return { k: x[0], v: x[1] }; }),
+                ["property", "value"], function (x) { return [x.k, x.v]; }, "no data"),
+                "Container system (host runtime)");
+        }).catch(function (e) { fSys(el("div", "al-alert err", String(e))); });
+
+        var fEv = slotCard(holder, "Events", true);
+        run("container-events", { since: "1h" }).then(function (r) {
+            fEv(emptyOr((r.events || []).slice().reverse(), ["time", "type", "container", "status"],
+                function (e) { return [e.time, e.type, el("kbd", "al", e.name), e.status]; },
+                "no recent events"), "Events (last " + (r.since || "") + ")");
+        }).catch(function (e) { fEv(el("div", "al-alert err", String(e))); });
+
+        var fErr = slotCard(holder, "Errors", true);
+        run("container-errors").then(function (r) {
+            fErr(emptyOr(r.containers, ["container", "state", "exit", "health", "recent errors"],
+                function (c) {
+                    return [el("kbd", "al", c.name),
+                            c.state === "running" ? badge("running", "ok") : badge(c.state, "err"),
+                            String(c.exit_code != null ? c.exit_code : ""), c.health || "—",
+                            el("pre", "al-log", (c.errors || []).slice(-6).join("\n") || "—")];
+                }, "no container errors"), "Errors (down / unhealthy containers)");
+        }).catch(function (e) { fErr(el("div", "al-alert err", String(e))); });
+    }
+
     // ---------------------------------------------------------------- boot
     var RENDER = { overview: renderOverview,
                    objects: renderObjects, spn: renderSpn, kerberos: renderKerberos,
@@ -3213,7 +3322,7 @@
                    gpo: renderGpo,
                    sites: renderSites, dns: renderDns, domains: renderDomains,
                    dcs: renderDcs, clients: renderClients, members: renderMembers,
-                   activity: renderActivity };
+                   containers: renderContainers, activity: renderActivity };
 
     function boot() {
         renderTabs();
