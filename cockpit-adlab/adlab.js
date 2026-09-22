@@ -3264,6 +3264,7 @@
                         else if (s.gave_up) supTxt = "gave up (" + s.attempts + ")";
                         else if (s.attempts) supTxt = "retry " + s.attempts + "/" + r.max_retries +
                             (s.next_try_in ? " in " + s.next_try_in + "s" : "");
+                        else if (s.starts) supTxt = "auto-started " + s.starts + "×";
                     }
                     var box = el("div", "al-actions");
                     if (c.state !== "missing") {

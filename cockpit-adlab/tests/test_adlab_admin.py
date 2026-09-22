@@ -3500,7 +3500,37 @@ class TestContainers(Base):
         self._lab()
         rc, out = self.call_main(["container-supervise"])
         self.assertEqual(self._act(out, "dc3")["action"], "started")
-        self.assertNotIn("dc3", self._sup_state())
+        # retry state cleared, but the cumulative auto-start count is kept
+        self.assertEqual(self._sup_state()["dc3"], {"starts": 1})
+
+    def test_supervise_start_count_accumulates(self):
+        self._state("dc3", "exited")
+        self.fake.on(lambda a: a[:2] == ["podman", "start"] and "dc3" in a, rc=0)
+        self._lab()
+        mod._write_supervisor_state({"dc3": {"starts": 1}})   # already auto-started once
+        rc, out = self.call_main(["container-supervise"])
+        self.assertEqual(self._act(out, "dc3")["total_starts"], 2)
+        self.assertEqual(self._sup_state()["dc3"]["starts"], 2)
+
+    def test_stop_parks_before_podman_stop(self):
+        # The HIGH fix: park must be persisted BEFORE `podman stop` so the timer
+        # can't race in during the shutdown and restart the container.
+        seen = {}
+        def run(argv, stdin=None, timeout=120):
+            self.fake.calls.append((list(argv), stdin))
+            if argv[:2] == ["podman", "stop"] and "dc4" in argv:
+                try:
+                    seen["parked"] = json.load(open(mod.CTR_SUPERVISOR_FILE)).get("dc4", {}).get("parked")
+                except Exception:
+                    seen["parked"] = None
+                return 0, "", ""
+            if argv[:2] == ["podman", "inspect"]:
+                return 0, "running\n", ""
+            return 0, "", ""
+        mod.RUN = type("R", (), {"run": staticmethod(run)})()
+        rc, out = self.call_main(["container-stop", "--name", "dc4"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(seen.get("parked"))     # parked on disk at the moment of stop
 
     def test_supervise_backoff_then_giveup(self):
         self._state("dc3", "exited")
