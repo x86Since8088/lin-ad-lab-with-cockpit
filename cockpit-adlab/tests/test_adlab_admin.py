@@ -224,12 +224,20 @@ class Base(unittest.TestCase):
         self._ca_dir = tempfile.mkdtemp(suffix=".ca")
         self._old_ca_dir = mod.PKI_CA_DIR
         mod.PKI_CA_DIR = self._ca_dir
+        # isolate the container-supervisor state file
+        self._sup = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        self._sup.close(); os.unlink(self._sup.name)
+        self._old_sup = mod.CTR_SUPERVISOR_FILE
+        mod.CTR_SUPERVISOR_FILE = self._sup.name
 
     def tearDown(self):
         mod.RUN = self._old_run
         mod.AUDIT_LOG = self._old_audit
         mod.GPO_OS_FILE = self._old_gpo_os
         mod.PKI_CA_DIR = self._old_ca_dir
+        mod.CTR_SUPERVISOR_FILE = self._old_sup
+        if os.path.exists(self._sup.name):
+            os.unlink(self._sup.name)
         import shutil
         shutil.rmtree(self._ca_dir, ignore_errors=True)
         if os.path.exists(self._gpo_os.name):
@@ -258,7 +266,7 @@ KNOWN_TYPES = {"str", "int", "bool", "enum", "password-stdin"}
 KNOWN_GROUPS = {"meta", "overview", "fsmo", "users", "groups", "gpo", "objects",
                 "sites", "dns", "dcs", "clients", "activity", "domains",
                 "members", "rds", "spn", "kerberos", "crypto", "pki",
-                "delegation", "authpolicy"}
+                "delegation", "authpolicy", "containers"}
 DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "ou-delete", "gpo-delete", "gpo-unlink", "gpo-settings-remove",
                "dns-delete", "dc-restart", "dc-shell", "dc-promote", "dc-demote",
@@ -270,7 +278,8 @@ DESTRUCTIVE = {"fsmo-transfer", "fsmo-seize", "user-delete", "group-delete",
                "delegation-set-unconstrained", "delegation-set-protocol-transition",
                "delegation-remove-service", "rbcd-remove",
                "protected-users-add", "protected-users-remove",
-               "authpolicy-delete", "authsilo-delete", "authsilo-member-revoke"}
+               "authpolicy-delete", "authsilo-delete", "authsilo-member-revoke",
+               "container-stop", "container-restart", "container-supervise-disable"}
 
 
 class TestSchema(Base):
@@ -3440,6 +3449,121 @@ class TestGpoEditor(unittest.TestCase):
         load, _ = mod._compile_policy(sch, "enabled", {"ExpEl": ["x"]}, "MACHINE")
         self.assertEqual(load[0]["type"], "REG_EXPAND_SZ")
         self.assertEqual((load[0]["keyname"], load[0]["valuename"]), ("Software\\Test\\ExpList", "P1"))
+
+
+class TestContainers(Base):
+    """Container supervisor (retry + backoff), controls, classification."""
+
+    def _state(self, name, st):
+        # ctr_state does `podman inspect <name> --format {{.State.Status}}`
+        self.fake.on(lambda a, n=name: a[:2] == ["podman", "inspect"]
+                     and a and a[-1] == "{{.State.Status}}" and n in a, out=st + "\n")
+
+    def _lab(self):
+        # lab_up + "no additional forests" (TestContainers doesn't inherit TestDomains)
+        self.fake.on(lambda a: a[:3] == ["podman", "ps", "-a"]
+                     and any("{{.Names}}\t" in x for x in a), out="")
+        self.fake.lab_up()
+
+    def _sup_state(self):
+        try:
+            return json.load(open(mod.CTR_SUPERVISOR_FILE))
+        except Exception:
+            return {}
+
+    def _act(self, out, name):
+        return next(a for a in out["actions"] if a["name"] == name)
+
+    def test_classify_and_managed(self):
+        self.assertEqual(mod._classify_container("dc1"), "dc")
+        self.assertEqual(mod._classify_container("ad2-dc1"), "dc")
+        self.assertEqual(mod._classify_container("client3"), "client")
+        self.assertEqual(mod._classify_container("rdp1"), "rdp")
+        self.assertEqual(mod._classify_container("adlab-ca"), "ca")
+        self.assertIsNone(mod._classify_container("edy-proxy-go"))
+        self.assertIsNone(mod._classify_container("harbor-net"))
+
+    def test_supervise_retry_schedules_backoff(self):
+        self._state("dc3", "exited")
+        self.fake.on(lambda a: a[:2] == ["podman", "start"] and "dc3" in a, rc=1, err="boom")
+        self._lab()
+        rc, out = self.call_main(["container-supervise"])
+        self.assertEqual(rc, 0, out)
+        act = self._act(out, "dc3")
+        self.assertEqual((act["action"], act["attempts"], act["next_try_in"]),
+                         ("retry-scheduled", 1, 60))          # +1 minute
+        self.assertEqual(self._sup_state()["dc3"]["attempts"], 1)
+
+    def test_supervise_starts_down_container(self):
+        self._state("dc3", "exited")
+        self.fake.on(lambda a: a[:2] == ["podman", "start"] and "dc3" in a, rc=0)
+        self._lab()
+        rc, out = self.call_main(["container-supervise"])
+        self.assertEqual(self._act(out, "dc3")["action"], "started")
+        self.assertNotIn("dc3", self._sup_state())
+
+    def test_supervise_backoff_then_giveup(self):
+        self._state("dc3", "exited")
+        self.fake.on(lambda a: a[:2] == ["podman", "start"] and "dc3" in a, rc=1)
+        self._lab()
+        mod._write_supervisor_state({"dc3": {"attempts": 2, "next_try": mod.time.time() + 300}})
+        rc, out = self.call_main(["container-supervise"])
+        self.assertEqual(self._act(out, "dc3")["action"], "backoff")  # not yet due
+        mod._write_supervisor_state({"dc3": {"attempts": 5, "next_try": 0}})
+        rc, out = self.call_main(["container-supervise"])
+        self.assertEqual(self._act(out, "dc3")["action"], "gave-up")
+
+    def test_supervise_backoff_increments_per_attempt(self):
+        self._state("dc3", "exited")
+        self.fake.on(lambda a: a[:2] == ["podman", "start"] and "dc3" in a, rc=1)
+        self._lab()
+        mod._write_supervisor_state({"dc3": {"attempts": 1, "next_try": 0}})  # due
+        rc, out = self.call_main(["container-supervise"])
+        act = self._act(out, "dc3")
+        self.assertEqual((act["attempts"], act["next_try_in"]), (2, 120))     # +2 minutes
+
+    def test_supervise_recovers_running(self):
+        self._lab()             # dc3 running
+        mod._write_supervisor_state({"dc3": {"attempts": 3, "next_try": 0}})
+        rc, out = self.call_main(["container-supervise"])
+        self.assertEqual(self._act(out, "dc3")["action"], "recovered")
+        self.assertNotIn("dc3", self._sup_state())
+
+    def test_stop_parks_container(self):
+        self.fake.on(lambda a: a[:2] == ["podman", "stop"] and "dc4" in a, rc=0)
+        self._lab()
+        rc, out = self.call_main(["container-stop", "--name", "dc4"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(self._sup_state()["dc4"]["parked"])
+
+    def test_parked_container_not_restarted(self):
+        self._state("dc4", "exited")
+        self._lab()
+        mod._write_supervisor_state({"dc4": {"attempts": 5, "parked": True, "next_try": 0}})
+        rc, out = self.call_main(["container-supervise"])
+        self.assertEqual(self._act(out, "dc4")["action"], "parked")
+        self.assertFalse(self.fake.argv_containing("podman", "start", "dc4"))
+
+    def test_start_clears_retry_state(self):
+        self.fake.on(lambda a: a[:2] == ["podman", "start"] and "dc4" in a, rc=0)
+        self._lab()
+        mod._write_supervisor_state({"dc4": {"attempts": 3, "parked": True}})
+        rc, out = self.call_main(["container-start", "--name", "dc4"])
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("dc4", self._sup_state())
+
+    def test_reset_clears_state(self):
+        mod._write_supervisor_state({"dc3": {"attempts": 2}})
+        self.fake.lab_up()
+        rc, out = self.call_main(["container-supervise-reset", "--name", "dc3"])
+        self.assertTrue(out["was_tracked"])
+        self.assertNotIn("dc3", self._sup_state())
+
+    def test_control_rejects_non_lab_container(self):
+        self.fake.lab_up()
+        rc, out = self.call_main(["container-start", "--name", "harbor-net"])
+        self.assertEqual(rc, 1)
+        self.assertIn("not a lab-managed", out["error"])
 
 
 if __name__ == "__main__":

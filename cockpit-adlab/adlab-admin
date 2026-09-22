@@ -123,7 +123,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 
 
 def _require_config():
@@ -6491,6 +6491,325 @@ def v_gpo_linux_report(a):
             "total": len(rows), "reg_roots": list(LINUX_REG_ROOTS)}
 
 
+# ---- containers: startup supervisor (retry+backoff) + controls + system + events --
+# The lab's DC/client/RDP/CA containers carry NO podman --restart policy; bring-up is
+# boot-script only. This supervisor restarts an EXISTING lab container that has gone
+# down, up to CTR_MAX_RETRIES attempts with a +1-minute INCREMENTAL backoff (attempt
+# N waits N minutes), tracked per container in a host state file, driven by a systemd
+# timer that runs `container-supervise` every minute. It only `podman start`s existing
+# containers — it never recreates a removed one (that stays the lifecycle verbs' job).
+CTR_HELPER = "/usr/local/sbin/adlab-admin"
+CTR_SUPERVISOR_FILE = "/var/lib/adlab/container-supervisor.json"  # host, root-only
+CTR_MAX_RETRIES = 5
+CTR_BACKOFF_STEP = 60                       # seconds added per attempt (+1 min each)
+CTR_SUP_SERVICE = "adlab-container-supervisor"
+CTR_SUP_UNITDIR = "/etc/systemd/system"
+
+def _read_supervisor_state():
+    try:
+        with open(CTR_SUPERVISOR_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _write_supervisor_state(st):
+    os.makedirs(os.path.dirname(CTR_SUPERVISOR_FILE), exist_ok=True)
+    tmp = CTR_SUPERVISOR_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, CTR_SUPERVISOR_FILE)
+
+def _classify_container(name):
+    """Lab container kind by naming convention, or None if not lab-managed (so
+    other podman workloads on the host — edy/harbor/cribl — are never touched)."""
+    if re.match(r'^dc\d+$', name) or re.match(r'^[a-z][a-z0-9-]*-dc\d+$', name):
+        return "dc"
+    if re.match(r'^client\d+$', name):
+        return "client"
+    if re.match(r'^rdp\d+$', name):
+        return "rdp"
+    if name == PKI_CA_CTR:
+        return "ca"
+    return None
+
+def _managed_container_names():
+    """Every lab-managed container name (all forests' DCs + clients + RDP + the CA),
+    precise by the lab's naming — never other podman workloads on the host."""
+    names, seen = [], set()
+    def add(n):
+        if n not in seen:
+            seen.add(n); names.append(n)
+    for d in list_domains():
+        for n in all_dcs(d):
+            add(n)
+    for n in all_clients():
+        add(n)
+    for i in range(1, PRIMARY_LAB.get("RDP_COUNT", 0) + 1):
+        add("rdp%d" % i)
+    add(PKI_CA_CTR)
+    return names
+
+def _inspect_container(name):
+    """Rich per-container state via one podman inspect (safe on a null Health)."""
+    fmt = ("{{.State.Status}}|{{.State.ExitCode}}|"
+           "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|"
+           "{{.RestartCount}}|{{.State.StartedAt}}|{{.Created}}|{{.Image}}|"
+           "{{range $k,$v := .NetworkSettings.Networks}}{{$v.IPAddress}}{{end}}")
+    rc, out, _ = RUN.run(["podman", "inspect", name, "--format", fmt])
+    if rc != 0:
+        return {"state": "missing"}
+    p = ((out or "").strip().split("|") + [""] * 8)[:8]
+    try:
+        exitc = int(p[1])
+    except ValueError:
+        exitc = None
+    try:
+        rcount = int(p[3])
+    except ValueError:
+        rcount = 0
+    return {"state": p[0] or "missing", "exit_code": exitc,
+            "health": "" if p[2] == "none" else p[2], "restart_count": rcount,
+            "started_at": p[4], "created": p[5], "image": p[6], "ip": p[7]}
+
+def _require_managed(name):
+    if _classify_container(name) is None:
+        raise Fail("%r is not a lab-managed container" % name)
+
+def _supervisor_timer_state():
+    rc, out, _ = RUN.run(["systemctl", "is-enabled", CTR_SUP_SERVICE + ".timer"])
+    enabled_word = (out or "").strip()
+    rc2, out2, _ = RUN.run(["systemctl", "is-active", CTR_SUP_SERVICE + ".timer"])
+    return {"installed": enabled_word in ("enabled", "disabled", "static"),
+            "enabled": enabled_word == "enabled",
+            "active": (out2 or "").strip() == "active"}
+
+def v_container_list(a):
+    """Every lab container with state/health/exit-code/restarts, plus its supervisor
+    retry state (attempts, next attempt, last error) — drives the Containers tab."""
+    st = _read_supervisor_state()
+    now = time.time()
+    rows = []
+    for name in _managed_container_names():
+        info = _inspect_container(name)
+        kind = _classify_container(name) or "other"
+        if info.get("state") == "missing":
+            rows.append({"name": name, "kind": kind, "state": "missing", "supervisor": None})
+            continue
+        s = st.get(name)
+        info.update({"name": name, "kind": kind,
+                     "supervisor": ({"attempts": s.get("attempts", 0),
+                                     "next_try_in": max(0, int(s.get("next_try", 0) - now)),
+                                     "gave_up": s.get("attempts", 0) >= CTR_MAX_RETRIES,
+                                     "parked": bool(s.get("parked")),
+                                     "last_error": s.get("last_error", "")} if s else None)})
+        rows.append(info)
+    return {"containers": rows, "max_retries": CTR_MAX_RETRIES,
+            "backoff_step_sec": CTR_BACKOFF_STEP, "supervisor": _supervisor_timer_state()}
+
+def v_container_start(a):
+    """Start a stopped lab container and clear its supervisor retry counter."""
+    name = a["name"].strip()
+    _require_managed(name)
+    rc, out, err = RUN.run(["podman", "start", name], timeout=120)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    st = _read_supervisor_state()
+    if st.pop(name, None) is not None:
+        _write_supervisor_state(st)
+    return {"started": name, "state": ctr_state(name)}
+
+def v_container_stop(a):
+    """Stop a lab container. It is PARKED so the supervisor won't fight the operator;
+    container-start (or supervise-reset) re-arms it."""
+    name = a["name"].strip()
+    _require_managed(name)
+    rc, out, err = RUN.run(["podman", "stop", name], timeout=120)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    st = _read_supervisor_state()
+    st[name] = {"attempts": CTR_MAX_RETRIES, "next_try": 0,
+                "last_error": "stopped by operator", "parked": True}
+    _write_supervisor_state(st)
+    return {"stopped": name, "state": ctr_state(name),
+            "note": "parked: the supervisor will not auto-restart a manually stopped "
+                    "container — use Start or Reset retries to re-arm it"}
+
+def v_container_restart(a):
+    name = a["name"].strip()
+    _require_managed(name)
+    rc, out, err = RUN.run(["podman", "restart", name], timeout=180)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    st = _read_supervisor_state()
+    if st.pop(name, None) is not None:
+        _write_supervisor_state(st)
+    return {"restarted": name, "state": ctr_state(name)}
+
+def v_container_supervise(a):
+    """One supervision pass (the systemd timer's target): start each DOWN lab
+    container, up to %d attempts with a +1-minute incremental backoff. Idempotent.""" % CTR_MAX_RETRIES
+    st = _read_supervisor_state()
+    now = time.time()
+    actions, live = [], set()
+    for name in _managed_container_names():
+        state = ctr_state(name)
+        if state == "missing":
+            continue                       # never created -> not our job to run
+        live.add(name)
+        if state == "running":
+            if st.pop(name, None) is not None:
+                actions.append({"name": name, "action": "recovered"})
+            continue
+        s = st.get(name) or {"attempts": 0, "next_try": 0}
+        if s.get("parked"):
+            actions.append({"name": name, "action": "parked"})
+            continue
+        if s.get("attempts", 0) >= CTR_MAX_RETRIES:
+            actions.append({"name": name, "action": "gave-up", "attempts": s["attempts"]})
+            continue
+        if now < s.get("next_try", 0):
+            actions.append({"name": name, "action": "backoff",
+                            "next_try_in": int(s["next_try"] - now), "attempts": s.get("attempts", 0)})
+            continue
+        rc, out, err = RUN.run(["podman", "start", name], timeout=120)
+        if rc == 0:
+            st.pop(name, None)
+            actions.append({"name": name, "action": "started"})
+        else:
+            s["attempts"] = s.get("attempts", 0) + 1
+            s["next_try"] = now + s["attempts"] * CTR_BACKOFF_STEP
+            s["last_error"] = (err.strip() or out.strip())[-300:]
+            st[name] = s
+            actions.append({"name": name, "action": "retry-scheduled", "attempts": s["attempts"],
+                            "next_try_in": s["attempts"] * CTR_BACKOFF_STEP, "error": s["last_error"]})
+    for gone in [n for n in list(st) if n not in live]:   # forget vanished containers
+        st.pop(gone, None)
+    _write_supervisor_state(st)
+    return {"checked": len(live), "actions": actions, "at": _now_iso()}
+
+def v_container_supervise_reset(a):
+    """Clear a container's retry counter (re-arm after a fix / un-park); no name = all."""
+    st = _read_supervisor_state()
+    name = (a.get("name") or "").strip()
+    if name:
+        existed = st.pop(name, None) is not None
+        _write_supervisor_state(st)
+        return {"reset": name, "was_tracked": existed}
+    _write_supervisor_state({})
+    return {"reset": "all"}
+
+def v_container_supervise_enable(a):
+    """Install + enable the systemd timer that runs the supervisor every minute."""
+    svc = ("[Unit]\nDescription=AD Lab container startup supervisor "
+           "(restart down lab containers; %d retries, +1min backoff)\n"
+           "After=network-online.target\nWants=network-online.target\n\n"
+           "[Service]\nType=oneshot\nUser=root\nExecStart=%s container-supervise\n"
+           % (CTR_MAX_RETRIES, CTR_HELPER))
+    tmr = ("[Unit]\nDescription=Run the AD Lab container supervisor every minute\n\n"
+           "[Timer]\nOnBootSec=1min\nOnUnitActiveSec=1min\nAccuracySec=10s\n\n"
+           "[Install]\nWantedBy=timers.target\n")
+    for fn, body in ((CTR_SUP_SERVICE + ".service", svc), (CTR_SUP_SERVICE + ".timer", tmr)):
+        with open(os.path.join(CTR_SUP_UNITDIR, fn), "w") as f:
+            f.write(body)
+    RUN.run(["systemctl", "daemon-reload"])
+    rc, out, err = RUN.run(["systemctl", "enable", "--now", CTR_SUP_SERVICE + ".timer"], timeout=60)
+    if rc != 0:
+        raise Fail((err.strip() or out.strip())[-400:])
+    return {"enabled": True, "unit": CTR_SUP_SERVICE + ".timer", "state": _supervisor_timer_state()}
+
+def v_container_supervise_disable(a):
+    """Disable + remove the supervisor timer (containers are no longer auto-restarted)."""
+    RUN.run(["systemctl", "disable", "--now", CTR_SUP_SERVICE + ".timer"], timeout=60)
+    for fn in (CTR_SUP_SERVICE + ".timer", CTR_SUP_SERVICE + ".service"):
+        try:
+            os.remove(os.path.join(CTR_SUP_UNITDIR, fn))
+        except OSError:
+            pass
+    RUN.run(["systemctl", "daemon-reload"])
+    return {"enabled": False, "state": _supervisor_timer_state()}
+
+def v_container_system(a):
+    """Host container-runtime overview: podman version, storage, disk usage, and a
+    state tally of the lab containers (the 'system' view)."""
+    rc, ver, _ = RUN.run(["podman", "version", "--format", "{{.Server.Version}}"])
+    rc2, info, _ = RUN.run(["podman", "info", "--format",
+        "{{.Store.GraphDriverName}}|{{.Store.GraphRoot}}|{{.Host.OS}}/{{.Host.Arch}}|{{.Store.ContainerStore.Number}}"])
+    p = ((info or "").strip().split("|") + [""] * 4)[:4]
+    rc3, df, _ = RUN.run(["podman", "system", "df", "--format",
+        "{{.Type}}={{.Size}} ({{.Reclaimable}} reclaimable)"])
+    tally = {}
+    for name in _managed_container_names():
+        s = ctr_state(name)
+        tally[s] = tally.get(s, 0) + 1
+    return {"podman_version": (ver or "").strip(), "graph_driver": p[0],
+            "graph_root": p[1], "platform": p[2], "total_containers": p[3],
+            "disk": [l for l in (df or "").splitlines() if l.strip()],
+            "lab_state_tally": tally}
+
+def v_container_inspect(a):
+    """One container's system detail (state, health, restarts, resources, mounts)."""
+    name = a["name"].strip()
+    _require_managed(name)
+    info = _inspect_container(name)
+    if info.get("state") == "missing":
+        raise Fail("no such container: %s" % name)
+    rc, out, _ = RUN.run(["podman", "inspect", name, "--format",
+        "{{.HostConfig.Memory}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.RestartPolicy.Name}}|"
+        "{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}"])
+    p = ((out or "").strip().split("|") + [""] * 4)[:4]
+    info.update({"name": name, "kind": _classify_container(name) or "other",
+                 "memory_limit": p[0], "nano_cpus": p[1],
+                 "restart_policy": p[2] or "no", "mounts": p[3].strip()})
+    return info
+
+def v_container_events(a):
+    """Recent podman events for the lab containers (create/start/died/health…)."""
+    name = (a.get("name") or "").strip()
+    since = a.get("since") or "30m"
+    cmd = ["podman", "events", "--stream=false", "--since", since,
+           "--format", "{{.Time}}\t{{.Type}}\t{{.Name}}\t{{.Status}}"]
+    if name:
+        _require_managed(name)
+        cmd += ["--filter", "container=" + name]
+    rc, out, _ = RUN.run(cmd, timeout=60)
+    managed = set(_managed_container_names())
+    events = []
+    for line in (out or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        if not name and parts[2] not in managed:
+            continue
+        events.append({"time": parts[0], "type": parts[1], "name": parts[2], "status": parts[3]})
+    return {"events": events[-200:], "since": since}
+
+def v_container_errors(a):
+    """Error/warning signals: down or unhealthy lab containers, each with the tail of
+    its log filtered to error-ish lines."""
+    lines = int(a.get("lines", 40) or 40)
+    only = (a.get("name") or "").strip()
+    if only:
+        _require_managed(only)
+    names = [only] if only else _managed_container_names()
+    rows = []
+    for name in names:
+        info = _inspect_container(name)
+        state = info.get("state")
+        if state == "missing":
+            continue
+        healthy = info.get("health") in ("", "healthy", "starting")
+        if state == "running" and healthy and not only:
+            continue                       # nothing wrong -> skip unless asked by name
+        rc, log, err = RUN.run(["podman", "logs", "--tail", str(lines), name], timeout=30)
+        blob = (log or "") + (err or "")
+        errs = [l for l in blob.splitlines()
+                if re.search(r'\b(error|fail(ed|ure)?|fatal|panic|denied|refused|cannot|unable)\b', l, re.I)]
+        if only or state not in ("running",) or info.get("health") == "unhealthy" or errs:
+            rows.append({"name": name, "state": state, "exit_code": info.get("exit_code"),
+                         "health": info.get("health", ""), "errors": errs[-lines:]})
+    return {"containers": rows}
+
+
 VERBS = {
     "version":       {"fn": v_version, "group": "meta", "help": "Helper and lab identity."},
     "schema":        {"fn": v_schema, "group": "meta", "help": "This verb table, as JSON — drives the UI."},
@@ -6979,6 +7298,39 @@ VERBS = {
     "authsilo-member-revoke": {"fn": v_authsilo_member_revoke, "group": "authpolicy", "danger": True,
                       "help": "Revoke an account's membership in an authentication silo.",
                       "args": [arg("name", help_="silo name"), arg("member")]},
+    "container-list": {"fn": v_container_list, "group": "containers",
+                      "help": "Every lab container with state/health/exit-code/restarts + its supervisor retry state. Drives the Containers tab."},
+    "container-start": {"fn": v_container_start, "group": "containers",
+                      "help": "Start a stopped lab container (clears its retry counter).",
+                      "args": [arg("name", help_="container name, e.g. dc3 / client2 / adlab-ca")]},
+    "container-stop": {"fn": v_container_stop, "group": "containers", "danger": True,
+                      "help": "Stop a lab container (parked so the supervisor won't auto-restart it).",
+                      "args": [arg("name")]},
+    "container-restart": {"fn": v_container_restart, "group": "containers", "danger": True,
+                      "help": "Restart a lab container (clears its retry counter).",
+                      "args": [arg("name")]},
+    "container-system": {"fn": v_container_system, "group": "containers",
+                      "help": "Host container-runtime overview: podman version, storage, disk usage, lab-state tally."},
+    "container-inspect": {"fn": v_container_inspect, "group": "containers",
+                      "help": "One container's system detail: state, health, restarts, resource limits, mounts.",
+                      "args": [arg("name")]},
+    "container-events": {"fn": v_container_events, "group": "containers",
+                      "help": "Recent podman events for the lab containers (create/start/died/health).",
+                      "args": [arg("name", required=False, help_="one container (default: all lab containers)"),
+                               arg("since", required=False, help_="how far back, e.g. 30m / 2h (default 30m)")]},
+    "container-errors": {"fn": v_container_errors, "group": "containers",
+                      "help": "Down/unhealthy containers with error-filtered log tails.",
+                      "args": [arg("name", required=False),
+                               arg("lines", "int", required=False, default=40)]},
+    "container-supervise": {"fn": v_container_supervise, "group": "containers",
+                      "help": "One supervision pass: start each down lab container (5 retries, +1min incremental backoff). The systemd timer's target; idempotent."},
+    "container-supervise-reset": {"fn": v_container_supervise_reset, "group": "containers",
+                      "help": "Clear a container's retry counter / un-park it (no name = reset all).",
+                      "args": [arg("name", required=False)]},
+    "container-supervise-enable": {"fn": v_container_supervise_enable, "group": "containers",
+                      "help": "Install + enable the systemd timer that auto-restarts down lab containers every minute."},
+    "container-supervise-disable": {"fn": v_container_supervise_disable, "group": "containers", "danger": True,
+                      "help": "Disable + remove the container-restart supervisor timer (containers stop being auto-restarted)."},
     "client-list":   {"fn": v_client_list, "group": "clients",
                       "help": "Client containers with join state."},
     "client-onboard": {"fn": v_client_onboard, "group": "clients",
