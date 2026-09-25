@@ -16,6 +16,7 @@
 !Containerfile.dc
 !Containerfile.client
 !dc-entrypoint.sh
+!dc-chrony.conf
 !edy-domain-install.sh
 !10-build.sh
 !20-up.sh

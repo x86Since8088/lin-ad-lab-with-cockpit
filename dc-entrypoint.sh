@@ -80,5 +80,22 @@ if [ -x /usr/local/bin/edy-agent ] && [ -s /etc/edy-agent/state.json ]; then
     log "edy-agent restarted"
 fi
 
+# Serve SIGNED (MS-SNTP) time to Windows domain members. They sync from their
+# authenticating DC (NT5DS) and require a *signed* NTP reply; samba supplies the
+# signing (its ntp_signd socket) and chrony is the NTP server that uses it.
+# chronyd -x never disciplines the clock (containers share the host clock), it
+# only serves it; the shipped config syncs to the host for a real stratum.
+# Started before samba: chrony connects to the samba-created signd socket lazily
+# (on the first signed request), by which time samba is up. Guarded so a chrony
+# failure can never abort the DC itself.
+if command -v chronyd >/dev/null 2>&1 && [ -f /etc/chrony/adlab-dc.conf ]; then
+    mkdir -p /run/chrony
+    if chronyd -x -f /etc/chrony/adlab-dc.conf; then
+        log "chronyd started — serving signed NTP to domain members"
+    else
+        log "WARNING: chronyd failed to start; Windows members cannot sync time from this DC"
+    fi
+fi
+
 log "starting samba (AD DC mode) as pid 1"
 exec /usr/sbin/samba --foreground --no-process-group --debuglevel=1
