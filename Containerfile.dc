@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         samba-ad-dc samba-ad-provision \
         krb5-user krb5-config ldb-tools ldap-utils python3-samba \
         python3-setproctitle tdb-tools \
+        chrony \
         dnsutils iproute2 iputils-ping procps ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 # tdb-tools provides `tdbbackup`, which `samba-tool domain backup offline`
@@ -23,7 +24,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN rm -f /etc/samba/smb.conf
 COPY edy-domain-install.sh /usr/local/sbin/edy-domain-install
 COPY dc-entrypoint.sh /usr/local/sbin/dc-entrypoint.sh
-RUN chmod 0755 /usr/local/sbin/dc-entrypoint.sh /usr/local/sbin/edy-domain-install
-EXPOSE 53/tcp 53/udp 88/tcp 88/udp 135/tcp 139/tcp 389/tcp 389/udp \
+# chrony serves SIGNED (MS-SNTP) time to Windows domain members via samba's
+# ntp_signd socket. This config is read by dc-entrypoint.sh (chronyd -x -f ...);
+# chrony's own systemd unit is unused (there is no init in the container).
+COPY dc-chrony.conf /etc/chrony/adlab-dc.conf
+RUN chmod 0755 /usr/local/sbin/dc-entrypoint.sh /usr/local/sbin/edy-domain-install \
+    && chmod 0644 /etc/chrony/adlab-dc.conf
+EXPOSE 53/tcp 53/udp 88/tcp 88/udp 123/udp 135/tcp 139/tcp 389/tcp 389/udp \
        445/tcp 464/tcp 464/udp 636/tcp 3268/tcp 3269/tcp
 ENTRYPOINT ["/usr/local/sbin/dc-entrypoint.sh"]
