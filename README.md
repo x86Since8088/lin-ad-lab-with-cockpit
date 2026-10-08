@@ -51,8 +51,9 @@ interactive sudo); the scripts assert `EUID -eq 0` and drive rootful podman.
 ```
 
 After a host reboot the containers are `exited` but their state persists.
-`samba-ad-lab.service` (`./install-start.sh`) runs `./21-start.sh` at boot —
-starts in order, restores AD DNS, restarts agents. Manual recovery is still
+`samba-ad-lab.timer` (`./install-start.sh`) fires `samba-ad-lab.service` 45 s
+after boot, which runs `./21-start.sh` — starts in order, restores AD DNS,
+restarts agents — without gating `multi-user.target`. Manual recovery is still
 `./21-start.sh` or `systemctl restart samba-ad-lab`. `./99-down.sh` removes
 containers but KEEPS state; `--purge` wipes it for a fresh forest.
 

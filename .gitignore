@@ -29,6 +29,9 @@
 !99-down.sh
 !install-start.sh
 !samba-ad-lab.service
+!samba-ad-lab.timer
+!samba-ad-lab.service.d
+!samba-ad-lab.service.d/**
 
 # ---- tracked trees ----------------------------------------------------------
 !docs
