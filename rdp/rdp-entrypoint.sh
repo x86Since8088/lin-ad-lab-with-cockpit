@@ -42,7 +42,12 @@ chmod 3777 /run/xrdp/sockdir
 mkdir -p /tmp/.ICE-unix /tmp/.X11-unix
 chown root:root /tmp/.ICE-unix /tmp/.X11-unix
 chmod 1777 /tmp/.ICE-unix /tmp/.X11-unix
-rm -f /run/dbus/pid /run/dbus/system_bus_socket
+# /run is NOT a tmpfs here: it is part of the writable layer and survives a
+# host crash. After the 2026-10-04 hard reset a stale xrdp-sesman.pid (its pid
+# reused by dbus/sssd) made sesman refuse to start ("already running"), this
+# script exit 1, and samba-ad-lab.service loop for two hours. Nothing is running
+# yet when pid 1 reaches this line, so every daemon pidfile here is stale.
+rm -f /run/dbus/pid /run/dbus/system_bus_socket /run/xrdp/xrdp-sesman.pid /run/xrdp/xrdp.pid
 dbus-daemon --system --fork 2>/dev/null && log "system dbus started"
 
 # ---------------------------------------------------------------- sssd

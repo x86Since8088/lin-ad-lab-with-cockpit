@@ -1,0 +1,14 @@
+# Added 2026-10-08. Starts the lab shortly after boot WITHOUT making multi-user.target (and everything
+# After= it, e.g. power-profiles-daemon) wait for the ~75 s lab start. Rollback:
+#   systemctl disable samba-ad-lab.timer; rm /etc/systemd/system/samba-ad-lab.timer
+#   systemctl enable samba-ad-lab.service; systemctl daemon-reload
+[Unit]
+Description=Start the Samba AD lab containers shortly after boot (decoupled from multi-user.target)
+Documentation=file:///etc/systemd/system/samba-ad-lab.service.d/10-bounded-restart.conf
+
+[Timer]
+OnBootSec=45s
+Unit=samba-ad-lab.service
+
+[Install]
+WantedBy=timers.target
