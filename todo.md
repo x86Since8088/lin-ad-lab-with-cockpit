@@ -42,18 +42,26 @@ open work appears. Memory only points here (`samba-ad-lab-todo`; incident record
   stopped DC's layer before `podman start`, and `dc-entrypoint.sh` removes it before `chronyd -x`. Stub-tested only;
   not yet exercised across a real DC restart or reboot. Manual recovery meanwhile:
   `podman exec dcN sh -c 'rm -f /run/chrony/chronyd.pid; chronyd -x -f /etc/chrony/adlab-dc.conf'`.
+- [ ] **Verify the DC chronyd fix across a real DC restart or reboot.** At the next boot: `podman top dcN -eo comm | grep -c chronyd`
+  is 1 on all five DCs, with no `WARNING: chronyd failed to start` in `podman logs --since <boot> dcN`, and `21-start.sh`
+  prints `note: dcN: removed stale chronyd.pid` for any DC that had one (a clean stop may leave none). Until then PR #38 is stub-tested plus a real
+  `podman mount`/`unmount` pass on a stopped container only.
+- [ ] **Track the system installer.** The repo-root `install.sh` (15.9 KB, 2026-09-07) installs the sysvol scripts under
+  `/usr/local/libexec/samba-ad-lab/` but is not whitelisted in the ignore-everything `.gitignore`, so it exists only in the
+  live checkout (`git ls-files` shows `install-start.sh`, `cockpit-adlab/install.sh`, `sysvol/install-timer.sh`, `tools/install-tools.sh`
+  but not `install.sh`). Add `!install.sh`, review it (it runs as root) and commit it.
 - [ ] **Rebuild the DC image and rolling-recreate `dc1`–`dc5` so the `dc-entrypoint.sh` chronyd pidfile cleanup is
   baked in (PR #38).** The running DCs keep the old entrypoint in their image layer, so until then only the
   `21-start.sh` pre-start cleanup protects them (the lab-start path only, not a bare `podman restart dcN`).
   Non-destructive for the primary DCs (their forest lives in `/opt/sc/lab-state`); one DC at a time, let replication
   settle (`30-verify.sh`). `ad2-dc1`/`ad2-dev-dc1` run an older image without chrony — never recreate them to "fix" this.
 - [ ] **Supervisor unit generator lacks `KillMode=process`.** `cockpit-adlab/adlab-admin` `v_container_supervise_enable`
-  (~L6758, unit text at ~L6763) writes `Type=oneshot`/`User=root`/`ExecStart=… container-supervise` with no `KillMode`
+  (the unit text is a string literal in that function) writes `Type=oneshot`/`User=root`/`ExecStart=… container-supervise` with no `KillMode`
   (the deployed `/usr/local/sbin/adlab-admin` is the same). The drop-in keeps edt1 working across regeneration; emit
   `KillMode=process` from the generator (with a comment saying why) so a fresh install is right too. Same trap and fix as
   `samba-ad-lab.service`.
 - [ ] **Supervisor counts a start as success even if the container dies seconds later.** In `v_container_supervise`
-  (`cockpit-adlab/adlab-admin` ~L6694) a `podman start` that returns 0 resets the entry to `{"starts": n+1}`, so
+  (`cockpit-adlab/adlab-admin`) a `podman start` that returns 0 resets the entry to `{"starts": n+1}`, so
   `attempts` never increments and the 5-retry/backoff limit can never trip: `/var/lib/adlab/container-supervisor.json`
   today shows `rdp1` 16266, `rdp2` 16265, `ad2-dc1`/`ad2-dev-dc1` 4059 starts each and no attempts. Treat a previous
   supervised start with `FinishedAt − StartedAt < 15 s` as a failed attempt, back off, give up after the existing 5, and
@@ -66,7 +74,7 @@ open work appears. Memory only points here (`samba-ad-lab-todo`; incident record
   refuse-to-rm guard. `rdp/10-build-rdp.sh` L16 builds straight to `$IMG_RDP` (`rdp/rdp.env` L18 =
   `localhost/ad-rdp:latest`), so a throwaway-tag build needs an `IMG_RDP` override.
 - [ ] **Extra-forest DCs have no persistent state.** `ad2-dc1`/`ad2-dev-dc1` were created by the plugin
-  (`cockpit-adlab/adlab-admin` `_run_dc` L4166–4193 via `v_domain_add`), which mounts only `administrator.pass` — no
+  (`cockpit-adlab/adlab-admin` `_run_dc`, called from `v_domain_add`), which mounts only `administrator.pass` — no
   `/var/lib/samba` volume — so `podman rm` destroys the forest. `20-up.sh`'s extra-forest block (L145–148) does
   `podman rm -f` then `podman run` for any extra DC that is not running (its L105 comment says an existing container "is
   left alone"; the code does not); it is dormant only because `EXTRA_DOMAINS=()` in `/etc/samba-ad-lab/lab.env`. Give
@@ -87,8 +95,8 @@ open work appears. Memory only points here (`samba-ad-lab-todo`; incident record
   (mode 775, `eddie:smbusers`, setgid dir; `smbusers` has one local member, `eddie`; remote writers depend on the share
   ACL). The trust surface is the whole tree, not one file: `21-start.sh` `cd`s to its own directory, sources
   `rdp/rdp.env` → `../lab.env`, and runs `40-agent.sh` → `agent.env`; the parent `projects/samba-ad-lab` is `root:users`
-  2775. The sysvol scripts were moved to `/usr/local/libexec/samba-ad-lab/` by `install.sh` (661aa75, 2026-09-08; PR #31
-  only fixed their `lab.env` lookup). `lab.env` and `rdp.env` are already installed root-owned under
+  2775. The sysvol scripts were moved to `/usr/local/libexec/samba-ad-lab/` by the lab's system installer (the repo-root
+  `install.sh`, 2026-09-07 — see the untracked-installer item; PR #31 only fixed their `lab.env` lookup). `lab.env` and `rdp.env` are already installed root-owned under
   `/etc/samba-ad-lab` (identical to the share copies today) but the boot script ignores them, and `agent.env` is not
   installed anywhere. Choose: install `21-start.sh`, `40-agent.sh`, `agent.env` and the `rdp/` helpers under
   `/usr/local` and point them at `/etc/samba-ad-lab`, or accept the risk.
@@ -97,9 +105,9 @@ open work appears. Memory only points here (`samba-ad-lab-todo`; incident record
 - **`samba-ad-lab/source` `stash@{0}`** ("pre-reset snapshot 2026-09-18: superseded draft, work merged via PR 12"): the
   work it protected is merged and the tree is clean; drop it or keep it. Not dropped.
 - **Host hygiene (root-owned):** `/etc/adlab/lab-root` (2026-09-08) still points at the share project dir and nothing
-  reads it any more; `/usr/local/libexec/samba-ad-lab/sysvol-lib.sh.bak.1789971669` is a pre-PR #31 leftover; this
-  checkout has 5 prunable worktrees from an earlier session (`git worktree prune`) and branches already merged into main
-  remain on origin (`git branch -r --merged origin/main` lists 21 refs).
+  reads it any more; `/usr/local/libexec/samba-ad-lab/sysvol-lib.sh.bak.1789971669` is a pre-PR #31 leftover; branches
+  already merged into main remain on origin (`gh api repos/x86Since8088/lin-ad-lab-with-cockpit/branches` lists 10 besides
+  `main`, including those of PRs #34/#36/#38) and stale remote-tracking refs linger locally (`git fetch --prune`).
 
 ## Not open (for context)
 
