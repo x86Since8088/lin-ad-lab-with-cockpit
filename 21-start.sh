@@ -19,9 +19,41 @@ cd "$(dirname "$(readlink -f "$0")")"
 . ./rdp/rdp.env        # sources ../lab.env itself
 [[ $EUID -eq 0 ]] || { echo "run as root"; exit 1; }
 
+# /run is not a tmpfs inside the RDP targets or the DCs, so a hard reset (or
+# any stop) leaves daemon pidfiles in their writable layer. sesman then sees
+# "already running" (the pid now belongs to dbus/sssd), the container exits 1,
+# the exec below fails and this script with it — samba-ad-lab.service looped
+# 275x that way on 2026-10-04. A DC's chronyd refuses the same way ("Another
+# chronyd may already be running (pid=9)"); dc-entrypoint only logs a WARNING
+# and the DC then serves no signed MS-SNTP time to Windows members (seen at
+# the 2026-10-04 and 2026-10-15 boots). The entrypoints now remove the files
+# themselves, but only in containers created from a rebuilt image; rdp1/rdp2
+# and dc1-dc5 keep the old entrypoint in their image layer (and rdp1 its domain
+# join in its writable layer), so they must NOT be recreated — clear the files
+# from the stopped container's layer instead. podman mount/unmount touch only
+# that layer, never the DCs' /opt/sc/lab-state bind mounts. Never fatal: a miss
+# only reproduces the old failure, which the bounded restart in
+# samba-ad-lab.service.d/ now contains (RDP) or costs signed time until the
+# next restart (DC).
+clear_stale_pidfiles() {   # $1 = container, $2.. = paths under its root; no-op while it is running
+    local n=$1 m f removed=""
+    shift
+    [[ "$(podman inspect -f '{{.State.Running}}' "$n" 2>/dev/null)" == true ]] && return 0
+    m=$(podman mount "$n" 2>/dev/null) && [[ -d $m ]] \
+        || { echo "  note: $n: podman mount failed; stale pidfiles not checked"; return 0; }
+    for f in "$@"; do
+        [[ -e "$m/$f" ]] && rm -f "$m/$f" && removed+=" ${f##*/}"
+    done
+    podman unmount "$n" >/dev/null 2>&1 || true
+    [[ -n $removed ]] && echo "  note: $n: removed stale$removed"
+    return 0
+}
+clear_stale_xrdp_pids() { clear_stale_pidfiles "$1" run/xrdp/xrdp-sesman.pid run/xrdp/xrdp.pid; }
+
 echo "== starting DCs =="
 for i in $(seq 1 "$DC_COUNT"); do
     n=$(dc_name "$i")
+    clear_stale_pidfiles "$n" run/chrony/chronyd.pid
     podman start "$n" >/dev/null && echo "  $n" || { echo "  $n FAILED to start"; exit 1; }
 done
 
@@ -34,29 +66,6 @@ for t in $(seq 1 90); do
 done
 [[ $ok == yes ]] || { echo "dc1 never served LDAP"; exit 1; }
 echo "  dc1 is serving"
-
-# /run is not a tmpfs inside the RDP targets, so a hard reset leaves
-# /run/xrdp/*.pid in their writable layer. sesman then sees "already running"
-# (the pid now belongs to dbus/sssd), the container exits 1, the exec below
-# fails and this script with it — samba-ad-lab.service looped 275x that way on
-# 2026-10-04. rdp-entrypoint.sh now removes the files itself, but only in
-# containers created from a rebuilt image; rdp1/rdp2 keep the old entrypoint in
-# their image layer and rdp1 its domain join in its writable layer, so they must
-# NOT be recreated — clear the files from the stopped container's layer instead.
-# Never fatal: a miss only reproduces the old failure, which the bounded
-# restart in samba-ad-lab.service.d/ now contains.
-clear_stale_xrdp_pids() {   # $1 = container; no-op while it is running
-    local n=$1 m f removed=""
-    [[ "$(podman inspect -f '{{.State.Running}}' "$n" 2>/dev/null)" == true ]] && return 0
-    m=$(podman mount "$n" 2>/dev/null) && [[ -d $m ]] \
-        || { echo "  note: $n: podman mount failed; stale xrdp pidfiles not checked"; return 0; }
-    for f in xrdp-sesman.pid xrdp.pid; do
-        [[ -e "$m/run/xrdp/$f" ]] && rm -f "$m/run/xrdp/$f" && removed+=" $f"
-    done
-    podman unmount "$n" >/dev/null 2>&1 || true
-    [[ -n $removed ]] && echo "  note: $n: removed stale$removed"
-    return 0
-}
 
 echo "== starting clients and RDP targets =="
 for i in $(seq 1 "$CLIENT_COUNT"); do

@@ -68,10 +68,10 @@ still:
 # then, if a DC was destroyed, replication self-heals
 ```
 
-### Failure mode: stale xrdp pidfile in an RDP target
+### Failure mode: stale pidfiles (xrdp in an RDP target, chronyd in a DC)
 
-`/run` is not a tmpfs inside the RDP targets, so a hard reset leaves
-`/run/xrdp/xrdp-sesman.pid` (and `xrdp.pid`) in the container's writable layer.
+`/run` is not a tmpfs inside the lab containers, so a hard reset leaves
+`/run/xrdp/xrdp-sesman.pid` (and `xrdp.pid`) in an RDP target's writable layer.
 On the next start that pid belongs to dbus or sssd, sesman refuses to start
 ("already running"), `rdp-entrypoint` exits 1, `21-start.sh`'s `podman exec`
 on the target fails and so does the unit. Symptom: `podman logs rdp1` ends in
@@ -90,6 +90,25 @@ rm -f "$m/run/xrdp/xrdp-sesman.pid" "$m/run/xrdp/xrdp.pid"
 podman unmount rdp1
 podman start rdp1
 ```
+
+The DCs have the same bug with `/run/chrony/chronyd.pid`: it survives any
+stop in the writable layer, chronyd refuses to start ("Another chronyd may
+already be running (pid=9)") and `dc-entrypoint.sh` only logs `WARNING:
+chronyd failed to start` — samba still comes up, but the DC serves no signed
+MS-SNTP time, so Windows members cannot sync from it (2026-10-04 and
+2026-10-15 boots). Same two fixes: `dc-entrypoint.sh` removes the pidfile
+before `chronyd -x` (only in DCs created from a rebuilt image) and `21-start.sh`
+clears it from each stopped DC's layer before `podman start`, through the same
+helper (`clear_stale_pidfiles`); `podman mount` touches only that layer, never
+the `/opt/sc/lab-state` bind mounts. Symptom: `podman exec dc1 pgrep chronyd`
+prints nothing. Recover a running DC in place, no restart needed:
+
+```bash
+podman exec dcN sh -c 'rm -f /run/chrony/chronyd.pid; chronyd -x -f /etc/chrony/adlab-dc.conf'
+```
+
+`ad2-dc1`/`ad2-dev-dc1` run an older image without chrony; none of this
+applies to them and they are never recreated for it.
 
 If a destroy/recreate briefly removed a DC, its replication partners may show a
 transient `WERR_NETNAME_DELETED` failure counter until the next successful
