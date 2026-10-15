@@ -31,12 +31,12 @@ open work appears. Memory only points here (`samba-ad-lab-todo`; incident record
 ## Code follow-ups
 
 - [x] **DC `chronyd` does not survive a container restart (regression of PR #33 signed time)** — `21-start.sh` part
-  done in PR #37: `clear_stale_pidfiles` (the PR #34 helper, generalised) clears `/run/chrony/chronyd.pid` from each
+  done in PR #38: `clear_stale_pidfiles` (the PR #34 helper, generalised) clears `/run/chrony/chronyd.pid` from each
   stopped DC's layer before `podman start`, and `dc-entrypoint.sh` removes it before `chronyd -x`. Stub-tested only;
   not yet exercised across a real DC restart or reboot. Manual recovery meanwhile:
   `podman exec dcN sh -c 'rm -f /run/chrony/chronyd.pid; chronyd -x -f /etc/chrony/adlab-dc.conf'`.
 - [ ] **Rebuild the DC image and rolling-recreate `dc1`–`dc5` so the `dc-entrypoint.sh` chronyd pidfile cleanup is
-  baked in (PR #37).** The running DCs keep the old entrypoint in their image layer, so until then only the
+  baked in (PR #38).** The running DCs keep the old entrypoint in their image layer, so until then only the
   `21-start.sh` pre-start cleanup protects them (the lab-start path only, not a bare `podman restart dcN`).
   Non-destructive for the primary DCs (their forest lives in `/opt/sc/lab-state`); one DC at a time, let replication
   settle (`30-verify.sh`). `ad2-dc1`/`ad2-dev-dc1` run an older image without chrony — never recreate them to "fix" this.
