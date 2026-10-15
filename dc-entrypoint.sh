@@ -90,6 +90,12 @@ fi
 # failure can never abort the DC itself.
 if command -v chronyd >/dev/null 2>&1 && [ -f /etc/chrony/adlab-dc.conf ]; then
     mkdir -p /run/chrony
+    # /run is NOT a tmpfs here: it is part of the writable layer and keeps the
+    # previous run's pidfile across a container restart, so chronyd refused to
+    # start ("Another chronyd may already be running (pid=9)") at the 2026-10-04
+    # and 2026-10-15 boots and the DCs served no signed time. Nothing is running
+    # yet when pid 1 reaches this line, so the file is always stale.
+    rm -f /run/chrony/chronyd.pid
     if chronyd -x -f /etc/chrony/adlab-dc.conf; then
         log "chronyd started — serving signed NTP to domain members"
     else
