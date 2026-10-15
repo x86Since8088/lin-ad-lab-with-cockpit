@@ -9,6 +9,13 @@ open work appears. Memory only points here (`samba-ad-lab-todo`; incident record
 
 ## Live state (verified 2026-10-15, after the 11:44 reboot)
 
+- `cockpit-adlab` **1.16.1** deployed 2026-10-15 20:29Z from merged main (`ff73a8f`, PR #35) —
+  `/usr/local/sbin/adlab-admin` -> `/opt/cockpit-adlab/payload-1.16.1/bin/adlab-admin`, post-install assertions ok,
+  `payload-1.16.0` retained for rollback. `config` now distinguishes `present`/`missing`/`unreadable`/`in-container`:
+  as eddie `admin_pass_file` is `status=unreadable exists=null` (was the false "missing"), as root `status=present`;
+  `gpo_template_dir` is `in-container` (it is a path inside a DC container, never on the host). `status` reports 17
+  containers; `domain-info`, `fsmo-show`, `dc-list`, `schema` all exercised against the new build.
+
 - `samba-ad-lab.timer` fires `samba-ad-lab.service` 45 s after boot; the service is **disabled** (no
   `multi-user.target.wants` link). This boot: timer fired 11:45:12, lab start ran 57 s, `Result=success`, `NRestarts=0`;
   `multi-user.target` reached at 25.4 s with no `samba-ad-lab` in its chain; power-profiles-daemon active at 11:44:57
@@ -65,9 +72,13 @@ open work appears. Memory only points here (`samba-ad-lab-todo`; incident record
   left alone"; the code does not); it is dormant only because `EXTRA_DOMAINS=()` in `/etc/samba-ad-lab/lab.env`. Give
   extra forests a state mount like `dc_state_args` and make both paths refuse to `rm` an existing container. Until then
   never run `20-up.sh` with `EXTRA_DOMAINS` set.
-- [ ] **`adlab-admin config` reports an unreadable file as missing** (adlab-admin 1.16.0 on edt1: `admin_pass_file`
-  exists=False as eddie, True as root). Fixed in **PR #35** (`fix/adlab-config-honest-path-status`, opened by another
-  session, open and unmerged on 2026-10-15). Delete this item when #35 merges.
+- [ ] **The Python suite must run as NON-ROOT; one test fails under `sudo`/the job runner.**
+  `test_config_verb_reports_resolved_paths` asserts `env_file_source == "env:ADLAB_ENV"`, but `$ADLAB_ENV` is honoured
+  only when `euid != 0` and the file is owned by the caller — deliberately, since "an env var that redirects a root
+  process's config is a privilege escalation" (`adlab-admin` L60–62). Run as root it resolves via `install.conf`
+  instead and the assertion fails. **Pre-existing, not a regression:** the same single test fails on 2fba7fb
+  (269 passed / 1 failed) exactly as on current main. Either skip it when `os.geteuid() == 0`, or document the suite as
+  non-root-only. As eddie: 273 passed.
 
 ## Owner decisions
 
