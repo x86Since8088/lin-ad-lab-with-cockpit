@@ -32,6 +32,7 @@
 !samba-ad-lab.timer
 !samba-ad-lab.service.d
 !samba-ad-lab.service.d/**
+!todo.md
 
 # ---- tracked trees ----------------------------------------------------------
 !docs
