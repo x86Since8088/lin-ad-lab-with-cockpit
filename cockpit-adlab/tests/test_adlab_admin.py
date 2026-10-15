@@ -589,6 +589,88 @@ class TestDomains(Base):
         self.assertTrue(apf.endswith("/administrator.pass"))
         self.assertNotIn("$", apf)
 
+    def test_config_path_states_distinguish_missing_from_unreadable(self):
+        # The defect this covers: os.path.exists() answers False both for
+        # "absent" and for "I could not look", and ADLAB_SECRET_DIR is 0700
+        # root:root -- so a non-root operator was told the admin password file
+        # was MISSING when it existed and was merely unreadable. os.stat is
+        # faked rather than using real 0000 dirs, because root bypasses
+        # directory permissions and the test must hold for either user.
+        import errno
+
+        present = mod._path_entry(__file__)
+        self.assertEqual(present["status"], "present")
+        self.assertIs(present["exists"], True)
+
+        missing = mod._path_entry("/nonexistent-adlab-%d/nope" % os.getpid())
+        self.assertEqual(missing["status"], "missing")
+        self.assertIs(missing["exists"], False)
+
+        real_stat = os.stat
+        def deny(path, *a, **kw):
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        os.stat = deny
+        try:
+            unreadable = mod._path_entry("/srv/secrets/administrator.pass")
+        finally:
+            os.stat = real_stat
+        # The whole point: NOT reported as absent.
+        self.assertEqual(unreadable["status"], "unreadable")
+        self.assertIsNone(unreadable["exists"])
+        self.assertIs(unreadable["exists"], None)
+        self.assertNotEqual(unreadable["exists"], False)
+        self.assertIn("root", unreadable["detail"])
+
+        unset = mod._path_entry("")
+        self.assertEqual(unset["status"], "unset")
+        self.assertIsNone(unset["exists"])
+
+    def test_config_never_calls_an_unreadable_credential_file_absent(self):
+        # Forcing test, written against the PUBLIC verb rather than the helper,
+        # so it fails on the old implementation for the right reason: it asked
+        # os.path.exists(), which returns False under EACCES, and reported the
+        # admin password file as absent on a healthy lab. Both os.stat and
+        # os.path.exists are denied here, which is what the kernel actually
+        # does when a parent directory is 0700 and the caller is not root.
+        import errno
+        real_stat, real_exists = os.stat, os.path.exists
+        target = mod.LAB["ADMIN_PASS_FILE"]
+
+        def deny_stat(path, *a, **kw):
+            if str(path) == target:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_stat(path, *a, **kw)
+
+        def deny_exists(path, *a, **kw):
+            return False if str(path) == target else real_exists(path, *a, **kw)
+
+        os.stat, os.path.exists = deny_stat, deny_exists
+        try:
+            rc, out = self.call_main(["config"])
+        finally:
+            os.stat, os.path.exists = real_stat, real_exists
+
+        self.assertEqual(rc, 0)
+        apf = out["paths"]["admin_pass_file"]
+        self.assertIsNot(apf["exists"], False,
+                         "an unreadable credential file must not be reported absent")
+        self.assertEqual(apf.get("status"), "unreadable")
+
+    def test_config_does_not_stat_container_paths_on_the_host(self):
+        # ADLAB_GPO_TEMPLATE_DIR is "as seen INSIDE a DC container" (.envdefault)
+        # and every use goes through `podman exec`, so the host filesystem
+        # cannot answer. Stat'ing it here reported false unconditionally, which
+        # read as a missing directory on a healthy lab.
+        rc, out = self.call_main(["config"])
+        self.assertEqual(rc, 0)
+        gpo = out["paths"]["gpo_template_dir"]
+        self.assertEqual(gpo["status"], "in-container")
+        self.assertIsNone(gpo["exists"])
+        self.assertIn("container", gpo["detail"])
+        # a host path in the same payload is still evaluated normally
+        self.assertIn(out["paths"]["lab_env"]["status"],
+                      ("present", "missing", "unreadable"))
+
     def test_lab_verb_fails_loudly_without_config(self):
         # DEPLOY-CONTRACT 4.3 step 3: with no resolved .env a LAB verb fails,
         # naming install.conf, while meta verbs stay usable for diagnosis.

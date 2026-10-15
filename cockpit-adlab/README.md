@@ -83,7 +83,7 @@ no page, no menu entry, no error anywhere an operator will look. A missing
 sibling is therefore diagnosed at runtime instead:
 
 ```bash
-/usr/local/sbin/adlab-admin config     # every key, its value, and whether it exists
+/usr/local/sbin/adlab-admin config     # every key, its value, and its state
 ```
 
 ## Tests

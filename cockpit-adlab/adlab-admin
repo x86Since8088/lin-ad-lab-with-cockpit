@@ -125,7 +125,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.16.0"
+VERSION = "1.16.1"
 
 
 def _require_config():
@@ -897,29 +897,70 @@ def v_version(a):
     return {"version": VERSION, "realm": LAB["REALM"],
             "domain": LAB["DOMAIN_DNS"], "netbios": LAB["DOMAIN_NB"]}
 
+# Module level, not a closure inside v_config, so the permission and
+# container branches below can be tested by faking os.stat.
+def _path_entry(path, scope="host"):
+    """Report a configured path's state honestly: present / missing /
+    unreadable / in-container / unset.
+
+    `os.path.exists()` is NOT good enough here, and that was a real defect.
+    It answers False both for "absent" and for "I could not look", and the
+    lab's credential directory is 0700 root:root -- so a non-root operator
+    running `config` was told ADMIN_PASS_FILE was MISSING when the file was
+    there and merely unreadable. `config` exists to stop exactly that class
+    of misleading diagnostic, so the states are kept distinct.
+
+    `exists` is retained for compatibility and stays STRICTLY three-valued:
+    True only when a stat succeeded, False only when the path is genuinely
+    absent, and null whenever we could not determine it. Read `status` to
+    tell those apart; never infer absence from a falsy `exists`.
+    """
+    if not path:
+        return {"path": path, "exists": None, "status": "unset"}
+    if scope == "container":
+        # Resolved INSIDE a DC container (every use goes through `podman
+        # exec`), so the host filesystem cannot answer the question. Stat'ing
+        # it here reported "false" unconditionally, which read as a missing
+        # directory on a perfectly healthy lab.
+        return {"path": path, "exists": None, "status": "in-container",
+                "detail": "evaluated inside a DC container, not on this host"}
+    try:
+        os.stat(path)
+        return {"path": path, "exists": True, "status": "present"}
+    except (FileNotFoundError, NotADirectoryError):
+        return {"path": path, "exists": False, "status": "missing"}
+    except PermissionError:
+        return {"path": path, "exists": None, "status": "unreadable",
+                "detail": "permission denied; re-run as root to confirm"}
+    except OSError as e:
+        return {"path": path, "exists": None, "status": "error",
+                "detail": e.strerror or str(e)}
+
+
 def v_config(a):
     # The operator's ground truth for configuration. adlab-admin reads
     # install.conf -> ENV_FILE -> the six ADLAB_* keys (DEPLOY-CONTRACT 4.3);
     # this reports which .env it read, how it got there, and every resolved
-    # path with whether it exists. README.md and .envdefault point here, so it
+    # path with its state. README.md and .envdefault point here, so it
     # must never go stale: it is computed, not written down.
-    def entry(path):
-        return {"path": path, "exists": bool(path) and os.path.exists(path)}
     return {
         "version": VERSION,
         "env_file": ENV_FILE,
         "env_file_source": ENV_SOURCE,   # env:ADLAB_ENV | install.conf | unresolved
         "install_conf": INSTALL_CONF,
         "install_conf_exists": os.path.exists(INSTALL_CONF),
+        "install_conf_state": _path_entry(INSTALL_CONF),
         "adlab_root": ADLAB_ROOT,
         "paths": {
-            "lab_env": entry(LAB_ENV),
-            "rdp_env": entry(RDP_ENV),
-            "sysvol_replicate": entry(SYSVOL_REPL),
-            "secret_dir": entry(SECRET_DIR),
-            "admin_pass_file": entry(LAB["ADMIN_PASS_FILE"]),
-            "gpo_template_dir": entry(GPO_TEMPLATE_DIR),
-            "audit_log": entry(AUDIT_LOG),
+            "lab_env": _path_entry(LAB_ENV),
+            "rdp_env": _path_entry(RDP_ENV),
+            "sysvol_replicate": _path_entry(SYSVOL_REPL),
+            "secret_dir": _path_entry(SECRET_DIR),
+            "admin_pass_file": _path_entry(LAB["ADMIN_PASS_FILE"]),
+            # ADLAB_GPO_TEMPLATE_DIR is a path inside a DC container -- see
+            # .envdefault: "as seen INSIDE a DC container".
+            "gpo_template_dir": _path_entry(GPO_TEMPLATE_DIR, scope="container"),
+            "audit_log": _path_entry(AUDIT_LOG),
         },
     }
 

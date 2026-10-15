@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.16.1 - 2026-10-15
+
+Stop `config` reporting a present file as missing.
+
+- **`config` conflated "absent" with "I could not look".** Each path was
+  reported with `os.path.exists()`, which returns False under `EACCES` just as
+  it does for a genuinely missing file. `ADLAB_SECRET_DIR` is `0700 root:root`,
+  so a non-root operator running `adlab-admin config` was told
+  `admin_pass_file` did **not exist** when the file was there and merely
+  unreadable. `config` is the diagnostic README.md and `.envdefault` point
+  operators at, so this was the exact class of misleading diagnostic the verb
+  exists to prevent. Paths now carry a `status` of `present` / `missing` /
+  `unreadable` / `in-container` / `unset`, and `exists` became strictly
+  three-valued: `true` only on a successful stat, `false` only for a genuinely
+  absent path, and `null` whenever it could not be determined. **Read `status`
+  to tell those apart; never infer absence from a falsy `exists`.**
+- **`config` stat'ed a container path on the host.** `ADLAB_GPO_TEMPLATE_DIR`
+  is "as seen INSIDE a DC container" (`.envdefault`) and every use goes through
+  `podman exec`, so the host filesystem cannot answer for it — it was reported
+  `false` unconditionally, which read as a missing directory on a healthy lab.
+  It now reports `status: in-container` and `exists: null`.
+- `install_conf_exists` is unchanged for compatibility; the same information is
+  now also available, with a status, as `install_conf_state`.
+- Tests: the helper is now module-level `_path_entry` so the permission and
+  container branches are testable without root (`os.stat` is faked, because
+  root bypasses directory permissions and the test must hold for either user).
+  Added a forcing test written against the public `config` verb that fails on
+  the old implementation for the right reason.
+
 ## 1.11.2 - 2026-09-19
 
 Fix a deploy-time regression that could take the live plugin down.
