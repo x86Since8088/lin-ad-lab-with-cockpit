@@ -36,6 +36,7 @@ stdlib only. No pip. Python 3.9+.
 import base64
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -125,7 +126,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.16.1"
+VERSION = "1.17.0"
 
 
 def _require_config():
@@ -4915,6 +4916,139 @@ def v_pki_ntauth_list(a):
             cas.append({"index": i, "info": info})
     return {"ntauth_dn": _ntauth_dn(), "present": True, "cas": cas, "count": len(cas)}
 
+# ---- CA public-key viewer (read-only; PUBLIC material only) -----------------
+# Never reads ca.key: only /ca/ca.crt (via _ca_cert_pem) and the cACertificate
+# attributes published in AD. Decoding runs on the host openssl from a PEM
+# built in Python, so it also works for CAs that are not ours.
+_FP_RE = re.compile(r'^[0-9a-fA-F]{8,64}$')
+
+def _der_to_pem(der):
+    b = base64.b64encode(der).decode()
+    return "-----BEGIN CERTIFICATE-----\n%s\n-----END CERTIFICATE-----\n" % \
+        "\n".join(b[i:i + 64] for i in range(0, len(b), 64))
+
+def _pem_to_der(pem):
+    m = re.search(r'-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----', pem or "", re.S)
+    if not m:
+        raise Fail("not a PEM certificate")
+    return base64.b64decode("".join(m.group(1).split()))
+
+def _cert_detail(der, with_pem=False):
+    """Decode one DER cert: subject/issuer/serial/validity/key alg+size, the
+    SHA-256 cert fingerprint and the SHA-256 SPKI (public-key) fingerprint."""
+    pem = _der_to_pem(der)
+    rc, out, err = RUN.run(["openssl", "x509", "-noout", "-text", "-pubkey", "-serial",
+                            "-subject", "-issuer", "-startdate", "-enddate",
+                            "-nameopt", "RFC2253"], stdin=pem)
+    if rc != 0:
+        raise Fail("openssl could not parse the certificate: " + (err or "").strip()[-200:])
+    def g(rx):
+        m = re.search(rx, out, re.M)
+        return m.group(1).strip() if m else ""
+    pk = re.search(r'-----BEGIN PUBLIC KEY-----.*?-----END PUBLIC KEY-----', out, re.S)
+    pub = (pk.group(0) + "\n") if pk else ""
+    spki = ""
+    if pub:
+        spki = hashlib.sha256(base64.b64decode("".join(pub.splitlines()[1:-1]))).hexdigest()
+    alg = g(r'Public Key Algorithm:\s*(.+)$')
+    bits = g(r'Public-Key:\s*\((\d+) bit\)')
+    curve = g(r'ASN1 OID:\s*(\S+)')
+    d = {"id": hashlib.sha256(der).hexdigest(),
+         "subject": g(r'^subject=(.*)$'), "issuer": g(r'^issuer=(.*)$'),
+         "serial": g(r'^serial=(.*)$'),
+         "not_before": g(r'^notBefore=(.*)$'), "not_after": g(r'^notAfter=(.*)$'),
+         "key_algorithm": alg, "key_bits": int(bits) if bits else 0,
+         "curve": curve,
+         "sha256_fingerprint": hashlib.sha256(der).hexdigest().upper(),
+         "spki_sha256": spki.upper()}
+    d["self_signed"] = bool(d["subject"]) and d["subject"] == d["issuer"]
+    if with_pem:
+        d["cert_pem"] = pem
+        d["public_key_pem"] = pub
+    return d
+
+def _ad_cacerts(d, dn, scope):
+    """DER blobs of every cACertificate under dn (scope base|one)."""
+    rc, out, _ = podman(d, ["ldbsearch", "-H", SAM, "--cross-ncs", "-b", dn,
+                            "-s", scope, "cACertificate"])
+    res = []
+    if rc != 0:
+        return res
+    for e in parse_ldif_full(out or ""):
+        for hexval in e["attrs"].get("cACertificate", []):
+            try:
+                res.append((e["dn"], bytes.fromhex(hexval)))
+            except ValueError:
+                continue
+    return res
+
+def _collect_cas(source="all"):
+    """Every CA cert we can see, de-duplicated by SHA-256 of the DER, each noting
+    where it is published. Returns (cas, errors); cas carry a private _der."""
+    found, errors = {}, []
+    def add(der, where):
+        k = hashlib.sha256(der).hexdigest()
+        e = found.setdefault(k, {"der": der, "published_in": []})
+        if where not in e["published_in"]:
+            e["published_in"].append(where)
+    if source in ("all", "node"):
+        if _ca_has_root():
+            pem = _ca_cert_pem()
+            if pem:
+                add(_pem_to_der(pem), "node")
+    if source in ("all", "ad"):
+        try:
+            d = pdc_emulator()
+            for _, der in _ad_cacerts(d, _cas_dn(), "one"):
+                add(der, "root-trust")
+            for _, der in _ad_cacerts(d, _aia_dn(), "one"):
+                add(der, "aia")
+            for _, der in _ad_cacerts(d, _ntauth_dn(), "base"):
+                add(der, "ntauth")
+        except Fail as e:
+            errors.append("AD: %s" % e)
+    return found, errors
+
+def v_pki_ca_list(a):
+    """Every CA certificate visible: the CA node's root plus the certs published in
+    AD (root-trust, AIA, NTAuthCertificates), de-duplicated by fingerprint."""
+    src = (a.get("source") or "all").lower()
+    found, errors = _collect_cas(src)
+    cas = []
+    for k, e in found.items():
+        try:
+            det = _cert_detail(e["der"])
+        except Fail as ex:
+            errors.append("%s: %s" % (k[:12], ex))
+            continue
+        det["published_in"] = e["published_in"]
+        det["is_node_ca"] = "node" in e["published_in"]
+        cas.append(det)
+    cas.sort(key=lambda c: (not c["is_node_ca"], c["subject"]))
+    return {"source": src, "cas": cas, "count": len(cas), "errors": errors}
+
+def v_pki_ca_cert(a):
+    """Public key + certificate of one CA: details, cert PEM and public-key PEM.
+    id = SHA-256 cert fingerprint (full or >=8-hex prefix) from pki-ca-list;
+    omitted = the CA node's own root."""
+    fid = str(a.get("id") or "").strip().replace(":", "")
+    if fid and not _FP_RE.match(fid):
+        raise Fail("id must be 8-64 hex chars (a pki-ca-list fingerprint)")
+    found, errors = _collect_cas("all" if fid else "node")
+    if fid:
+        hits = [k for k in found if k.startswith(fid.lower())]
+    else:
+        hits = list(found)
+    if not hits:
+        raise Fail("no such CA certificate" + (" (%s)" % "; ".join(errors) if errors else ""))
+    if len(hits) > 1:
+        raise Fail("ambiguous id: matches %d certificates" % len(hits))
+    e = found[hits[0]]
+    det = _cert_detail(e["der"], with_pem=True)
+    det["published_in"] = e["published_in"]
+    det["is_node_ca"] = "node" in e["published_in"]
+    return det
+
 # ---- domain-integrated certificate templates (pKICertificateTemplate) -------
 _KU_BITS = {"digitalSignature": 0x80, "nonRepudiation": 0x40, "keyEncipherment": 0x20,
             "dataEncipherment": 0x10, "keyAgreement": 0x08, "keyCertSign": 0x04,
@@ -7314,6 +7448,13 @@ VERBS = {
                                    help_="true = also delete the NTAuthCertificates object")]},
     "pki-ntauth-list": {"fn": v_pki_ntauth_list, "group": "pki",
                       "help": "CAs currently trusted for smartcard/PKINIT logon (contents of NTAuthCertificates)."},
+    "pki-ca-list":    {"fn": v_pki_ca_list, "group": "pki",
+                      "help": "Every CA certificate visible (CA node root + AD root-trust/AIA/NTAuthCertificates), de-duplicated by fingerprint, with subject, key algorithm/size, validity and where it is published. Read-only.",
+                      "args": [arg("source", "enum", required=False, choices=["all", "node", "ad"], default="all",
+                                   help_="where to look (default: all)")]},
+    "pki-ca-cert":    {"fn": v_pki_ca_cert, "group": "pki",
+                      "help": "Public key and certificate of one CA: subject/issuer/serial/validity, key algorithm+size, SHA-256 cert and public-key fingerprints, public-key PEM and cert PEM. Never touches the private key. Read-only.",
+                      "args": [arg("id", required=False, help_="SHA-256 cert fingerprint (hex, 8-64 chars) from pki-ca-list; default: the CA node's root")]},
     "pki-template-list": {"fn": v_pki_template_list, "group": "pki",
                       "help": "Certificate templates in AD (pKICertificateTemplate) plus the standard set this helper can seed."},
     "pki-template-seed": {"fn": v_pki_template_seed, "group": "pki",

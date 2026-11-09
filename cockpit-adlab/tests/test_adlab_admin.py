@@ -3202,6 +3202,110 @@ class TestPki(Base):
         self.assertIn("extendedKeyUsage=1.3.6.1.5.5.7.3.1", signed[0])   # serverAuth
 
 
+    # ---- CA public-key viewer ----
+    def _mk_cert(self, cn):
+        import subprocess, tempfile, shutil
+        d = tempfile.mkdtemp()
+        try:
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                            "-keyout", d + "/k.pem", "-out", d + "/c.pem", "-days", "30",
+                            "-subj", "/CN=%s/O=Lab" % cn], check=True, capture_output=True)
+            return open(d + "/c.pem").read()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _ca_fakes(self, node_pem, ad_pem):
+        import subprocess
+        f, b = self.fake, self._body
+        # decoding goes to the REAL host openssl so the assertions are against real output
+        f.on(lambda a: a[0] == "openssl",
+             out="")  # placeholder replaced below
+        f.rules.pop()
+        orig = f.run
+        def run(argv, stdin=None, timeout=120):
+            if argv[0] == "openssl":
+                f.calls.append((list(argv), stdin))
+                p = subprocess.run(argv, input=stdin, capture_output=True, text=True)
+                return p.returncode, p.stdout, p.stderr
+            return orig(argv, stdin, timeout)
+        f.run = run
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "test -f" in b(a), rc=0)
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "cat /ca/ca.crt" in b(a), out=node_pem)
+        def ldif(dn, pems):
+            o = ""
+            for pem in pems:
+                o += "dn: %s\ncACertificate:: %s\n\n" % (dn, base64.b64encode(mod._pem_to_der(pem)).decode())
+            return o
+        f.on(lambda a: "ldbsearch" in a and a[a.index("-b") + 1] == mod._cas_dn(),
+             out=ldif("CN=Node,CN=Certification Authorities", [node_pem, ad_pem]))
+        f.on(lambda a: "ldbsearch" in a and a[a.index("-b") + 1] == mod._aia_dn(),
+             out=ldif("CN=Node,CN=AIA", [node_pem]))
+        f.on(lambda a: "ldbsearch" in a and a[a.index("-b") + 1] == mod._ntauth_dn(),
+             out=ldif("CN=NTAuthCertificates", [node_pem, ad_pem]))
+        f.lab_up()
+
+    def test_ca_list_dedupes_and_notes_publication(self):
+        node, other = self._mk_cert("Node Root CA"), self._mk_cert("Foreign CA")
+        self._ca_fakes(node, other)
+        rc, out = self.call_main(["pki-ca-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["count"], 2)
+        n = out["cas"][0]
+        self.assertTrue(n["is_node_ca"])
+        self.assertEqual(sorted(n["published_in"]), ["aia", "node", "ntauth", "root-trust"])
+        self.assertEqual(n["key_algorithm"], "rsaEncryption")
+        self.assertEqual(n["key_bits"], 2048)
+        self.assertIn("Node Root CA", n["subject"])
+        self.assertEqual(out["cas"][1]["published_in"], ["root-trust", "ntauth"])
+        self.assertNotIn("cert_pem", n)
+
+    def test_ca_cert_returns_public_key_and_fingerprints(self):
+        import subprocess
+        node, other = self._mk_cert("Node Root CA"), self._mk_cert("Foreign CA")
+        self._ca_fakes(node, other)
+        rc, out = self.call_main(["pki-ca-cert"])           # default = node root
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Node Root CA", out["subject"])
+        self.assertEqual(out["cert_pem"], node)
+        self.assertTrue(out["public_key_pem"].startswith("-----BEGIN PUBLIC KEY-----"))
+        # compare against openssl's own fingerprint + pubkey
+        fp = subprocess.run(["openssl", "x509", "-noout", "-fingerprint", "-sha256"], input=node,
+                            capture_output=True, text=True).stdout.split("=")[1].strip().replace(":", "")
+        self.assertEqual(out["sha256_fingerprint"], fp)
+        pub = subprocess.run(["openssl", "x509", "-noout", "-pubkey"], input=node,
+                             capture_output=True, text=True).stdout
+        self.assertEqual(out["public_key_pem"], pub)
+        spki = subprocess.run("openssl x509 -noout -pubkey | openssl pkey -pubin -outform DER | sha256sum",
+                              shell=True, input=node, capture_output=True, text=True).stdout.split()[0]
+        self.assertEqual(out["spki_sha256"].lower(), spki)
+        # by id prefix: a CA that only exists in AD
+        rc, out2 = self.call_main(["pki-ca-cert", "--id", mod._cert_detail(mod._pem_to_der(other))["id"][:12]])
+        self.assertEqual(rc, 0, out2)
+        self.assertIn("Foreign CA", out2["subject"])
+        self.assertFalse(out2["is_node_ca"])
+        # the private key is never read or returned
+        blob = json.dumps(out) + json.dumps(out2)
+        self.assertNotIn("PRIVATE KEY", blob)
+        for argv, _ in self.fake.calls:
+            self.assertNotIn("ca.key", " ".join(map(str, argv)))
+
+    def test_ca_cert_rejects_bad_id_and_unknown(self):
+        node, other = self._mk_cert("Node Root CA"), self._mk_cert("Foreign CA")
+        self._ca_fakes(node, other)
+        rc, out = self.call_main(["pki-ca-cert", "--id", "x; rm -rf /"])
+        self.assertNotEqual(rc, 0)
+        rc, out = self.call_main(["pki-ca-cert", "--id", "deadbeefdeadbeef"])
+        self.assertNotEqual(rc, 0)
+
+    def test_ca_list_survives_ad_failure(self):
+        node, other = self._mk_cert("Node Root CA"), self._mk_cert("Foreign CA")
+        self._ca_fakes(node, other)
+        self.fake.rules = [r for r in self.fake.rules if not r[0](["podman", "exec", "dc1", "samba-tool", "fsmo", "show"])]
+        rc, out = self.call_main(["pki-ca-list", "--source", "node"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["count"], 1)
+
+
 DELEG_LDIF = """dn: CN=DC1,OU=Domain Controllers,DC=ad,DC=edt1,DC=lab
 sAMAccountName: DC1$
 userAccountControl: 532480
