@@ -126,7 +126,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.17.0"
+VERSION = "1.18.0"
 
 
 def _require_config():
@@ -4962,6 +4962,16 @@ def _cert_detail(der, with_pem=False):
          "sha256_fingerprint": hashlib.sha256(der).hexdigest().upper(),
          "spki_sha256": spki.upper()}
     d["self_signed"] = bool(d["subject"]) and d["subject"] == d["issuer"]
+    def hexid(rx):
+        m = re.search(rx, out)
+        return m.group(1).replace(":", "").upper() if m else ""
+    d["ski"] = hexid(r'Subject Key Identifier:\s*\n\s*([0-9A-Fa-f:]+)')
+    d["aki"] = hexid(r'Authority Key Identifier:\s*\n\s*(?:keyid:)?([0-9A-Fa-f:]+)')
+    bc = re.search(r'Basic Constraints:[^\n]*\n\s*([^\n]+)', out)
+    bct = bc.group(1) if bc else ""
+    d["is_ca"] = "CA:TRUE" in bct
+    pl = re.search(r'pathlen:(\d+)', bct)
+    d["path_len"] = int(pl.group(1)) if pl else None
     if with_pem:
         d["cert_pem"] = pem
         d["public_key_pem"] = pub
@@ -4996,6 +5006,15 @@ def _collect_cas(source="all"):
             pem = _ca_cert_pem()
             if pem:
                 add(_pem_to_der(pem), "node")
+    if source in ("all", "node") and _ca_deployed():
+        # intermediate CAs created on the node (public certs only)
+        rc, out, _ = _ca_run("cat /ca/intermediates/*/ca.crt 2>/dev/null")
+        if rc == 0:
+            for m in re.finditer(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', out or "", re.S):
+                try:
+                    add(_pem_to_der(m.group(0)), "node-intermediate")
+                except Fail:
+                    pass
     if source in ("all", "ad"):
         try:
             d = pdc_emulator()
@@ -5023,8 +5042,9 @@ def v_pki_ca_list(a):
             continue
         det["published_in"] = e["published_in"]
         det["is_node_ca"] = "node" in e["published_in"]
+        det["is_node_intermediate"] = "node-intermediate" in e["published_in"]
         cas.append(det)
-    cas.sort(key=lambda c: (not c["is_node_ca"], c["subject"]))
+    cas.sort(key=lambda c: (not c["is_node_ca"], not c["is_node_intermediate"], c["subject"]))
     return {"source": src, "cas": cas, "count": len(cas), "errors": errors}
 
 def v_pki_ca_cert(a):
@@ -5038,7 +5058,7 @@ def v_pki_ca_cert(a):
     if fid:
         hits = [k for k in found if k.startswith(fid.lower())]
     else:
-        hits = list(found)
+        hits = [k for k, e in found.items() if "node" in e["published_in"]]
     if not hits:
         raise Fail("no such CA certificate" + (" (%s)" % "; ".join(errors) if errors else ""))
     if len(hits) > 1:
@@ -5048,6 +5068,190 @@ def v_pki_ca_cert(a):
     det["published_in"] = e["published_in"]
     det["is_node_ca"] = "node" in e["published_in"]
     return det
+
+# ---- CA chain (read-only) + intermediate CA ---------------------------------
+# Chain building uses PUBLIC certificates only: the node root/intermediates,
+# the AD cACertificate values, and one issued leaf read from /ca/issued/*.crt.
+# Signature steps are checked by the host openssl with argv lists.
+_ISSUED_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*\.crt\Z')
+_INT_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z')
+CHAIN_MAX_DEPTH = 8
+
+def _sig_verifies(child_der, issuer_der):
+    """True if child's signature verifies under issuer (single-step trust)."""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="adlab-chain-") as td:
+        ip, cp = os.path.join(td, "issuer.pem"), os.path.join(td, "child.pem")
+        with open(ip, "w") as f: f.write(_der_to_pem(issuer_der))
+        with open(cp, "w") as f: f.write(_der_to_pem(child_der))
+        rc, _, _ = RUN.run(["openssl", "verify", "-partial_chain", "-no_check_time",
+                            "-CAfile", ip, cp])
+    return rc == 0
+
+def _chain_build(leaf_der, pool):
+    """Walk leaf -> root. pool = {sha256hex: {der, published_in}}. Returns
+    (steps, status_core) where status_core is complete|incomplete."""
+    leaf_id = hashlib.sha256(leaf_der).hexdigest()
+    details = {}
+    def det(k, der):
+        if k not in details:
+            details[k] = _cert_detail(der)
+        return details[k]
+    cur_k, cur_der = leaf_id, leaf_der
+    steps, seen, note = [], {leaf_id}, ""
+    status = "incomplete"
+    for _ in range(CHAIN_MAX_DEPTH):
+        cd = det(cur_k, cur_der)
+        step = {"id": cur_k, "subject": cd["subject"], "issuer": cd["issuer"],
+                "not_after": cd["not_after"], "sha256_fingerprint": cd["sha256_fingerprint"],
+                "published_in": (pool.get(cur_k) or {}).get("published_in", []),
+                "is_ca": cd["is_ca"], "ski": cd["ski"], "aki": cd["aki"],
+                "path_len": cd["path_len"], "signature_ok": None}
+        steps.append(step)
+        if cd["self_signed"]:
+            step["signature_ok"] = _sig_verifies(cur_der, cur_der)
+            status = "complete" if step["signature_ok"] else "incomplete"
+            if not step["signature_ok"]:
+                note = "self-signed certificate does not verify against itself"
+            break
+        cands = []
+        for k, e in pool.items():
+            if k in seen:
+                continue
+            try:
+                ck = det(k, e["der"])
+            except Fail:
+                continue
+            if cd["aki"] and ck["ski"]:
+                if cd["aki"] == ck["ski"]:
+                    cands.append((0, k))
+            elif ck["subject"] == cd["issuer"]:
+                cands.append((1, k))
+        # AKI missing/mismatching on every candidate: fall back to issuer DN
+        if not cands:
+            for k, e in pool.items():
+                if k in seen:
+                    continue
+                try:
+                    if det(k, e["der"])["subject"] == cd["issuer"]:
+                        cands.append((2, k))
+                except Fail:
+                    continue
+        nxt = None
+        for _, k in sorted(cands):
+            if _sig_verifies(cur_der, pool[k]["der"]):
+                nxt = k
+                break
+        if nxt is None:
+            step["signature_ok"] = False if cands else None
+            note = ("issuer certificate not found: %s" % cd["issuer"] if not cands
+                    else "no candidate issuer's signature verifies")
+            break
+        step["signature_ok"] = True
+        seen.add(nxt)
+        cur_k, cur_der = nxt, pool[nxt]["der"]
+    else:
+        note = "maximum chain depth (%d) reached" % CHAIN_MAX_DEPTH
+    return steps, status, note
+
+def v_pki_ca_chain(a):
+    """Certificate chain leaf -> root for a CA certificate (id = fingerprint from
+    pki-ca-list; default the node root) or an issued certificate (issued = file
+    name from pki-cert-list). Read-only; public material only."""
+    fid = str(a.get("id") or "").strip().replace(":", "")
+    issued = str(a.get("issued") or "")
+    if fid and issued:
+        raise Fail("give either id or issued, not both")
+    if fid and not _FP_RE.match(fid):
+        raise Fail("id must be 8-64 hex chars (a pki-ca-list fingerprint)")
+    if issued and (not _ISSUED_RE.match(issued) or ".." in issued or len(issued) > 200):
+        raise Fail("issued must be a certificate file name from pki-cert-list (letters, digits, . _ - and ending in .crt)")
+    pool, errors = _collect_cas("all")
+    if issued:
+        if not _ca_deployed():
+            raise Fail("CA node not deployed")
+        rc, out, _ = _ca_run("cat /ca/issued/%s 2>/dev/null" % shq(issued))
+        m = re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', out or "", re.S)
+        if rc != 0 or not m:
+            raise Fail("no such issued certificate: " + issued)
+        leaf_der = _pem_to_der(m.group(0))
+        lk = hashlib.sha256(leaf_der).hexdigest()
+        pool.setdefault(lk, {"der": leaf_der, "published_in": ["issued"]})
+    else:
+        if fid:
+            hits = [k for k in pool if k.startswith(fid.lower())]
+        else:
+            hits = [k for k, e in pool.items() if "node" in e["published_in"]]
+        if not hits:
+            raise Fail("no such CA certificate" + (" (%s)" % "; ".join(errors) if errors else ""))
+        if len(hits) > 1:
+            raise Fail("ambiguous id: matches %d certificates" % len(hits))
+        lk = hits[0]
+        leaf_der = pool[lk]["der"]
+    steps, status, note = _chain_build(leaf_der, pool)
+    ad_ok = not any(e.startswith("AD:") for e in errors)
+    trusted = None
+    if status == "complete":
+        root = pool.get(steps[-1]["id"]) or {}
+        if ad_ok:
+            trusted = "root-trust" in root.get("published_in", [])
+            if not trusted:
+                status = "untrusted"
+                note = "root is not in the AD Certification Authorities (root-trust) container"
+    chain_pem = "".join(_der_to_pem((pool[s_["id"]])["der"]) for s_ in steps)
+    return {"status": status, "length": len(steps), "trusted": trusted, "note": note,
+            "steps": steps, "chain_pem": chain_pem, "errors": errors}
+
+def v_pki_intermediate_create(a):
+    """Create an intermediate CA on the CA node (/ca/intermediates/<name>/),
+    signed by the root with basicConstraints CA:TRUE,pathlen:0. The root key
+    never leaves the node. Idempotent. publish=true also adds the intermediate
+    to the AD AIA container."""
+    if not _ca_has_root():
+        raise Fail("CA node not deployed - run pki-ca-deploy first")
+    name = str(a.get("name") or "").strip()
+    if not _INT_NAME_RE.match(name) or ".." in name:
+        raise Fail("name must be 1-64 chars: letters, digits, . _ - (starting with a letter or digit)")
+    cn = (a.get("cn") or name).strip()
+    if not re.match(r'^[A-Za-z0-9 ._()-]{1,64}$', cn):
+        raise Fail("cn may contain letters, digits, space and . _ ( ) -")
+    days = int(a.get("days", 1825) or 1825)
+    keybits = int(a.get("key_bits", 3072) or 3072)
+    if not (1 <= days <= 7300) or keybits not in (2048, 3072, 4096):
+        raise Fail("days must be 1-7300 and key_bits 2048, 3072 or 4096")
+    d_ = "/ca/intermediates/" + name
+    ext = ("basicConstraints=critical,CA:TRUE,pathlen:0\\n"
+           "keyUsage=critical,keyCertSign,cRLSign\\n"
+           "subjectKeyIdentifier=hash\\n"
+           "authorityKeyIdentifier=keyid,issuer\\n")
+    body = (
+        "set -e; D=%s; "
+        "if [ -s $D/ca.crt ]; then echo exists; else "
+        "mkdir -p $D; chmod 700 $D; "
+        "openssl genrsa -out $D/ca.key %d >/dev/null 2>&1; chmod 600 $D/ca.key; "
+        "openssl req -new -key $D/ca.key -subj %s -out $D/ca.csr >/dev/null 2>&1; "
+        "printf %s > $D/ext.cnf; "
+        "openssl x509 -req -in $D/ca.csr -CA /ca/ca.crt -CAkey /ca/ca.key -CAcreateserial "
+        "-days %d -sha256 -extfile $D/ext.cnf -out $D/ca.crt >/dev/null 2>&1; "
+        "rm -f $D/ext.cnf; echo created; fi; cat $D/ca.crt"
+    ) % (shq(d_), keybits, shq("/O=EDT1 Lab/CN=%s" % cn), shq(ext), days)
+    rc, out, err = _ca_run(body, timeout=180)
+    m = re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', out or "", re.S)
+    if rc != 0 or not m:
+        raise Fail("intermediate create failed: " + (err.strip() or out.strip())[-400:])
+    der = _pem_to_der(m.group(0))
+    det = _cert_detail(der)
+    res = {"name": name, "cn": cn, "created": out.lstrip().startswith("created"),
+           "id": det["id"], "subject": det["subject"], "issuer": det["issuer"],
+           "not_after": det["not_after"], "sha256_fingerprint": det["sha256_fingerprint"],
+           "path_len": det["path_len"], "key_on_node": d_ + "/ca.key",
+           "cert_pem": m.group(0) + "\n", "published": None}
+    if str(a.get("publish", "")).lower() in ("1", "yes", "true"):
+        pd = pdc_emulator()
+        dn = "CN=%s,%s" % (cn, _aia_dn())
+        res["published"] = _upsert_ca_object(
+            pd, dn, cn, base64.b64encode(der).decode(), _ca_crl_der_b64())
+    return res
 
 # ---- domain-integrated certificate templates (pKICertificateTemplate) -------
 _KU_BITS = {"digitalSignature": 0x80, "nonRepudiation": 0x40, "keyEncipherment": 0x20,
@@ -7455,6 +7659,18 @@ VERBS = {
     "pki-ca-cert":    {"fn": v_pki_ca_cert, "group": "pki",
                       "help": "Public key and certificate of one CA: subject/issuer/serial/validity, key algorithm+size, SHA-256 cert and public-key fingerprints, public-key PEM and cert PEM. Never touches the private key. Read-only.",
                       "args": [arg("id", required=False, help_="SHA-256 cert fingerprint (hex, 8-64 chars) from pki-ca-list; default: the CA node's root")]},
+    "pki-ca-chain":   {"fn": v_pki_ca_chain, "group": "pki",
+                      "help": "Certificate chain leaf -> root for a CA certificate (id) or an issued certificate (issued = file from pki-cert-list): ordered steps with subject/issuer/expiry/fingerprint, signature verified per step, status complete|incomplete|untrusted and the concatenated chain PEM. Read-only, public material only.",
+                      "args": [arg("id", required=False, help_="SHA-256 cert fingerprint (hex, 8-64 chars) from pki-ca-list; default: the CA node's root"),
+                               arg("issued", required=False, help_="issued certificate file name from pki-cert-list (e.g. web01-webserver.crt); instead of id")]},
+    "pki-intermediate-create": {"fn": v_pki_intermediate_create, "group": "pki",
+                      "help": "Create an intermediate CA on the CA node (/ca/intermediates/<name>/), signed by the root with CA:TRUE,pathlen:0. The root key stays on the node. Idempotent. Optionally publish it to AD AIA.",
+                      "args": [arg("name", help_="intermediate name (letters, digits, . _ -), e.g. AD-EDT1-Lab-Issuing-CA-1"),
+                               arg("cn", required=False, help_="subject CN (default: the name)"),
+                               arg("days", "int", required=False, default=1825, help_="validity in days (default 1825)"),
+                               arg("key_bits", "enum", required=False, choices=["2048", "3072", "4096"], default="3072", help_="RSA key size"),
+                               arg("publish", "enum", required=False, choices=["true", "false"], default="false",
+                                   help_="true = also add it to the AD AIA container")]},
     "pki-template-list": {"fn": v_pki_template_list, "group": "pki",
                       "help": "Certificate templates in AD (pKICertificateTemplate) plus the standard set this helper can seed."},
     "pki-template-seed": {"fn": v_pki_template_seed, "group": "pki",

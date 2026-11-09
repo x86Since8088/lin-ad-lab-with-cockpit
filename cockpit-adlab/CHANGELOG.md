@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.18.0 - 2026-11-09
+
+CA chain view on the PKI tab, plus intermediate CAs.
+
+- **New read-only verb `pki-ca-chain`** (`--id <fingerprint>` or `--issued <file>`
+  from `pki-cert-list`). Builds the path leaf -> root over the certs the helper can
+  see (node root and intermediates, AD root-trust/AIA/NTAuth) by matching
+  Authority Key ID -> Subject Key ID, falling back to issuer DN == subject DN, and
+  checks every signature step with `openssl verify -partial_chain` (argv lists, no
+  shell). Loop guard and a maximum depth of 8. Returns ordered steps and a status:
+  `complete`, `incomplete` (issuer missing / signature does not verify) or
+  `untrusted` (root not in the AD root-trust container), plus `chain_pem`
+  (leaf first). `--issued` is validated (`^[A-Za-z0-9][A-Za-z0-9._-]*\.crt$`) and
+  only ever read from `/ca/issued`; private keys are never read or returned.
+- **New verb `pki-intermediate-create`** (`name`, optional `cn`, `days`,
+  `key_bits`, `publish`): creates an intermediate CA on the CA node under
+  `/ca/intermediates/<name>/` (key mode 600), signed by the root with
+  `basicConstraints critical CA:TRUE,pathlen:0`, `keyCertSign,cRLSign`, SKI/AKI.
+  Idempotent. `publish=true` also adds it to the AD AIA container (not
+  root-trust). The root key stays on the node.
+- `pki-ca-list` / `pki-ca-cert` now include intermediates found on the node
+  (`published_in: node-intermediate`) and report `ski`, `aki`, `is_ca`, `path_len`.
+- **UI:** the CA view modal gains a Chain section (ordered steps, per-step
+  signature and status badges; clicking a CA step opens that cert, Back walks
+  back; "Download chain (.pem)"); each issued certificate has a **View chain**
+  action (`#/pki?modal=pki-chain-view&target=<file>`); a **Create intermediate**
+  action button.
+- Tests: 12 new `TestPkiChain` cases on real openssl root -> intermediate -> leaf
+  fixtures (ordering, complete/incomplete/untrusted, same-DN wrong-key issuer,
+  cross-signed loop, depth cap, filename validation, no private key in output).
+
 ## 1.17.0 - 2026-11-09
 
 View the public keys / certificates of the CAs on the PKI tab.

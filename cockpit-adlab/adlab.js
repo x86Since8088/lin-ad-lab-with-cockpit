@@ -331,6 +331,7 @@
             case "object-edit":   objectEditModal(target); break;
             case "object-attrs":  objectAttrsModal(target); break;
             case "pki-ca-view":   pkiCaViewModal(target); break;
+            case "pki-chain-view": pkiChainViewModal(target); break;
             default: /* unknown — leave nothing */ break;
         }
     }
@@ -3031,6 +3032,7 @@
         acts.appendChild(actionButton("Publish to AD", "pki-ca-publish", {}));
         acts.appendChild(actionButton("Seed templates", "pki-template-seed", {}));
         acts.appendChild(actionButton("Issue certificate", "pki-issue", {}));
+        acts.appendChild(actionButton("Create intermediate", "pki-intermediate-create", {}));
         var refresh = el("button", "al-btn secondary", "Refresh");
         refresh.addEventListener("click", function () { refreshTab(); });
         acts.appendChild(refresh);
@@ -3100,9 +3102,10 @@
                 function (c) {
                     var subj = el("span", null, c.subject || "(no subject)");
                     if (c.is_node_ca) { subj.appendChild(document.createTextNode(" ")); subj.appendChild(badge("CA node", "ok")); }
+                    if (c.is_node_intermediate) { subj.appendChild(document.createTextNode(" ")); subj.appendChild(badge("intermediate", "warn")); }
                     var pub = el("span");
                     (c.published_in || []).forEach(function (w) {
-                        pub.appendChild(badge(w, w === "node" ? "ok" : "dim")); pub.appendChild(document.createTextNode(" "));
+                        pub.appendChild(badge(w, (w === "node" || w === "node-intermediate") ? "ok" : "dim")); pub.appendChild(document.createTextNode(" "));
                     });
                     return [subj, (c.key_algorithm || "?") + (c.key_bits ? " " + c.key_bits : ""),
                             c.not_after || "", pub,
@@ -3134,9 +3137,10 @@
 
         var fCerts = slotCard(holder, "Issued certificates", true);
         run("pki-cert-list").then(function (r) {
-            fCerts(emptyOr(r.certs, ["file", "subject", "expires", "serial"],
+            fCerts(emptyOr(r.certs, ["file", "subject", "expires", "serial", ""],
                 function (c) {
-                    return [el("code", "al-spn", c.file), c.subject, c.not_after, c.serial];
+                    return [el("code", "al-spn", c.file), c.subject, c.not_after, c.serial,
+                            actionBtn("View chain", function () { openModal("pki-chain-view", { target: c.file }); })];
                 }, "no certificates issued yet"),
                 "Issued certificates — " + (r.count || 0) + " (on " + (r.ca_node || "CA node") + ")");
         }).catch(function (e) { fCerts(el("div", "al-alert err", String(e))); });
@@ -3200,9 +3204,76 @@
                     ["Public key (SPKI) SHA-256", el("code", "al-spn", r.spki_sha256)],
                     ["Published in", (r.published_in || []).join(", ")]
                 ]));
+                var kids = [r.ski ? ["Subject key ID", el("code", "al-spn", r.ski)] : null,
+                            r.aki ? ["Authority key ID", el("code", "al-spn", r.aki)] : null,
+                            ["CA", r.is_ca ? ("yes" + (r.path_len !== null && r.path_len !== undefined ? ", path length " + r.path_len : "")) : "no"]]
+                    .filter(Boolean);
+                out.appendChild(tableOf(["field", "value"], kids));
+                var chainBox = el("div"); out.appendChild(chainBox);
+                pkiChainSection(chainBox, { id: id }, id, base);
                 out.appendChild(pemBlock("Public key (PEM)", r.public_key_pem, base + ".pub.pem"));
                 out.appendChild(pemBlock("Certificate (PEM)", r.cert_pem, base + ".crt"));
             }).catch(function (e) { clear(out); out.appendChild(el("div", "al-alert err", String(e))); });
+            var close = el("button", "al-btn secondary", "Close");
+            close.addEventListener("click", closeModal); box.appendChild(close);
+        }, true);
+    }
+
+    /* Chain section: ordered steps leaf -> root; a step that is a CA certificate
+     * navigates the modal stack to that cert (#/pki?modal=pki-ca-view&target=<sha256>).
+     * req = {id} or {issued}; selfId = the cert already shown (not a link). */
+    function pkiChainSection(box, req, selfId, fileBase) {
+        box.appendChild(el("h4", null, "Chain"));
+        var out = el("div"); out.appendChild(el("div", "al-loading", "building chain…"));
+        box.appendChild(out);
+        run("pki-ca-chain", req).then(function (r) {
+            clear(out);
+            var kind = r.status === "complete" ? "ok" : (r.status === "untrusted" ? "warn" : "err");
+            var head = el("div");
+            head.appendChild(badge(r.status, kind));
+            head.appendChild(document.createTextNode(" " + (r.length || 0) + " certificate(s), leaf at the top" +
+                (r.note ? " — " + r.note : "")));
+            out.appendChild(head);
+            var list = el("ol", "al-chain");
+            list.style.listStyle = "none"; list.style.margin = "0.5rem 0"; list.style.padding = "0";
+            (r.steps || []).forEach(function (st, i) {
+                var li = el("li");
+                li.style.cssText = "border-left:3px solid var(--border, #888);margin:0 0 0.4rem " + (i * 0.75) + "rem;padding:0.2rem 0.6rem";
+                var title = el("div");
+                var navigable = st.is_ca && st.id !== selfId;
+                if (navigable) {
+                    var link = el("a", null, st.subject || "(no subject)");
+                    link.href = "#"; link.setAttribute("role", "link");
+                    link.addEventListener("click", function (ev) { ev.preventDefault(); openModal("pki-ca-view", { target: st.id }); });
+                    title.appendChild(link);
+                } else {
+                    title.appendChild(el("strong", null, st.subject || "(no subject)"));
+                }
+                title.appendChild(document.createTextNode(" "));
+                title.appendChild(badge(!st.is_ca ? "leaf" : (st.issuer === st.subject ? "root" : "CA"), "dim"));
+                title.appendChild(document.createTextNode(" "));
+                if (st.signature_ok === true) { title.appendChild(badge("signature ok", "ok")); }
+                else if (st.signature_ok === false) { title.appendChild(badge("signature NOT verified", "err")); }
+                else { title.appendChild(badge("issuer missing", "err")); }
+                if (st.id === selfId) { title.appendChild(document.createTextNode(" ")); title.appendChild(badge("this certificate", "dim")); }
+                li.appendChild(title);
+                li.appendChild(el("div", "al-sub", "expires " + (st.not_after || "?") + "  ·  " + (st.published_in || []).join(", ")));
+                li.appendChild(el("code", "al-spn", st.sha256_fingerprint || ""));
+                list.appendChild(li);
+            });
+            out.appendChild(list);
+            var row = el("div", "al-actions");
+            row.appendChild(actionBtn("Download chain (.pem)", function () { downloadText((fileBase || "chain") + ".chain.pem", r.chain_pem || ""); }));
+            out.appendChild(row);
+            (r.errors || []).forEach(function (e) { out.appendChild(el("div", "al-alert warn", String(e))); });
+        }).catch(function (e) { clear(out); out.appendChild(el("div", "al-alert err", String(e))); });
+    }
+    function pkiChainViewModal(file) {
+        if (!file) { return; }
+        modal("Certificate chain", function (box) {
+            box.appendChild(el("div", "al-sub", "Issued certificate: " + file));
+            var holder = el("div"); box.appendChild(holder);
+            pkiChainSection(holder, { issued: file }, "", file.replace(/\.crt$/, ""));
             var close = el("button", "al-btn secondary", "Close");
             close.addEventListener("click", closeModal); box.appendChild(close);
         }, true);
