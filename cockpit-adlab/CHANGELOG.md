@@ -27,7 +27,7 @@ CA chain view on the PKI tab, plus intermediate CAs.
   back; "Download chain (.pem)"); each issued certificate has a **View chain**
   action (`#/pki?modal=pki-chain-view&target=<file>`); a **Create intermediate**
   action button.
-- Tests: 11 new `TestPkiChain` cases on real openssl root -> intermediate -> leaf
+- Tests: 12 new `TestPkiChain` cases on real openssl root -> intermediate -> leaf
   fixtures (ordering, complete/incomplete/untrusted, same-DN wrong-key issuer,
   cross-signed loop, depth cap, filename validation, no private key in output).
 

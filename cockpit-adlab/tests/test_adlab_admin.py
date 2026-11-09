@@ -3535,6 +3535,14 @@ class TestPkiChain(Base):
         self.assertNotIn("Certification Authorities", " ".join(
             (c[1] or "") for c in f.calls if "ldbadd" in c[0]))
 
+    def test_ca_cert_default_is_root_even_with_intermediates(self):
+        p = self._pki()
+        self._fakes(p, node_ints=[p["int"]], ad_root=[p["root"]])
+        rc, out = self.call_main(["pki-ca-cert"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["cert_pem"], p["root"])
+        self.assertEqual(out["published_in"][0], "node")
+
     def test_ca_list_includes_node_intermediates(self):
         p = self._pki()
         self._fakes(p, node_ints=[p["int"]], ad_root=[p["root"]])

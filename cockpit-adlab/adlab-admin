@@ -5058,7 +5058,7 @@ def v_pki_ca_cert(a):
     if fid:
         hits = [k for k in found if k.startswith(fid.lower())]
     else:
-        hits = list(found)
+        hits = [k for k, e in found.items() if "node" in e["published_in"]]
     if not hits:
         raise Fail("no such CA certificate" + (" (%s)" % "; ".join(errors) if errors else ""))
     if len(hits) > 1:
