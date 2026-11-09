@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.17.0 - 2026-11-09
+
+View the public keys / certificates of the CAs on the PKI tab.
+
+- **New read-only verbs `pki-ca-list` and `pki-ca-cert`.** `pki-ca-list` lists
+  every CA certificate visible - the CA node's root plus the `cACertificate`
+  values in AD (Certification Authorities root-trust, AIA, NTAuthCertificates,
+  which may hold CAs that are not ours) - de-duplicated by SHA-256 fingerprint,
+  with subject, key algorithm/size, validity and where each is published.
+  `pki-ca-cert --id <fingerprint>` (full or >=8-hex prefix; default the node
+  root) returns the full detail: issuer, serial, validity, certificate SHA-256,
+  public-key (SPKI) SHA-256, the public-key PEM and the certificate PEM. Only
+  public material is read (never `ca.key`); the id is validated as hex.
+- **PKI tab: "Certification Authorities" table** with a **View public key**
+  action per row, opening a deep-linkable modal
+  (`#/pki?modal=pki-ca-view&target=<sha256>`) with read-only monospace PEM
+  boxes, each with Copy and Download (`.pub.pem` / `.crt`).
+- Tests: 4 new `TestPki` cases against real openssl-generated certificates.
+
 ## 1.16.1 - 2026-10-15
 
 Stop `config` reporting a present file as missing.

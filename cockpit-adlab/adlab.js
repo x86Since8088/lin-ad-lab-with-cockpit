@@ -330,6 +330,7 @@
             case "gpo-detail":    gpoDetailModal(target); break;
             case "object-edit":   objectEditModal(target); break;
             case "object-attrs":  objectAttrsModal(target); break;
+            case "pki-ca-view":   pkiCaViewModal(target); break;
             default: /* unknown — leave nothing */ break;
         }
     }
@@ -3092,6 +3093,26 @@
             fAd(el("div", "al-alert err", String(e)));
         });
 
+        var fCas = slotCard(holder, "Certification Authorities", true);
+        run("pki-ca-list").then(function (r) {
+            var box = el("div");
+            box.appendChild(emptyOr(r.cas || [], ["subject", "key", "expires", "published in", "SHA-256 fingerprint", ""],
+                function (c) {
+                    var subj = el("span", null, c.subject || "(no subject)");
+                    if (c.is_node_ca) { subj.appendChild(document.createTextNode(" ")); subj.appendChild(badge("CA node", "ok")); }
+                    var pub = el("span");
+                    (c.published_in || []).forEach(function (w) {
+                        pub.appendChild(badge(w, w === "node" ? "ok" : "dim")); pub.appendChild(document.createTextNode(" "));
+                    });
+                    return [subj, (c.key_algorithm || "?") + (c.key_bits ? " " + c.key_bits : ""),
+                            c.not_after || "", pub,
+                            el("code", "al-spn", (c.sha256_fingerprint || "").match(/.{1,2}/g).slice(0, 8).join(":") + "…"),
+                            actionBtn("View public key", function () { openModal("pki-ca-view", { target: c.id }); })];
+                }, "no CA certificates found — deploy the CA node and/or publish to AD"));
+            (r.errors || []).forEach(function (e) { box.appendChild(el("div", "al-alert warn", String(e))); });
+            fCas(box, "Certification Authorities — " + (r.count || 0) + " (CA node + AD root-trust / AIA / NTAuth)");
+        }).catch(function (e) { fCas(el("div", "al-alert err", String(e))); });
+
         var fTpl = slotCard(holder, "Certificate templates", true);
         run("pki-template-list").then(function (r) {
             var box = el("div");
@@ -3119,6 +3140,72 @@
                 }, "no certificates issued yet"),
                 "Issued certificates — " + (r.count || 0) + " (on " + (r.ca_node || "CA node") + ")");
         }).catch(function (e) { fCerts(el("div", "al-alert err", String(e))); });
+    }
+
+    // -------- CA public key viewer (routed modal #/pki?modal=pki-ca-view&target=<sha256>)
+    function actionBtn(label, onClick) {
+        var b = el("button", "al-btn secondary", label);
+        b.addEventListener("click", onClick);
+        return b;
+    }
+    function copyToClipboard(text, ta) {
+        function fallback() {
+            ta.focus(); ta.select();
+            try { document.execCommand("copy"); } catch (e) { /* ignore */ }
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).catch(fallback);
+        } else { fallback(); }
+    }
+    function downloadText(filename, text) {
+        var blob = new Blob([text], { type: "application/x-pem-file" });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url; a.download = filename;
+        document.body.appendChild(a); a.click();
+        setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
+    }
+    function pemBlock(title, pem, filename) {
+        var c = el("div", "al-veditor");
+        c.appendChild(el("h4", null, title));
+        var ta = el("textarea");
+        ta.readOnly = true; ta.value = pem || ""; ta.rows = Math.min(14, Math.max(4, (pem || "").split("\n").length));
+        ta.style.width = "100%"; ta.style.boxSizing = "border-box";
+        ta.style.fontFamily = 'ui-monospace, "JetBrains Mono", monospace';
+        ta.style.fontSize = "0.8rem";
+        ta.setAttribute("aria-label", title);
+        c.appendChild(ta);
+        var row = el("div", "al-actions");
+        var cp = actionBtn("Copy", function () {
+            copyToClipboard(ta.value, ta); cp.textContent = "Copied"; setTimeout(function () { cp.textContent = "Copy"; }, 1500);
+        });
+        row.appendChild(cp);
+        row.appendChild(actionBtn("Download " + filename.replace(/^.*\./, "."), function () { downloadText(filename, ta.value); }));
+        c.appendChild(row);
+        return c;
+    }
+    function pkiCaViewModal(id) {
+        if (!id) { return; }
+        modal("CA public key", function (box) {
+            var out = el("div"); out.appendChild(el("div", "al-loading", "loading…"));
+            box.appendChild(out);
+            run("pki-ca-cert", { id: id }).then(function (r) {
+                clear(out);
+                var base = ((r.subject.match(/CN=([^,]+)/) || [])[1] || "ca").replace(/[^A-Za-z0-9._-]+/g, "_");
+                out.appendChild(tableOf(["field", "value"], [
+                    ["Subject", r.subject], ["Issuer", r.issuer + (r.self_signed ? "  (self-signed root)" : "")],
+                    ["Serial", r.serial], ["Not before", r.not_before], ["Not after", r.not_after],
+                    ["Key algorithm", (r.key_algorithm || "?") + (r.key_bits ? " " + r.key_bits + " bit" : "") + (r.curve ? " (" + r.curve + ")" : "")],
+                    ["Certificate SHA-256", el("code", "al-spn", r.sha256_fingerprint)],
+                    ["Public key (SPKI) SHA-256", el("code", "al-spn", r.spki_sha256)],
+                    ["Published in", (r.published_in || []).join(", ")]
+                ]));
+                out.appendChild(pemBlock("Public key (PEM)", r.public_key_pem, base + ".pub.pem"));
+                out.appendChild(pemBlock("Certificate (PEM)", r.cert_pem, base + ".crt"));
+            }).catch(function (e) { clear(out); out.appendChild(el("div", "al-alert err", String(e))); });
+            var close = el("button", "al-btn secondary", "Close");
+            close.addEventListener("click", closeModal); box.appendChild(close);
+        }, true);
     }
 
     // -------- S4U / delegation + authentication policies
