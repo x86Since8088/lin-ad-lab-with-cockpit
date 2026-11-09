@@ -3306,6 +3306,246 @@ class TestPki(Base):
         self.assertEqual(out["count"], 1)
 
 
+import hashlib
+
+
+class TestPkiChain(Base):
+    """pki-ca-chain / pki-intermediate-create against real openssl fixtures:
+    root -> intermediate -> leaf."""
+
+    def _body(self, argv):
+        for i, x in enumerate(argv):
+            if x == "-c" and i + 1 < len(argv):
+                return argv[i + 1]
+        return ""
+
+    def setUp(self):
+        super().setUp()
+        import subprocess
+        f = self.fake
+        orig = f.run
+        def run(argv, stdin=None, timeout=120):
+            if argv[0] == "openssl":       # decode/verify with the REAL host openssl
+                f.calls.append((list(argv), stdin))
+                p = subprocess.run(argv, input=stdin, capture_output=True, text=True)
+                return p.returncode, p.stdout, p.stderr
+            return orig(argv, stdin, timeout)
+        f.run = run
+
+    def _pki(self):
+        import subprocess, tempfile, shutil
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        def sh(*a, **kw):
+            subprocess.run(list(a), check=True, capture_output=True, cwd=d, **kw)
+        def ext(name, body):
+            open("%s/%s.ext" % (d, name), "w").write(body)
+        sh("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "root.key",
+           "-out", "root.crt", "-days", "30", "-subj", "/O=Lab/CN=Root CA",
+           "-addext", "basicConstraints=critical,CA:TRUE,pathlen:1",
+           "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-addext", "subjectKeyIdentifier=hash")
+        ext("int", "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n"
+                   "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n")
+        sh("openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", "int.key",
+           "-out", "int.csr", "-subj", "/O=Lab/CN=Issuing CA 1")
+        sh("openssl", "x509", "-req", "-in", "int.csr", "-CA", "root.crt", "-CAkey", "root.key",
+           "-CAcreateserial", "-days", "30", "-sha256", "-extfile", "int.ext", "-out", "int.crt")
+        ext("leaf", "basicConstraints=critical,CA:FALSE\nsubjectKeyIdentifier=hash\n"
+                    "authorityKeyIdentifier=keyid,issuer\n")
+        sh("openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", "leaf.key",
+           "-out", "leaf.csr", "-subj", "/O=Lab/CN=web01")
+        sh("openssl", "x509", "-req", "-in", "leaf.csr", "-CA", "int.crt", "-CAkey", "int.key",
+           "-CAcreateserial", "-days", "30", "-sha256", "-extfile", "leaf.ext", "-out", "leaf.crt")
+        # an unrelated CA with the SAME subject DN as the root but another key
+        sh("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "imp.key",
+           "-out", "imp.crt", "-days", "30", "-subj", "/O=Lab/CN=Root CA",
+           "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "subjectKeyIdentifier=hash")
+        r = lambda n: open("%s/%s.crt" % (d, n)).read()
+        return {"root": r("root"), "int": r("int"), "leaf": r("leaf"), "imp": r("imp")}
+
+    def _fakes(self, pems, node_ints=(), ad_root=(), ad_aia=(), issued=None):
+        f, b = self.fake, self._body
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "test -f" in b(a), rc=0)
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "cat /ca/ca.crt" in b(a), out=pems["root"])
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "cat /ca/intermediates/" in b(a),
+             out="".join(node_ints))
+        if issued is not None:
+            f.on(lambda a: "exec" in a and "adlab-ca" in a and "cat /ca/issued/" in b(a),
+                 out=issued)
+        def ldif(dn, ps):
+            return "".join("dn: %s\ncACertificate:: %s\n\n" % (dn, base64.b64encode(mod._pem_to_der(x)).decode())
+                           for x in ps)
+        f.on(lambda a: "ldbsearch" in a and a[a.index("-b") + 1] == mod._cas_dn(), out=ldif("CN=x", ad_root))
+        f.on(lambda a: "ldbsearch" in a and a[a.index("-b") + 1] == mod._aia_dn(), out=ldif("CN=y", ad_aia))
+        f.on(lambda a: "ldbsearch" in a and a[a.index("-b") + 1] == mod._ntauth_dn(), out="")
+        f.lab_up()
+
+    def test_cert_detail_extracts_key_ids_and_basic_constraints(self):
+        p = self._pki()
+        r, i, l = (mod._cert_detail(mod._pem_to_der(p[k])) for k in ("root", "int", "leaf"))
+        self.assertTrue(r["is_ca"]); self.assertEqual(r["path_len"], 1)
+        self.assertTrue(i["is_ca"]); self.assertEqual(i["path_len"], 0)
+        self.assertFalse(l["is_ca"]); self.assertIsNone(l["path_len"])
+        self.assertTrue(r["ski"]); self.assertEqual(i["aki"], r["ski"]); self.assertEqual(l["aki"], i["ski"])
+
+    def test_chain_of_issued_leaf_is_ordered_and_complete(self):
+        p = self._pki()
+        self._fakes(p, node_ints=[p["int"]], ad_root=[p["root"]], issued=p["leaf"])
+        rc, out = self.call_main(["pki-ca-chain", "--issued", "web01.crt"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["status"], "complete")
+        self.assertEqual(out["length"], 3)
+        self.assertEqual([("web01" in s["subject"], "Issuing" in s["subject"], "Root" in s["subject"])
+                          for s in out["steps"]],
+                         [(True, False, False), (False, True, False), (False, False, True)])
+        self.assertEqual([s["is_ca"] for s in out["steps"]], [False, True, True])
+        self.assertTrue(all(s["signature_ok"] for s in out["steps"]))
+        self.assertEqual(out["steps"][1]["published_in"], ["node-intermediate"])
+        self.assertTrue(out["trusted"])
+        self.assertEqual(out["chain_pem"], p["leaf"] + p["int"] + p["root"])
+        self.assertNotIn("PRIVATE KEY", json.dumps(out))
+
+    def test_chain_of_ca_by_id_and_default_root(self):
+        p = self._pki()
+        self._fakes(p, node_ints=[p["int"]], ad_root=[p["root"]])
+        iid = mod._cert_detail(mod._pem_to_der(p["int"]))["id"]
+        rc, out = self.call_main(["pki-ca-chain", "--id", iid[:16]])
+        self.assertEqual((rc, out["status"], out["length"]), (0, "complete", 2))
+        rc, out = self.call_main(["pki-ca-chain"])
+        self.assertEqual((rc, out["status"], out["length"]), (0, "complete", 1))
+        self.assertTrue(out["steps"][0]["signature_ok"])
+
+    def test_chain_incomplete_when_issuer_missing(self):
+        p = self._pki()
+        self._fakes(p, node_ints=[], ad_root=[p["root"]], issued=p["leaf"])
+        rc, out = self.call_main(["pki-ca-chain", "--issued", "web01.crt"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((out["status"], out["length"]), ("incomplete", 1))
+        self.assertIn("issuer certificate not found", out["note"])
+
+    def test_chain_untrusted_when_root_not_in_ad_root_trust(self):
+        p = self._pki()
+        self._fakes(p, node_ints=[p["int"]], ad_root=[], issued=p["leaf"])
+        rc, out = self.call_main(["pki-ca-chain", "--issued", "web01.crt"])
+        self.assertEqual((rc, out["status"], out["length"]), (0, "untrusted", 3))
+        self.assertFalse(out["trusted"])
+
+    def test_chain_same_dn_wrong_key_issuer_is_not_followed(self):
+        # an AD cert with the root's subject DN but a different key must not be
+        # accepted as the issuer: the signature step fails
+        p = self._pki()
+        self._fakes(p, node_ints=[p["int"]], ad_root=[p["imp"]], issued=p["leaf"])
+        self.fake.rules = [r for r in self.fake.rules
+                           if not r[0](["podman", "exec", "adlab-ca", "bash", "-c", "cat /ca/ca.crt"])]
+        rc, out = self.call_main(["pki-ca-chain", "--issued", "web01.crt"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["status"], "incomplete")
+        self.assertEqual(out["length"], 2)
+
+    def test_chain_loop_and_depth_guard(self):
+        import hashlib, subprocess, tempfile, shutil
+        p = self._pki()
+        # cross-signed pair A<->B (each issued by the other's key): a naive walk loops forever
+        d = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        def sh(*a):
+            subprocess.run(list(a), check=True, capture_output=True, cwd=d)
+        for n in ("A", "B"):
+            sh("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", n + ".key",
+               "-out", n + ".self", "-days", "5", "-subj", "/CN=Loop" + n)
+        for n, o in (("A", "B"), ("B", "A")):
+            sh("openssl", "req", "-new", "-key", n + ".key", "-out", n + ".csr", "-subj", "/CN=Loop" + n)
+            sh("openssl", "x509", "-req", "-in", n + ".csr", "-CA", o + ".self", "-CAkey", o + ".key",
+               "-CAcreateserial", "-days", "5", "-out", n + ".cross")
+        A, B = (mod._pem_to_der(open("%s/%s.cross" % (d, n)).read()) for n in "AB")
+        pool = {hashlib.sha256(x).hexdigest(): {"der": x, "published_in": []} for x in (A, B)}
+        steps, status, note = mod._chain_build(A, pool)
+        self.assertEqual(status, "incomplete")
+        self.assertLessEqual(len(steps), 2)
+        steps, status, note = mod._chain_build(
+            mod._pem_to_der(p["leaf"]),
+            {hashlib.sha256(mod._pem_to_der(p[k])).hexdigest(): {"der": mod._pem_to_der(p[k]), "published_in": []}
+             for k in ("int", "root")})
+        self.assertEqual((status, len(steps)), ("complete", 3))
+        # a pool that contains the leaf itself and a cert whose issuer DN is its own
+        # subject but is not self-signed cannot loop
+        old = mod.CHAIN_MAX_DEPTH
+        mod.CHAIN_MAX_DEPTH = 2
+        try:
+            steps, status, note = mod._chain_build(
+                mod._pem_to_der(p["leaf"]),
+                {hashlib.sha256(mod._pem_to_der(p[k])).hexdigest(): {"der": mod._pem_to_der(p[k]), "published_in": []}
+                 for k in ("int", "root")})
+        finally:
+            mod.CHAIN_MAX_DEPTH = old
+        self.assertEqual(status, "incomplete")
+        self.assertEqual(len(steps), 2)
+        self.assertIn("maximum chain depth", note)
+
+    def test_chain_filename_validation(self):
+        p = self._pki()
+        self._fakes(p, issued=p["leaf"])
+        for bad in ("../ca.crt", "..%2f.crt", "web01.key", "a/b.crt", "x.crt; rm -rf /",
+                    "/ca/ca.key", "ca.key.crt/../x", ".hidden.crt", "a b.crt", "web01.crt\n"):
+            rc, out = self.call_main(["pki-ca-chain", "--issued", bad])
+            self.assertNotEqual(rc, 0, bad)
+        rc, out = self.call_main(["pki-ca-chain", "--id", "x; rm", ])
+        self.assertNotEqual(rc, 0)
+        rc, out = self.call_main(["pki-ca-chain", "--id", "abcdef12", "--issued", "a.crt"])
+        self.assertNotEqual(rc, 0)
+        for argv, _ in self.fake.calls:
+            self.assertNotIn(".key", " ".join(map(str, argv)))
+
+    def test_intermediate_create_validates_and_signs_with_pathlen0(self):
+        p = self._pki()
+        f, b = self.fake, self._body
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "test -f" in b(a), rc=0)
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "genrsa" in b(a), out="created\n" + p["int"])
+        f.lab_up()
+        for bad in ("../x", "a b", "x;rm", "", "-lead", "a" * 65):
+            rc, out = self.call_main(["pki-intermediate-create", "--name", bad])
+            self.assertNotEqual(rc, 0, bad)
+        rc, out = self.call_main(["pki-intermediate-create", "--name", "Issuing-CA-1"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["created"])
+        self.assertEqual(out["path_len"], 0)
+        self.assertIsNone(out["published"])
+        body = [b(c[0]) for c in f.calls if "genrsa" in b(c[0])][0]
+        self.assertIn("basicConstraints=critical,CA:TRUE,pathlen:0", body)
+        self.assertIn("keyCertSign,cRLSign", body)
+        self.assertIn("chmod 600 $D/ca.key", body)
+        self.assertIn("/ca/intermediates/Issuing-CA-1", body)
+        self.assertNotIn("PRIVATE KEY", json.dumps(out))
+        self.assertFalse(f.argv_containing("ldbadd"))     # not published by default
+
+    def test_intermediate_create_is_idempotent_and_publishes_to_aia_only(self):
+        p = self._pki()
+        f, b = self.fake, self._body
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "test -f" in b(a), rc=0)
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "gencrl" in b(a), out="Q1JM\n")
+        f.on(lambda a: "exec" in a and "adlab-ca" in a and "genrsa" in b(a), out="exists\n" + p["int"])
+        f.on(lambda a: "ldbsearch" in a, rc=1)
+        f.on(lambda a: "ldbadd" in a, out="")
+        f.lab_up()
+        rc, out = self.call_main(["pki-intermediate-create", "--name", "Issuing-CA-1",
+                                  "--publish", "true"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(out["created"])
+        self.assertEqual(out["published"]["action"], "created")
+        self.assertIn("CN=AIA", out["published"]["dn"])
+        self.assertNotIn("Certification Authorities", " ".join(
+            (c[1] or "") for c in f.calls if "ldbadd" in c[0]))
+
+    def test_ca_list_includes_node_intermediates(self):
+        p = self._pki()
+        self._fakes(p, node_ints=[p["int"]], ad_root=[p["root"]])
+        rc, out = self.call_main(["pki-ca-list", "--source", "node"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["count"], 2)
+        self.assertEqual(out["cas"][1]["published_in"], ["node-intermediate"])
+        self.assertTrue(out["cas"][1]["is_node_intermediate"])
+        self.assertEqual(out["cas"][1]["path_len"], 0)
+
+
 DELEG_LDIF = """dn: CN=DC1,OU=Domain Controllers,DC=ad,DC=edt1,DC=lab
 sAMAccountName: DC1$
 userAccountControl: 532480

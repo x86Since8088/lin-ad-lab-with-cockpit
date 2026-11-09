@@ -9,6 +9,7 @@ open work appears. Memory only points here (`samba-ad-lab-todo`; incident record
 
 ## Live state (verified 2026-10-15, after the 11:44 reboot)
 
+- `cockpit-adlab` **1.18.0** (PKI tab: CA chain view, verbs `pki-ca-chain`/`pki-intermediate-create`, intermediates in `pki-ca-list`) deployed 2026-11-09 from branch `feat/pki-ca-chain` (PR pending merge); `payload-1.17.0` kept for rollback.
 - `cockpit-adlab` **1.17.0** (PKI tab: view CA public keys/certs, verbs `pki-ca-list`/`pki-ca-cert`) deployed 2026-11-09 from branch `feat/pki-ca-public-key-view` (PR pending merge); `payload-1.16.1` kept for rollback.
 - `cockpit-adlab` **1.16.1** deployed 2026-10-15 20:29Z from merged main (`ff73a8f`, PR #35) —
   `/usr/local/sbin/adlab-admin` -> `/opt/cockpit-adlab/payload-1.16.1/bin/adlab-admin`, post-install assertions ok,
