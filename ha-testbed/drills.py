@@ -279,8 +279,11 @@ def d_failover_cycle(kind, vm="adl-ha-a", gpo=True, label=None):
         marker = "drill-%s-%d" % (kind, int(now()))
         ok, why = gpo_create("adl-ha-b", "dc3", marker)
         res["gpo_during"] = ok
+    res["t_fault"] = round(t0, 1)
+    res["t_heal"] = round(now(), 1)
     fault("heal" if kind != "poweroff" else "poweron", vm)
     s, t_back = wait_healthy(900)
+    res["t_end"] = round(now(), 1)
     res["t_failback_s"] = t_back if s else None
     res["healthy_after"] = bool(s)
     fin = snapshot()
