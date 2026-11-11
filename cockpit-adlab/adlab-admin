@@ -126,7 +126,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.19.0"
+VERSION = "1.19.1"
 
 
 def _require_config():
@@ -2205,6 +2205,9 @@ def v_object_list(a):
     search = (a.get("search") or "").strip()
     extra = [x for x in (a.get("attrs", "") or "").split(",") if x]
     include_base = (a.get("include_base") or "").lower() in ("1", "yes", "true")
+    # ADUC's "Advanced Features" off: hide showInAdvancedViewOnly objects (the
+    # CN=System subtree, DomainUpdates, Program Data, …)
+    hide_advanced = (a.get("hide_advanced") or "").lower() in ("1", "yes", "true")
     try:
         limit = int(a.get("limit") or 2000)
     except ValueError:
@@ -2215,6 +2218,8 @@ def v_object_list(a):
     conds = [clsf]
     if search:
         conds.append(_search_filter(search))
+    if hide_advanced:
+        conds.append("(!(showInAdvancedViewOnly=TRUE))")
     filt = "(&%s)" % "".join(conds) if len(conds) > 1 else conds[0]
     want = ["objectClass", "name", "cn", "sAMAccountName", "displayName",
             "description"]
@@ -7489,7 +7494,8 @@ VERBS = {
                                arg("search", required=False, help_="substring over name/sAM/displayName/description"),
                                arg("attrs", required=False, help_="comma list of extra column attributes"),
                                arg("limit", "int", required=False),
-                               arg("include_base", required=False, help_="yes = also return the base object itself")]},
+                               arg("include_base", required=False, help_="yes = also return the base object itself"),
+                               arg("hide_advanced", required=False, help_="yes = hide showInAdvancedViewOnly objects (ADUC Advanced Features off)")]},
     "object-get":    {"fn": v_object_get, "group": "objects",
                       "help": "One object's full attribute set (drives the preview + Attribute Editor).",
                       "args": [arg("dn", picker="object-dn"), arg("acl", required=False, help_="yes = include nTSecurityDescriptor"),

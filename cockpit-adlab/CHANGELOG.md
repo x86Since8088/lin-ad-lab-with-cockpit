@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.19.1 - 2026-11-11
+
+Object picker: hide system objects by default, as ADUC does.
+
+- `object-list --hide_advanced yes` adds `(!(showInAdvancedViewOnly=TRUE))`.
+  On the live forest the container picker went from 162 entries (mostly the
+  `CN=System` subtree: DomainUpdates operations, …) to the 15 real ones.
+- The picker sends it unless its new **Advanced (system objects)** checkbox is
+  ticked, and sorts results: the search base (domain head) first, then by name.
+- Test: `test_list_hide_advanced_filters_system_objects` (296 pass).
+
 ## 1.19.0 - 2026-11-11
 
 A schema-driven, reusable **object picker** — the ADUC "Select Users, Contacts,
