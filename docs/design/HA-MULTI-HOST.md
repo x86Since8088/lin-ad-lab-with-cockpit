@@ -443,6 +443,26 @@ and mini-srv. The live lab and the shared lab VMs are never touched (memory
     (one shared DC subnet reachable from both hosts) or stays routed is an
     owner decision for the final design. Either way the AD-site and FSMO logic
     is the same. Sites come from address ranges, not from L2 boundaries.
+- **Keep edy-proxy-go updated on both VMs (owner, 2026-11-11).** The testbed
+  tracks current edy main and never drifts behind the edt1 fleet.
+  - **Source:** the same promoted main build that `edy-testcluster` uses (the
+    `main-check` worktree's stamped `EdyNetworkServices` plus its
+    `edy-files.tgz`). The binary is copied in through each VM's runner share,
+    so it never connects to edt1's deployment.
+  - **Version check:** refuse a build whose `main.Version` is missing or `dev`.
+  - **Rolling order:** B first, then A, the cluster founder. Each node updates
+    only after the other is healthy: `/up` is 200, the version is the new one,
+    peers are listed, and replication shows `failures==0`.
+  - **Rollback:** keep the previous binary beside the new one, and roll back
+    automatically if a check fails.
+  - **When:** on every new promoted main build, plus a daily check. The
+    trigger runs on the testbed host, so it is subject to the gate at the top
+    and is not installed before sign-off. Each run is recorded in
+    `ha-testbed/edy-versions.log`.
+  - **Rule:** before every stress run (§12), both VMs must be on the current
+    build.
+  - Script: `ha-testbed/tb-edy.sh up|update|status`, to be written with the
+    isolated-cluster setup.
 - **Forest:** a separate test forest `HA.TEST.LAB` built from this repo's
   images and scripts, never joined to `AD.EDT1.LAB`. Its DCs sit on the shared
   subnet, with one AD site per VM. The DCs' DNS forwarder is the testbed's own
