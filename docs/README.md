@@ -10,6 +10,7 @@ the pieces work and how to operate them.
 |---|---|---|
 | `docs/reference/` | How a subsystem works, not tied to one change | yes, when the thing changes |
 | `docs/operations/` | Runbooks — what an operator does, step by step | yes |
+| `docs/design/` | Designs not built yet (plans live in `todo.md`) | until built, then folded into reference/ |
 
 Module-local prose that used to live as scattered `README.md` files under
 `tools/` and `sysvol/` has been migrated here as structured reference docs.
@@ -31,3 +32,9 @@ Module-local prose that used to live as scattered `README.md` files under
 |---|---|
 | [operations/LIFECYCLE.md](operations/LIFECYCLE.md) | The numbered lifecycle scripts, reboot recovery, and the acceptance gate |
 | [operations/FSMO-AND-RECOVERY.md](operations/FSMO-AND-RECOVERY.md) | FSMO transfer/seize, tombstone reanimation, USN-rollback avoidance, forest recovery |
+
+## Design
+
+| Doc | Subject |
+|---|---|
+| [design/HA-MULTI-HOST.md](design/HA-MULTI-HOST.md) | Multi-host HA: DCs per host, FSMO seize classes, lease fencing, SYSVOL writer, `ha-*` management API for edy, two-VM testbed |

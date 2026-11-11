@@ -1,0 +1,431 @@
+# Multi-host HA for the AD lab (design)
+
+**Status:** design, nothing built. Owner directive 2026-11-11: AD-lab HA logic is
+worked out in its own session, in this repo. The phased plan is in
+[`todo.md`](../../todo.md) under "HA: multi-host DCs". **Nothing here changes the
+live lab on edt1 until the owner approves.** All building and drilling happens
+first on the two-VM testbed (§10).
+
+## 1. Goal and inputs
+
+Today all five DCs (`dc1`–`dc5`, realm `AD.EDT1.LAB`) run as rootful podman
+containers on one host, `edt1`, on the static bridge `static-edt`
+(`172.15.4.0/24`). If edt1 is down, the domain is down.
+
+Inputs from the owner (2026-11-10/11):
+
+- **mini-srv** (4 cores, 32 GB RAM, 512 GB disk, low power) comes online later
+  as a **passive failover host**. It is netbooted with Ubuntu and the cockpit
+  plugins, and edy-proxy-go controls it.
+- edy-proxy-go gains an opt-in **Hosting Domain Authentication** capability.
+  edy trusted nodes manage the AD lab on bare-metal host-cluster nodes. The
+  controller either fails over between trusted nodes or runs only on the raft
+  leader.
+- **Balance DCs across the hosts** of the host cluster.
+- Storage-core SMB will authenticate with Kerberos against these domains. edy's
+  `settings/auth/kerberos` gets multi-domain binding and forest-GC suggestions.
+- edy leadership decision L1/L4 (2026-11-07): a 2-node trusted cluster
+  **requires a witness**, which is a flagged trusted node. Without one it runs
+  degraded: `has_quorum=false`, no automatic takeover, and an alert.
+
+## 2. The core principle: HA comes from AD replication, not from moving DCs
+
+A DC is never "failed over" as a container instance. Each host runs its own
+DCs, pinned to that host, and they stay live all the time. AD replication is
+multi-master, so every DC on every host already holds the whole directory and
+answers LDAP, Kerberos, DNS and SMB (SYSVOL). When a host dies, its DCs are
+gone and the DCs on the other host keep serving.
+
+So DC containers must **not** be admitted to edy's HA-subnet or
+replicated-storage failover (Ceph RBD, block mirroring, qcow2 snapshots).
+Starting a DC's state on another host from a replicated or snapshotted copy is
+the **USN rollback** case ([FSMO-AND-RECOVERY §3.3](../operations/FSMO-AND-RECOVERY.md)).
+Async block replication lags, so the copy is always slightly old. The only
+legal way to move a DC is a **cold move** (stop it, copy the bind mount, never
+start the source again) or **demote and join fresh**. We use demote/join.
+
+Only three things are single-writer and need HA logic:
+
+1. the **FSMO roles** (seven in Samba),
+2. the **SYSVOL source of truth** (Samba has no DFS-R; the lab pushes from the
+   PDC emulator, [SYSVOL.md](../reference/SYSVOL.md)),
+3. **GPO edits**, which must land on that same SYSVOL source.
+
+Everything in this design either guards those three or makes clients find a
+live DC.
+
+## 3. Topology and placement
+
+### 3.1 Hosts as AD sites, routed, no L2 stretch
+
+| Host | AD site | DC subnet (default) | DCs (target) | Role |
+|---|---|---|---|---|
+| edt1 | `edt1` | `172.15.4.0/24` (`static-edt`, unchanged) | `dc1`, `dc2`, `dc3` | **active**: holds all FSMO roles and the SYSVOL writer lease |
+| mini-srv | `mini-srv` | `172.15.5.0/24` (new bridge `static-mini`) | `dc6`, `dc7` | **passive**: warm DCs, no roles, takes roles only on failover |
+
+- **Each host gets its own routed subnet** and one AD site with that subnet.
+  The KCC builds inter-site replication; clients prefer DCs in their own site
+  and fall back to others. AD is built for this, and it needs no VXLAN/EVPN.
+  The edy routers route between the two subnets (the WG/LAN underlay).
+  Default: routed. L2 stretch is not needed for DCs.
+- **At least one writable DC per host, two where capacity allows.** Two per host
+  lets one DC be rebuilt or patched without the host losing its local DC.
+  mini-srv's capacity budget for the failover profile: 2 DCs ≈ 1–1.5 GB RAM,
+  < 1 core idle. That fits beside its 1 edge, 1 router and 1 trusted node.
+- **Five DCs in total stays the target.** DCs `dc6`/`dc7` join on mini-srv
+  first. Then `dc4`/`dc5` on edt1 are demoted, cleanly and one at a time, which
+  frees their roles first (§4.1). DC numbers stay global (no per-host renaming).
+  The host is a field in the placement map, not part of the name.
+- **"Passive" means role placement, not cold standby.** mini-srv's DCs replicate
+  and serve auth all the time (that is what makes failover instant for
+  clients). Passive means they hold no FSMO roles and no SYSVOL writer lease
+  while edt1 is healthy, and roles **fail back** to edt1 with hysteresis (§5.4).
+- **Extra forests** (`ad2`, `ad2-dev`) get the same rule (≥1 DC per host) only
+  after they get persistent state ([todo](../../todo.md), "Extra-forest DCs have
+  no persistent state"). Until then they are single-host and excluded from HA.
+- **Not failed over:** `client1`–`client10` and `rdp1`/`rdp2` (test fixtures),
+  `adlab-ca`. They stay on edt1 and are down with it.
+
+### 3.2 The placement map (desired state)
+
+edy (the controller) owns one desired-state document per forest. Each host keeps
+the last applied copy at `/var/lib/adlab/ha/placement.json`:
+
+```json
+{
+  "forest": "AD.EDT1.LAB",
+  "epoch": 42,
+  "hosts": {
+    "edt1":     {"site": "edt1",     "subnet": "172.15.4.0/24", "priority": 100, "dcs": ["dc1","dc2","dc3"]},
+    "mini-srv": {"site": "mini-srv", "subnet": "172.15.5.0/24", "priority": 10,  "dcs": ["dc6","dc7"]}
+  },
+  "fsmo_home": {"pdc":"dc1","rid":"dc1","schema":"dc2","naming":"dc2","infrastructure":"dc3","domaindns":"dc1","forestdns":"dc1"},
+  "fsmo_standby": "dc6",
+  "sysvol_writer": {"dc": "dc1", "lease_epoch": 42}
+}
+```
+
+`fsmo_home` keeps the role placement of [FSMO-AND-RECOVERY §1](../operations/FSMO-AND-RECOVERY.md),
+squeezed onto three DCs. The DNS partition masters move from dc4/dc5 to dc1
+when those two are demoted.
+
+## 4. FSMO roles across hosts
+
+### 4.1 Transfer (planned: drain, maintenance, failback)
+
+`samba-tool fsmo transfer` between two live DCs. It is always safe and is the
+only thing a drain or a failback uses. Before demoting a DC, all its roles move
+to `fsmo_home` or `fsmo_standby`. The existing `v_dc_demote` must refuse while
+the DC still holds a role.
+
+### 4.2 Seize (unplanned: host loss), split by risk
+
+Seizing is where corruption comes from. A role seized from a DC that is
+actually alive gives two owners. For the RID master, two owners means
+overlapping RID pools and **duplicate SIDs**. So the roles split into two
+classes:
+
+| Class | Roles | Seize policy on confirmed host loss | When the old holder returns |
+|---|---|---|---|
+| **A: auto** | PDC emulator, Infrastructure, DomainDnsZones, ForestDnsZones | **automatic** after fencing (§5) | Safe: it learns the new `fSMORoleOwner` by inbound replication and gives up the role. Microsoft documents the same rule for PDC and Infrastructure masters. |
+| **B: manual** | RID master, Schema master, Domain naming | **never automatic.** Raise an alert. An operator seizes only if the host is gone for good, or a DC's RID pool is running low (`rIDAvailablePool` / `samba-tool dbcheck`). | **Must not come back.** If one was seized, every DC on the returning host that held it is **rebuilt**: metadata cleanup, then a fresh join. The host boots its DCs fenced (§5.3), so this happens before samba starts. |
+
+Why class B can wait: each DC already holds a RID pool (500 RIDs) and asks for
+the next one well before it runs out. Schema and naming changes do not happen
+during an outage. One week without the RID master costs nothing in this lab;
+one bad seize costs the forest.
+
+## 5. Split brain, quorum and fencing
+
+### 5.1 The problem with two hosts
+
+With edt1 and mini-srv alone, "the other host is unreachable" means either
+**it is dead** or **the link between us is cut**. Neither side can tell which.
+If mini-srv seizes the PDC and takes the SYSVOL writer role during a partition,
+there are two SYSVOL writers. The `--delete-after` push then destroys GPO edits
+on one side when the partition heals.
+
+Directory writes themselves are fine in a split: AD resolves them per attribute
+by version and timestamp when replication resumes. Only the single-writer items
+in §2 need a tiebreaker.
+
+### 5.2 The witness signal is an edy raft lease
+
+The AD lab does not run its own quorum. It uses edy's:
+
+- The **controller** is the edy component running on the **raft leader** of the
+  trusted cluster ("runs only on the raft leader"). When leadership moves, the
+  controller moves with it.
+- The trusted cluster must have **≥3 voters across ≥2 failure domains plus a
+  witness**. With 1 trusted node on mini-srv and the rest on edt1, the edt1
+  side always has the majority. Then mini-srv **can never confirm** that edt1
+  is dead, so failover to it can never be automatic. A **witness voter outside
+  both hosts** fixes that (owner decision L1/L4: a flagged trusted node; for
+  example a tiny VM or SBC on separate power, or a cloud node).
+- **Until a third-domain witness exists, failover is manual-attest.** The
+  controller alerts, and an operator calls `ha-attest-host-dead edt1` (§7)
+  after checking that edt1 really is down. That attestation stands in for the
+  quorum vote. The rest of the flow is the same.
+
+### 5.3 Leases and self-fencing (no power fencing needed)
+
+mini-srv has no BMC and edt1 cannot be powered off remotely, so fencing is
+**lease-based**: a host stops acting as a single writer by itself before anyone
+else may take over.
+
+1. The controller grants a **writer lease** to the host that holds the PDC role
+   and the SYSVOL writer: `{host, epoch, expires_at}`. TTL is 60 s, renewed
+   every 15 s through the host's edy agent.
+2. Each host runs `adlab-ha-watchdog` (a systemd timer every 10 s; host-local,
+   needs no network). It writes the lease into
+   `/var/lib/adlab/ha/lease.json` and **self-fences** when the lease lapses:
+   - SYSVOL replication from this host stops (freeze, no `--delete-after`),
+   - the GPO and SYSVOL-writing verbs in `adlab-admin` refuse with
+     `"not the SYSVOL writer (lease expired)"`,
+   - the **DCs keep running and keep serving authentication**. Fencing a DC
+     would only cut off the clients on that side; nothing about a running DC
+     is unsafe in a partition.
+3. The controller may take over (seize class A, grant the lease to the other
+   host) only at `expires_at + grace` (grace = 5 min by default). That margin
+   covers clock skew (both hosts are NTS-synced and within 1 s) and a slow
+   watchdog. edt1's normal reboot (≈ 25 s to `multi-user`, + 45 s timer
+   + ≈ 60 s lab start) fits inside it, so a reboot does not cause a failover.
+4. **Epoch fencing on every mutating call.** The host keeps the highest epoch
+   it has seen and rejects any call with a lower one (`409 stale_epoch`). A
+   deposed leader's late calls bounce.
+5. **Boot is fenced.** Under HA, `21-start.sh` (via `samba-ad-lab.service`)
+   checks `placement.json` and `lease.json` first:
+   - no valid lease: start the DCs **with SYSVOL frozen**;
+   - the controller has marked a DC "rebuild" (it held a class-B role that was
+     seized): **do not start that DC**.
+   The controller then reconciles.
+
+### 5.4 State machine (per forest)
+
+```
+            healthy(edt1 active)
+                 │  edt1 heartbeat lost
+                 ▼
+            suspect ── edt1 back within lease+grace ──► healthy (no action)
+                 │  lease expired + grace, AND (quorum says edt1 gone OR operator attested)
+                 ▼
+            failover: seize class A onto fsmo_standby (dc6); grant writer lease to mini-srv;
+                      SYSVOL source := dc6; alert "class B roles stranded on dc1/dc2"
+                 │
+                 ▼
+            degraded(mini-srv active)
+                 │  edt1 returns; its DCs boot fenced (SYSVOL frozen)
+                 ▼
+            rejoin: rebuild any DC flagged for class-B seize; else let inbound
+                    replication converge (fSMORoleOwner, all 5 NCs green, 0 failures)
+                 │  healthy for HOLD = 30 min (hysteresis)
+                 ▼
+            failback: pull SYSVOL dc6 → edt1 DCs (edits made during the outage live there);
+                      transfer class A back to fsmo_home; move writer lease to edt1
+                 │
+                 ▼
+            healthy(edt1 active)
+```
+
+Failback is **automatic but preemption-delayed**, matching edy's "mini-srv
+members are standby priority, preempting back with hysteresis". `HOLD` stops a
+flapping edt1 from bouncing the roles.
+
+## 6. Per-service HA
+
+### 6.1 SYSVOL
+
+Keep the proven design ([SYSVOL.md](../reference/SYSVOL.md)): one source,
+read-only rsyncd, every other DC pulls with `-rlptD -X -H --delete-after`, then
+`sysvolreset` and `sysvolcheck`. Three changes:
+
+1. **The source comes from the lease, not only from the directory.** Today
+   `sysvol-replicate.sh` asks the directory who holds the PDC role. In a split,
+   or right after a host returns, a DC can still believe a stale owner. Under
+   HA, a host replicates only if it holds a valid writer lease, and only from
+   `placement.sysvol_writer.dc`. It also cross-checks the directory's PDC owner
+   and freezes if the two disagree.
+2. **Cross-host transport.** Each host's replicator updates **its own** DCs.
+   The writer host serves the read-only rsyncd; the other host's DCs pull it
+   across the routed link (port 873, limited to the DC subnets). Same flags.
+3. **Failback pull.** Before the writer lease returns to edt1, edt1's DCs pull
+   from the outage-time source once, so GPO edits made during the outage
+   survive.
+
+Rejected for now: a bidirectional sync (osync/unison: conflict semantics on
+NTACL xattrs, and a second writer is the very thing we fence) and a replicated
+filesystem (CephFS: `security.NTACL` xattrs and the idmap rules are unproven
+there, and it would put a storage dependency under every DC). Revisit CephFS
+once storage-core exists.
+
+### 6.2 DNS
+
+- Backend stays `SAMBA_INTERNAL`, AD-integrated. Zones replicate in
+  DomainDnsZones/ForestDnsZones, which is already multi-master. Every DC is an
+  authoritative server.
+- **Clients must be given DCs from both hosts.** Today the edy DHCP scope hands
+  out only `172.15.4.10` (dc1). Change it to one DC per host, local first
+  (`172.15.4.10, 172.15.5.10`). Container clients get the same from
+  `fix_ad_resolv`.
+- Each host's DCs forward to their **local** edy router/resolver (on edt1 that
+  is `172.16.4.1`, the current `FORWARDER`). A per-host `FORWARDER` goes in the
+  placement map. Remember that samba reads `dns forwarder` only at start.
+- Optional, later: a per-site **anycast DNS VIP** fronting the DCs' DNS
+  (health-gated: SRV query for `_ldap._tcp.dc._msdcs`). This is the owner's
+  "DNS anycast is the first user" item, and edy's anycast work owns it.
+- edy side: the edy resolver needs **conditional forwarding** of `ad.edt1.lab`
+  (and every extra forest) to the DCs, so non-domain edy clients and the
+  storage-core SMB servers can find KDCs. Never create an `ad.edt1.lab` zone on
+  edy: it blackholes every unlisted name (memory `samba-ad-lab-services`).
+
+### 6.3 Time
+
+The PDC emulator is the domain's time root in the Windows hierarchy, but in
+this lab every DC serves its **host's** clock: `chronyd -x` with
+`server host.containers.internal`, signed through `ntp_signd`, and each host
+syncs the NTS pool. Moving the PDC role therefore changes nothing for time.
+mini-srv needs the same `.etcdefaults/chrony/conf.d/50-lab-serve.conf` and the
+same DC image. The health check alarms if the DCs on the two hosts differ by
+more than 1 s (Kerberos allows 5 min).
+
+### 6.4 Kerberos and storage-core SMB
+
+- Clients and SMB servers locate KDCs by SRV (`_kerberos._tcp`,
+  `_kerberos._tcp.<site>._sites`), so the second host is found automatically.
+  The storage-core keytabs do not care which DC issued a ticket.
+- Hints for edy `settings/auth/kerberos`: per realm, `dns_lookup_kdc = true`,
+  with a static fallback `kdc =` list of one DC per host. For forest GC binding,
+  suggest `_gc._tcp.<forest>` on 3268/3269 (LDAPS needs the DC certs; see
+  `42-tls-from-edy-ca.sh`). Every Samba DC is a GC.
+
+### 6.5 Backups (HA is not backup)
+
+Run `samba-tool domain backup online` nightly on the passive host, with the
+copies kept on the **other** host. That covers the deleted-OU and corrupt-forest
+cases that replication spreads instead of fixing.
+
+## 7. Management API (called by edy trusted nodes)
+
+### 7.1 Shape
+
+- **The executor is `adlab-admin`**: new `ha-*` verbs in the existing
+  JSON-in/JSON-out verb table, so the Cockpit UI and edy share one
+  implementation and one audit log. edy calls them on each host through its
+  host agent (job exec as root). There is no new listening socket.
+- **The controller is in edy** (raft leader). It holds the placement map and
+  the lease, decides, and calls the verbs. The host side is a thin, idempotent
+  reconciler that **refuses** anything unsafe locally (receiver authority): it
+  never trusts the caller's view of the roles; it re-reads them from its own
+  DCs.
+- Every mutating verb takes `epoch` (§5.3) and `op_id`. A repeated `op_id`
+  returns the first result and does nothing again.
+- Results include `evidence`: the raw `fsmo show` / `showrepl` / `sysvolcheck`
+  output the host acted on, so edy logs what the host saw, not what it assumed.
+
+### 7.2 Verbs
+
+| Verb | Mutates | Purpose / refuses when |
+|---|---|---|
+| `ha-status` | no | Host inventory: DCs and their state, site, roles held, replication (per NC: last success, failures), SYSVOL hash vs the writer's, chrony LI and offset, lease, epoch, capacity (RAM/CPU/disk free) |
+| `ha-health --dc D` | no | Deep check of one DC: container up; ports 53/88/389/445/636/3268 listen; `ldapsearch` rootDSE; `kinit -k` of the machine account; SRV lookup through the DC itself; `drs showrepl` green; `sysvolcheck` |
+| `ha-placement-apply --file` | yes | Store the desired placement and lease. Rejects a lower epoch. Plans only: returns the diff, does not deploy |
+| `ha-dc-deploy --dc D --site S --ip IP` | yes | Join a new DC on **this** host (wraps `v_dc_promote` with an explicit name, IP, site and per-host forwarder). Refuses if the name or IP is in use, the capacity check fails, or the forest's last replication is older than 60 days (tombstone margin) |
+| `ha-dc-remove --dc D` | yes | Clean demote and remove. Refuses if D holds a role, or if it would leave the host or the domain with no writable DC |
+| `ha-dc-rebuild --dc D` | yes | Metadata cleanup from a live peer, wipe the state dir, fresh join. Used after a class-B seize or a tombstone/USN-rollback finding |
+| `ha-fsmo-transfer --role R --to D` | yes | Graceful transfer. Both owners must be reachable |
+| `ha-fsmo-seize --role R --to D --lease-proof P` | yes | Class A only, unless `--class-b --i-understand` from an operator. Requires a valid takeover proof: the expired lease plus a quorum or attestation token. Records the old holder for the rejoin check |
+| `ha-sysvol-writer --dc D` | yes | Move the SYSVOL source (with the lease). A cold or out-of-date target pulls from the old writer first if it is reachable |
+| `ha-drain` | yes | Maintenance: transfer every role off this host's DCs, give up the writer lease, then report `drained`. Refuses if no other host has a healthy DC to take the roles |
+| `ha-undrain` | yes | Clears the drain flag. Roles come back only through the normal failback (hysteresis) |
+| `ha-fence` / `ha-unfence` | yes | Stop or allow the host's single-writer functions by hand (SYSVOL, GPO verbs). DCs keep running |
+| `ha-attest-host-dead --host H` | yes | Operator-only stand-in for a quorum vote while no witness exists (§5.2). Logged with who and why |
+| `ha-rejoin-check` | no | After a return: which local DCs may start normally, which must be rebuilt, and why |
+
+### 7.3 edy side (for the edy-proxy-go session, not built here)
+
+- Host-cluster entity: hosts by GUID, failure domain, `adlab_capable`, and
+  the capacity profile.
+- The **Hosting Domain Authentication** toggle per host cluster. Off means edy
+  never calls a mutating `ha-*` verb.
+- The controller loop on the raft leader: heartbeat each host (`ha-status`
+  every 15 s), lease renewal, the state machine of §5.4, alerts.
+- Conditional DNS forwarding for AD zones, DHCP DNS options with one DC per
+  site, and the Kerberos settings hints of §6.4.
+
+## 8. Health signals and alerts
+
+| Signal | Source | Warn | Page |
+|---|---|---|---|
+| Host heartbeat | `ha-status` via edy agent | 1 missed | lease + grace passed |
+| Replication | `drs showrepl` per NC | any failure > 15 min | > 4 h, or any NC > 24 h old |
+| SYSVOL drift | hash vs writer | > 2 cycles | > 1 h |
+| Time | chrony offset, LI | > 1 s | LI≠0 or > 60 s |
+| Class-B roles on a dead host | `fsmo show` | always | > 24 h |
+| RID pool | `dbcheck` / rIDAvailablePool | < 30 % | < 10 % |
+| Tombstone margin | last inbound replication per DC | > 30 days | > 60 days (refuse to start, rebuild) |
+| Witness | edy `has_quorum` | false | false and a host lost |
+
+## 9. Failure scenarios (each one becomes a testbed drill, §10)
+
+| # | Scenario | Expected outcome |
+|---|---|---|
+| D1 | edt1 clean reboot | No failover (fits in lease + grace). The writer lease is renewed after boot |
+| D2 | edt1 hard power-off for 30 min | Class A seized onto dc6 at expiry + grace; auth continues on mini-srv; class-B alert. Fails back 30 min after edt1 is healthy; GPO edits made during the outage survive |
+| D3 | Link cut, both hosts alive | Without the witness: edt1 keeps the roles (majority), mini-srv self-fences nothing (it holds no lease), auth works on both sides, directory writes converge on heal. With a witness on mini-srv's side: same, roles stay with the lease holder |
+| D4 | Link cut, and the witness is with mini-srv | edt1's lease lapses and it self-fences SYSVOL/GPO; mini-srv takes class A after grace. On heal: rejoin plus failback. Never two SYSVOL writers |
+| D5 | mini-srv down | No role change. Alert only |
+| D6 | Operator drain of edt1 | Roles move to mini-srv by transfer (no seize); edt1 stops cleanly; undrain + failback |
+| D7 | Class-B seize by an operator, then edt1 returns | dc1/dc2 flagged for rebuild, boot fenced, rebuilt by `ha-dc-rebuild`; no duplicate SIDs (`dbcheck`, a SID uniqueness scan) |
+| D8 | Stale leader call (old epoch) | `409 stale_epoch`, no change |
+| D9 | DC state restored from a snapshot (the negative test) | Detected by the health check (invocationID / USN mismatch reported by partners), DC quarantined and rebuilt |
+
+## 10. Testbed: two test VMs (owner, 2026-11-11)
+
+The design is built and drilled on **two throwaway VMs** that stand in for edt1
+and mini-srv. The live lab and the shared lab VMs are never touched (memory
+`shared-lab-vm-no-touch`).
+
+- **VMs:** created with the `edy-rapid-update` tooling (`epg-vm`, `epg-snap`)
+  from the hardened noble golden image. Names follow its rule,
+  `epg-stack-adl-os1-01` (host A, "edt1") and `epg-stack-adl-os1-02`
+  (host B, "mini-srv"), deployment code `adl`. They need a new stack role
+  `adhost` (rootful podman for the DC containers, which the rapid-update
+  validator does not allow today; that is a small `epg-stack` change). Size:
+  B is capped at mini-srv's real budget (4 vCPU, 8 GB for the lab share);
+  deploy at 6 vCPU / 16 GB and size down afterwards (memory
+  `lab-vm-deploy-sizing`). Use `qemu-img` snapshots after the forest is up, so
+  every drill starts from a known point. (Snapshots are fine **here** because
+  the whole testbed forest is reverted together, all VMs at once. The
+  USN-rollback rule is about restoring one DC while its partners move on.)
+- **Forest:** a separate test forest `HA.TEST.LAB` built from this repo's
+  images and scripts, never joined to `AD.EDT1.LAB`. Subnets `172.31.4.0/24`
+  (A) and `172.31.5.0/24` (B), routed between the VMs on their own libvirt
+  network.
+- **Secrets:** the test forest's administrator password is generated on the
+  VM into a root-only `.secrets/administrator.pass` (0600), the same layout as
+  the lab. edy API keys for the controller are minted with `edy-root-ops`
+  `edy-token` into 0600 files. Nothing goes into the repo, argv or logs.
+- **Controller and witness:** first a script-driven controller
+  (`tools/ha-sim.sh`, it plays edy's role and calls the `ha-*` verbs through
+  the VM runners), then a throwaway edy cluster from `edy-root-ops`
+  `edy-testcluster` (trusted + witness) once the edy controller exists.
+  Registering test nodes with the **live** edy fleet is a live change and
+  needs the owner's go-ahead (per the `edy-rapid-update` rules).
+- **Load:** one VM build at a time, `uptime` first (edt1 was hard-reset by
+  agent overload on 2026-10-04).
+
+## 11. Decisions taken by default (owner may override)
+
+| # | Decision | Default |
+|---|---|---|
+| 1 | Networking for DCs | Routed per-host subnets plus AD sites; no L2 stretch or anycast for DCs |
+| 2 | DC split | edt1: dc1–dc3; mini-srv: dc6, dc7; demote dc4/dc5 afterwards |
+| 3 | Auto-seize scope | Class A only (PDC, Infrastructure, both DNS masters). RID, Schema and Naming are manual |
+| 4 | SYSVOL | Keep the single-source rsync push, gated by an edy writer lease; no bidirectional sync |
+| 5 | Witness | Manual attestation until a third-failure-domain trusted node exists |
+| 6 | Failback | Automatic after 30 min healthy |
+| 7 | API | `ha-*` verbs in `adlab-admin`, called through the edy host agent; controller on the raft leader |
+| 8 | Timers | Lease TTL 60 s, renewal 15 s, grace 5 min, HOLD 30 min |
+
+**The one owner decision that blocks automatic failover** (not the build): where
+the third-failure-domain witness lives. Phases 0–3 in `todo.md` do not need it.
