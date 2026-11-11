@@ -350,7 +350,60 @@ cases that replication spreads instead of fixing.
 | `ha-attest-host-dead --host H` | yes | Operator-only stand-in for a quorum vote while no witness exists (§5.2). Logged with who and why |
 | `ha-rejoin-check` | no | After a return: which local DCs may start normally, which must be rebuilt, and why |
 
-### 7.3 edy side (for the edy-proxy-go session, not built here)
+### 7.3 Contract details (agreed with the "edy-proxy-go dev" session, 2026-11-11)
+
+**Envelope (Q1).** Every request and every response is versioned.
+
+```json
+// request
+{"schema_version": "adlab-ha/1", "verb": "ha-fsmo-transfer", "epoch": 42, "op_id": "c0ffee…",
+ "args": {"role": "pdc", "to": "dc6"}}
+// response
+{"schema_version": "adlab-ha/1", "ok": true, "op_id": "c0ffee…", "epoch_seen": 42, "replayed": false,
+ "result": {…}, "evidence": {"fsmo_show": "…"}, "error": null}
+// error
+{"schema_version": "adlab-ha/1", "ok": false, "op_id": "…", "epoch_seen": 43,
+ "error": {"code": "stale_epoch", "message": "…", "retryable": false}}
+```
+
+- `epoch` and `op_id` are **required on every mutating verb**. They are optional
+  on read-only verbs, which still report `epoch_seen`.
+- The host keeps op_id results for 7 days. A replay returns the stored
+  response with `replayed: true`.
+- The major version must match. An unknown major returns
+  `unsupported_schema`. Minor additions are additive and ignored by older
+  readers. `ha-status` lists `supported_schemas`.
+- Error codes: `stale_epoch`, `unsupported_schema`, `refused` (a local safety
+  check failed; `message` says which), `busy` (another mutating op holds the
+  host lock; retryable), `not_found`, `internal`. `retryable` comes from the
+  receiver, never from a guess by the caller.
+
+**`ha-status` bounds (Q2).** `ha-status` never runs `samba-tool` inline. A
+host-local collector, the same timer as `adlab-ha-watchdog`, refreshes
+`/var/lib/adlab/ha/status.json` every 15 s. It runs `drs showrepl`, `fsmo show`,
+the SYSVOL hash and chrony checks per DC, with a 30 s budget per cycle.
+
+- `ha-status` returns that snapshot plus `collected_at` and `age_s`.
+- Target runtime is ≤ 1 s, hard ceiling 3 s, which fits under the
+  controller's 10 s timeout.
+- Payload is ≤ 64 KB (5 DCs × 5 NCs plus evidence summaries; full raw output
+  only from `ha-health`).
+- If the snapshot is older than 45 s, the controller reads it as "collector
+  stalled": a warning, not proof the host is dead.
+- `ha-health --dc D` is the slow deep check (≤ 30 s). Call it on demand or
+  async, never on the heartbeat path.
+
+**Privilege (Q3).** Collection needs root (rootful `podman exec`, `samba-tool`),
+so the collector runs as root. **Reading** does not:
+
+- `status.json` is `0640 root:adlab-ha`.
+- `ha-status` and `ha-rejoin-check` can run as a dedicated unprivileged
+  `adlab-ha` user through the agent.
+- Every mutating verb runs as root through `adlab-admin` and enforces the
+  epoch/op_id/safety checks itself (receiver authority). A non-root caller of
+  a mutating verb is refused.
+
+### 7.4 edy side (for the edy-proxy-go session, not built here)
 
 - Host-cluster entity: hosts by GUID, failure domain, `adlab_capable`, and
   the capacity profile.
@@ -443,6 +496,20 @@ and mini-srv. The live lab and the shared lab VMs are never touched (memory
     (one shared DC subnet reachable from both hosts) or stays routed is an
     owner decision for the final design. Either way the AD-site and FSMO logic
     is the same. Sites come from address ranges, not from L2 boundaries.
+- **Second trusted node join (confirmed by edy-proxy-go dev, from its PR #515
+  two-trusted-node test).** B joins as a **trusted** node with a registration
+  bundle, the same way an edge does. Caveats for `tb-edy.sh up`:
+  - Both nodes must start with the **same fleet master password**, otherwise B
+    mints its own CA and distrusts A. It is generated once into a 0600 file
+    in `~/.config/adl-ha/` and handed over through the root-only runner share
+    `secrets/`, deleted on use.
+  - Set `EDY_VAULT_PASSPHRASE` on B, otherwise B has no vault passphrase.
+  - Until registration completes, B's node id is its hostname, so its early
+    key announcements are refused. This is harmless.
+  - B's peer row for A is named `controller`.
+  - Do **not** rely on edy agent self-update in the testbed: release
+    self-update is blocked fleet-wide until the code-signing CA is trusted (an
+    owner decision). Updates are the binary copy below.
 - **Keep edy-proxy-go updated on both VMs (owner, 2026-11-11).** The testbed
   tracks current edy main and never drifts behind the edt1 fleet.
   - **Source:** the same promoted main build that `edy-testcluster` uses (the
