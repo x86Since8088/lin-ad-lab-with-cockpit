@@ -72,6 +72,13 @@ live DC.
 | edt1 | `edt1` | `172.15.4.0/24` (`static-edt`, unchanged) | `dc1`, `dc2`, `dc3` | **active**: holds all FSMO roles and the SYSVOL writer lease |
 | mini-srv | `mini-srv` | `172.15.5.0/24` (new bridge `static-mini`) | `dc6`, `dc7` | **passive**: warm DCs, no roles, takes roles only on failover |
 
+- **Both sites must be in one site link, with change notification on.** A site that
+  belongs to no site link gets no inter-site connections from the KCC, so the hosts
+  silently stop replicating with each other. The testbed hit exactly this: a seize on
+  B never reached A. Use `DEFAULTIPSITELINK` (or a dedicated link) containing both
+  sites, with `options=1` (change notification across the link) and `replInterval=15`.
+  AD's inter-site default is 180 minutes, far too slow for HA. Health alarm: a
+  DC with no inbound connection from the other site.
 - **Each host gets its own routed subnet** and one AD site with that subnet.
   The KCC builds inter-site replication; clients prefer DCs in their own site
   and fall back to others. AD is built for this, and it needs no VXLAN/EVPN.
@@ -211,7 +218,7 @@ The AD lab does not run its own quorum. It uses edy's:
   |---|---|---|
   | **down** | No domain reaches the lost side's trusted node or host agent, and its own host's nodes report nothing | Full failover (§5.4): seize class A, move the writer lease |
   | **isolated** | The lost side is alive (its own host's nodes still reach it) but no other domain reaches it | Full failover: the isolated host self-fenced at lease expiry, and its roles are useless to everyone else. Its DCs keep serving local clients; flagged for normal rejoin |
-  | **split** | Both trusted sides are still reached, each by a different set of domains | **Lease-only failover:** the writer lease (SYSVOL/GPO) moves to the majority side, and the minority self-fences. **No FSMO seize.** Both PDCs would be alive, so roles move only by a graceful `ha-fsmo-transfer` after the split heals |
+  | **split** | Both trusted sides are still reached, each by a different set of domains | **Lease-only failover:** the lease moves to the majority side, and the minority self-fences. **No FSMO seize.** Both PDCs would be alive, so roles move only by a graceful `ha-fsmo-transfer` after the split heals. **GPO/SYSVOL writes are frozen on both sides until the heal** (found while building the testbed). The PDC, and so the SYSVOL source, stays on the minority side, and the replicator refuses a writer that disagrees with the directory's PDC owner (§6.1). Authentication continues everywhere |
   | **unknown** | Too few reports to tell (for example, no third domain) | Nothing automatic. Alert; operator attestation (§5.2) can upgrade it to down |
 
   - The classification and a summary of its evidence (which domains reached
@@ -313,7 +320,15 @@ read-only rsyncd, every other DC pulls with `-rlptD -X -H --delete-after`, then
    HA, a host replicates only if it holds a valid writer lease, and only from
    `placement.sysvol_writer.dc`. It also cross-checks the directory's PDC owner
    and freezes if the two disagree.
-2. **Cross-host transport.** Each host's replicator updates **its own** DCs.
+2. **Fence vs. serve (testbed finding).** A manual fence or a drain stops
+   *writes* (GPO edits), never the writer's *read-only* serving. The failback's
+   final delta pull needs it. Serving stops only when the lease lapses.
+3. **Role transfer reads the authoritative owner.** A DC that just came back
+   holds a stale local `fSMORoleOwner` until it replicates. Transfer decisions,
+   and the check after them, use a DC on the *other* host. The controller does
+   not start failback until the returning host's DCs agree with the survivor on
+   the PDC owner.
+4. **Cross-host transport.** Each host's replicator updates **its own** DCs.
    The writer host serves the read-only rsyncd; the other host's DCs pull it
    across the routed link (port 873, limited to the DC subnets). Same flags.
 3. **Failback pull.** Before the writer lease returns to edt1, edt1's DCs pull
@@ -776,3 +791,23 @@ with numbers recorded (rates and latencies, not just "it worked"; same style as
 Exit for the program: all rows pass three runs in a row, results are written to
 `docs/design/HA-STRESS-RESULTS.md`, and the owner reviews them. Only then is any
 HA test proposed for edt1.
+
+## 13. Findings from the testbed drills (2026-11-11)
+
+The design was built on the isolated testbed: host engine `cockpit-adlab/adlab-ha`,
+controller stand-in `ha-testbed/ha-sim.py`, and drills `ha-testbed/drills.py`. Every
+drill exposed something the design or code now handles. These are rules for any
+implementation, including edy's.
+
+| # | Found by | Defect / gap | Rule now |
+|---|---|---|---|
+| F1 | D2 | The KCC built no inter-site connections: the second site was in no site link, so the hosts silently stopped replicating, and a seize on B never reached A | Both sites go in one site link with change notification (`options=1`) and `replInterval=15` (§3.1). Alarm on "no inbound connection from the other site" |
+| F2 | D2 | A just-returned DC holds a stale `fSMORoleOwner`, so "already owner" checks run there are wrong (the transfer became a no-op) | Role decisions and verification read a DC on the *other* host. Failback waits until the returning host's DCs agree on the PDC owner |
+| F3 | D2 | A manual fence stopped the writer's read-only SYSVOL serving, so the failback's final pull could never succeed | Fence/drain stop *writes* only. Read-only serving follows the lease |
+| F4 | D2 | **Data loss.** A lease renewal raised a returning host's epoch before the placement reached it. The same-epoch placement was then refused as "two controllers", and the host kept a stale writer. Failback pulls became no-ops, and `--delete-after` erased GPO folders created during the outage | A renewal never moves the epoch. `ha-sysvol-writer` refuses when the host's placement epoch ≠ the call's. The controller checks that the new writer's SYSVOL hash equals the old writer's before switching. Drills verify each GPO folder on every DC |
+| F5 | D4 | A survivor's peer-reachability report was stale (collected before the cut), so the first classifications said `unknown` | Classify only on survivor reports collected after the loss |
+| F6 | D1, D7 | A DC that held class-B roles could serve for some seconds after boot, before anyone could tell it its roles were seized | DCs run `--restart=no`, and the host agent supervises them. Class-B holders stay held after boot until the controller speaks, or (full cold start) until nobody else answers for `hold_boot_s` |
+| F7 | D7 | An operator's class-B seize happens after the takeover, when the survivor's lease already names itself, so the proof could not be matched | The host keeps a lease history; a proof may match an expired lease of the lost host there |
+| F8 | D7, D9 | After a DC is rebuilt under the same name, every partner's samba keeps Kerberos tickets for the old incarnation. DRS fails with `WERR_GEN_FAILURE` until they expire (hours) or samba restarts | The rebuild ends with a rolling restart of the partner DCs, one at a time, holders last |
+| F9 | D9 | A snapshot-restored DC (USN rollback) went undetected | Each DC's own `highestCommittedUSN` is compared with its partners' `repsFrom` high-water mark for its invocationId. If a partner is ahead, the DC is stopped, held, and rebuilt. Detected in 35 s on the testbed |
+| F10 | build | During a split the PDC (and so the SYSVOL source) stays on the minority side | SYSVOL/GPO writes freeze on both sides until the heal (§5.2) |

@@ -1,0 +1,1078 @@
+#!/usr/bin/env python3
+"""adlab-ha — the host side of multi-host AD HA (docs/design/HA-MULTI-HOST.md §5–§7).
+
+One host = one failure domain running some of the forest's DCs as podman containers.
+This engine never decides a failover; the controller (edy, or ha-sim on the testbed)
+does. The host ENFORCES: epochs, op_id replay, the writer lease (self-fencing), the
+seize rules (class A/B, lease proof, classification, attestation, holder-alive probe)
+and SYSVOL single-writer replication. Contract: adlab-ha/1 (design §7.3 v1.1).
+
+  adlab-ha json            one request envelope on stdin -> one response envelope on stdout
+  adlab-ha agent           long-running: collector (status.json), lease watchdog, SYSVOL sync
+  adlab-ha status          pretty status (local, for operators)
+
+Config: /etc/adlab-ha/host.json. State: /var/lib/adlab/ha/. Stdlib only.
+"""
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+
+SCHEMA = "adlab-ha/1"
+CONF = os.environ.get("ADLAB_HA_CONF", "/etc/adlab-ha/host.json")
+STATE = os.environ.get("ADLAB_HA_STATE", "/var/lib/adlab/ha")
+AUDIT = os.path.join(STATE, "audit.log")
+CLASS_A = ["pdc", "infrastructure", "domaindns", "forestdns"]
+CLASS_B = ["rid", "schema", "naming"]
+ROLE_NAMES = {  # samba-tool fsmo show label -> role id
+    "SchemaMasterRole": "schema", "InfrastructureMasterRole": "infrastructure",
+    "RidAllocationMasterRole": "rid", "PdcEmulationMasterRole": "pdc",
+    "DomainNamingMasterRole": "naming", "DomainDnsZonesMasterRole": "domaindns",
+    "ForestDnsZonesMasterRole": "forestdns"}
+# production timers (design §5.3); placement.timers may scale them for stress runs
+DEFAULT_TIMERS = {"ttl_s": 60, "renew_s": 15, "grace_s": 300, "hold_s": 1800,
+                  "sysvol_s": 300, "collect_s": 15, "attest_max_s": 3600, "hold_boot_s": 600}
+BOOT_T = None   # set by the agent at start
+MUTATING = {"ha-placement-apply", "ha-fsmo-transfer", "ha-fsmo-seize", "ha-sysvol-writer",
+            "ha-fence", "ha-unfence", "ha-drain", "ha-undrain", "ha-attest-host-dead",
+            "ha-attest-clear", "ha-dc-remove-dead", "ha-dc-rejoin", "ha-dc-restart"}
+READ_NONROOT = {"ha-status", "ha-rejoin-check"}
+
+
+class Refused(Exception):
+    def __init__(self, code, message, retryable=False):
+        super().__init__(message)
+        self.code, self.message, self.retryable = code, message, retryable
+
+
+# ---------------------------------------------------------------- state io
+def now():
+    return time.time()
+
+
+def jread(name, default=None):
+    try:
+        with open(os.path.join(STATE, name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def jwrite(name, obj, mode=0o640):
+    os.makedirs(STATE, exist_ok=True)
+    p = os.path.join(STATE, name)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1, sort_keys=True)
+    os.chmod(tmp, mode)
+    os.replace(tmp, p)
+
+
+def audit(event, **kw):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        rec = {"t": round(now(), 3), "event": event}
+        rec.update(kw)
+        with open(AUDIT, "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)        # agent + API calls append concurrently
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def conf():
+    with open(CONF) as f:
+        return json.load(f)
+
+
+def timers():
+    t = dict(DEFAULT_TIMERS)
+    t.update((jread("placement.json", {}) or {}).get("doc", {}).get("timers", {}) or {})
+    return t
+
+
+def canon_hash(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+# ---------------------------------------------------------------- DC access
+def run(argv, timeout=60, inp=None):
+    try:
+        p = subprocess.run(argv, input=inp, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+
+
+def dc_exec(dc, cmd, timeout=60):
+    return run(["podman", "exec", dc, "sh", "-c", cmd], timeout=timeout)
+
+
+def dc_auth_exec(dc, cmd, timeout=120):
+    """Run a samba-tool command needing domain-admin creds INSIDE the DC: an authfile
+    built from the mounted /run/adminpass (0600, removed after), never argv."""
+    c = conf()
+    wrapped = ("umask 077; f=$(mktemp); printf 'username=Administrator\\npassword=%%s\\ndomain=%s\\n' "
+               "\"$(cat /run/adminpass)\" > \"$f\"; %s -A \"$f\"; rc=$?; rm -f \"$f\"; exit $rc"
+               % (c["domain_nb"], cmd))
+    return dc_exec(dc, wrapped, timeout=timeout)
+
+
+def container_state(dc):
+    rc, out, _ = run(["podman", "inspect", "-f", "{{.State.Status}}", dc], timeout=15)
+    return out.strip() if rc == 0 else "missing"
+
+
+def fsmo_owners(dc):
+    """role -> owning DC name (lowercase), read from the given local DC."""
+    rc, out, err = dc_exec(dc, "samba-tool fsmo show", timeout=30)
+    if rc != 0:
+        raise Refused("internal", "fsmo show on %s failed: %s" % (dc, (err or out).strip()[:200]), True)
+    owners = {}
+    for line in out.splitlines():
+        m = re.match(r"(\w+) owner: CN=NTDS Settings,CN=([^,]+),", line.strip())
+        if m and m.group(1) in ROLE_NAMES:
+            owners[ROLE_NAMES[m.group(1)]] = m.group(2).lower()
+    return owners
+
+
+def fsmo_owners_remote(via_dc):
+    """role -> owner as seen by a DC on another host (queried over LDAP from local via_dc,
+    with creds). A DC that just came back may hold a STALE local view of fSMORoleOwner."""
+    c = conf()
+    for d, ip in sorted(c.get("all_dcs", {}).items()):
+        if d in c["dcs"]:
+            continue
+        rc, out, err = dc_auth_exec(via_dc, "timeout 30 samba-tool fsmo show -H ldap://%s" % ip, timeout=60)
+        if rc != 0:
+            continue
+        owners = {}
+        for line in out.splitlines():
+            m = re.match(r"(\w+) owner: CN=NTDS Settings,CN=([^,]+),", line.strip())
+            if m and m.group(1) in ROLE_NAMES:
+                owners[ROLE_NAMES[m.group(1)]] = m.group(2).lower()
+        if owners:
+            return owners, d
+    return None, None
+
+
+def repl_summary(dc):
+    rc, out, _ = dc_exec(dc, "samba-tool drs showrepl --json", timeout=40)
+    if rc != 0:
+        return None
+    try:
+        d = json.loads(out)
+    except ValueError:
+        return None
+    rows = []
+    for r in d.get("repsFrom", []):
+        ts = r.get("last success") or r.get("last success time") or ""
+        try:
+            last = datetime.datetime.strptime(ts, "%a %b %d %H:%M:%S %Y %Z").replace(
+                tzinfo=datetime.timezone.utc).timestamp()
+        except ValueError:
+            last = None
+        rows.append({"nc": r.get("NC dn"), "from": (r.get("DSA") or "").split("\\")[-1].lower(),
+                     "last_success": last, "failures": int(r.get("consecutive failures") or 0)})
+    return rows
+
+
+USN_PROBE = r"""
+import json, sys
+from samba import param, credentials
+from samba.samdb import SamDB
+from samba.auth import system_session
+from samba.ndr import ndr_unpack
+from samba.dcerpc import drsblobs
+import ldb
+lp = param.LoadParm(); lp.load_default()
+local = SamDB(url="/var/lib/samba/private/sam.ldb", lp=lp, session_info=system_session())
+inv = str(local.get_invocation_id())
+usn = int(local.search(base="", scope=ldb.SCOPE_BASE, attrs=["highestCommittedUSN"])[0]["highestCommittedUSN"][0])
+nc = str(local.get_default_basedn())
+c = credentials.Credentials(); c.guess(lp)
+c.set_username("Administrator"); c.set_password(open("/run/adminpass").read().strip()); c.set_domain(sys.argv[1])
+out = {"invocation_id": inv, "local_usn": usn, "partners": {}}
+for ip in sys.argv[2:]:
+    try:
+        p = SamDB(url="ldap://" + ip, credentials=c, lp=lp)
+        hw = None
+        for v in p.search(base=nc, scope=ldb.SCOPE_BASE, attrs=["repsFrom"])[0].get("repsFrom", []):
+            ctr = ndr_unpack(drsblobs.repsFromToBlob, v).ctr
+            if str(ctr.source_dsa_invocation_id) == inv:
+                hw = max(hw or 0, int(ctr.highwatermark.highest_usn))
+        out["partners"][ip] = hw
+    except Exception as ex:
+        out["partners"][ip] = "error: %s" % str(ex)[:80]
+print(json.dumps(out))
+"""
+
+
+def usn_rollback_check(dc):
+    """USN rollback (snapshot-restored DC, design §3.3 of FSMO-AND-RECOVERY): a partner has
+    already pulled MORE from this DC's invocationId than this DC now says it has committed."""
+    c = conf()
+    partners = [ip for d, ip in sorted(c.get("all_dcs", {}).items()) if d != dc]
+    rc, out, err = run(["podman", "exec", "-i", dc, "python3", "-", c["domain_nb"]] + partners,
+                       timeout=90, inp=USN_PROBE)
+    try:
+        r = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"error": (err or out).strip()[-200:]}
+    ahead = {ip: hw for ip, hw in r["partners"].items() if isinstance(hw, int) and hw > r["local_usn"]}
+    r["rollback"] = bool(ahead)
+    r["partners_ahead"] = ahead
+    return r
+
+
+def chrony_state(dc):
+    rc, out, _ = dc_exec(dc, "chronyc -n tracking", timeout=10)
+    li, off = None, None
+    if rc == 0:
+        for line in out.splitlines():
+            if line.startswith("Leap status"):
+                li = {"Normal": 0, "Insert second": 1, "Delete second": 2}.get(line.split(":", 1)[1].strip(), 3)
+            if line.startswith("System time"):
+                m = re.search(r"([0-9.]+) seconds (fast|slow)", line)
+                if m:
+                    off = float(m.group(1)) * (1 if m.group(2) == "fast" else -1)
+    return li, off
+
+
+def sysvol_dir(dc):
+    return os.path.join(conf()["dcs"][dc]["state_dir"], "var-lib-samba", "sysvol")
+
+
+def sysvol_hash(path):
+    """Content hash of the SYSVOL tree (paths + bytes), DfsrPrivate excluded."""
+    h = hashlib.sha256()
+    if not os.path.isdir(path):
+        return None
+    for root, dirs, files in os.walk(path):
+        dirs[:] = sorted(d for d in dirs if d != "DfsrPrivate")
+        for fn in sorted(files):
+            fp = os.path.join(root, fn)
+            rel = os.path.relpath(fp, path)
+            h.update(rel.encode() + b"\0")
+            try:
+                with open(fp, "rb") as f:
+                    h.update(hashlib.sha256(f.read()).digest())
+            except OSError:
+                h.update(b"?")
+    return h.hexdigest()
+
+
+def ldap_alive(from_dc, ip, timeout=5):
+    """Does the DC at ip answer an LDAP rootDSE query, as seen from local DC from_dc?"""
+    rc, out, _ = dc_exec(from_dc, "timeout %d ldbsearch -H ldap://%s -s base -b '' dnsHostName 2>/dev/null"
+                         % (timeout, ip), timeout=timeout + 5)
+    return rc == 0 and "dnsHostName" in out
+
+
+def tcp_alive(ip, port, timeout=2.0):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- lease / fence
+def lease_view(c=None):
+    c = c or conf()
+    L = jread("lease.json") or {}
+    t = now()
+    valid = bool(L) and t < L.get("expires_local", 0)
+    holder = L.get("host")
+    fence = jread("fence.json", {}) or {}
+    drain = jread("drain.json", {}) or {}
+    may_write = (valid and holder == c["host_id"] and not fence.get("manual") and not drain.get("drained"))
+    return {"lease": L or None, "valid": valid, "holder": holder, "may_write": may_write,
+            "manual_fence": bool(fence.get("manual")), "drained": bool(drain.get("drained"))}
+
+
+def epoch():
+    return int((jread("epoch.json", {}) or {}).get("epoch", 0))
+
+
+def set_epoch(e):
+    jwrite("epoch.json", {"epoch": int(e), "t": now()})
+
+
+def store_lease(lease):
+    t = now()
+    ttl = float(lease.get("ttl_s") or timers()["ttl_s"])
+    exp_ctl = float(lease.get("expires_at") or 0)
+    rec = {"host": lease["host"], "epoch": int(lease["epoch"]), "expires_at": exp_ctl, "ttl_s": ttl,
+           "received_at": t, "expires_local": min(exp_ctl, t + ttl) if exp_ctl else t + ttl}
+    old = jread("lease.json") or {}
+    if old and (old.get("host"), old.get("epoch")) != (rec["host"], rec["epoch"]):
+        hist = jread("lease_history.json", []) or []
+        hist.append({k: old.get(k) for k in ("host", "epoch", "expires_local", "received_at")})
+        jwrite("lease_history.json", hist[-50:])
+    jwrite("lease.json", rec)
+    return rec
+
+
+# ---------------------------------------------------------------- SYSVOL
+RSYNCD_CONF = "/run/adlab-ha-rsyncd.conf"
+RSYNCD_PID = "/run/adlab-ha-rsyncd.pid"
+
+
+def rsyncd_running():
+    try:
+        pid = int(open(RSYNCD_PID).read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def rsyncd_serve(dc):
+    """Serve the writer DC's SYSVOL READ-ONLY on sh0 (module 'sysvol')."""
+    c = conf()
+    cfg = ("pid file = %s\nuse chroot = yes\nread only = yes\nuid = root\ngid = root\n"
+           "address = %s\nhosts allow = %s\n[sysvol]\npath = %s\n"
+           % (RSYNCD_PID, c["sh0_ip"], c.get("sysvol_allow", "10.31.0.0/24"), sysvol_dir(dc)))
+    old = open(RSYNCD_CONF).read() if os.path.exists(RSYNCD_CONF) else ""
+    if rsyncd_running() and old == cfg:
+        return
+    rsyncd_stop()
+    with open(RSYNCD_CONF, "w") as f:
+        f.write(cfg)
+    run(["rsync", "--daemon", "--config=" + RSYNCD_CONF], timeout=10)
+    audit("sysvol_serve", dc=dc)
+
+
+def rsyncd_stop():
+    if rsyncd_running():
+        try:
+            os.kill(int(open(RSYNCD_PID).read().strip()), 15)
+        except (OSError, ValueError):
+            pass
+        audit("sysvol_serve_stop")
+    for p in (RSYNCD_PID,):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+def sysvol_pull(dc, src):
+    """Pull SYSVOL into local DC dc from src ('local:<dc>' or 'rsync://ip/sysvol/'),
+    then let samba re-derive ownership/ACLs (sysvolreset). -X carries security.NTACL."""
+    dst = sysvol_dir(dc) + "/"
+    if src.startswith("local:"):
+        source = sysvol_dir(src[6:]) + "/"
+    else:
+        source = src
+    rc, out, err = run(["rsync", "-rlptD", "-X", "-H", "--delete-after", "--exclude=DfsrPrivate",
+                        "--timeout=60", source, dst], timeout=300)
+    if rc != 0:
+        return False, (err or out).strip()[:300]
+    rc2, out2, err2 = dc_exec(dc, "samba-tool ntacl sysvolreset", timeout=180)
+    if rc2 != 0:
+        return False, "sysvolreset: " + (err2 or out2).strip()[:200]
+    return True, ""
+
+
+def sysvol_cycle():
+    """One replication cycle (agent timer, or on demand). Single writer: the
+    placement's sysvol_writer DC on the host holding a VALID lease. Everyone else
+    pulls from it, but only while that lease is valid by THIS host's clock and the
+    directory's PDC owner agrees; otherwise freeze (never pull from a stale writer)."""
+    c = conf()
+    P = (jread("placement.json", {}) or {}).get("doc", {})
+    W = (P.get("sysvol_writer") or {})
+    wdc, whost = W.get("dc"), W.get("host")
+    lv = lease_view(c)
+    res = {"t": now(), "writer": W, "action": "freeze", "reason": "", "pulled": []}
+    if not wdc or not whost:
+        res["reason"] = "no sysvol_writer in placement"
+    elif not lv["valid"] or lv["holder"] != whost:
+        res["reason"] = "writer host %s holds no valid lease here (holder=%s valid=%s)" % (whost, lv["holder"], lv["valid"])
+    else:
+        local = [d for d in c["dcs"] if container_state(d) == "running"]
+        pdc_owner = None
+        for d in local:
+            try:
+                pdc_owner = fsmo_owners(d).get("pdc")
+                break
+            except Refused:
+                continue
+        if pdc_owner and pdc_owner != wdc.lower():
+            res["reason"] = "directory PDC owner %s != sysvol writer %s" % (pdc_owner, wdc)
+        else:
+            res["action"] = "replicate"
+            for d in local:
+                if d == wdc:
+                    continue
+                src = ("local:" + wdc) if whost == c["host_id"] else "rsync://%s/sysvol/" % c["peer_hosts"][whost]
+                ok, why = sysvol_pull(d, src)
+                res["pulled"].append({"dc": d, "ok": ok, "err": why})
+    # serving is READ-ONLY and follows the lease only: a manual fence or a drain stops
+    # WRITES (GPO edits), but the failback's final pull still needs this copy
+    serve_ok = whost == c["host_id"] and lv["valid"] and lv["holder"] == c["host_id"]
+    if serve_ok and res["action"] == "replicate":
+        rsyncd_serve(wdc)
+    elif not serve_ok:
+        rsyncd_stop()
+    jwrite("sysvol_last.json", res)
+    return res
+
+
+# ---------------------------------------------------------------- collector
+def collect():
+    c = conf()
+    t = now()
+    lv = lease_view(c)
+    P = jread("placement.json", {}) or {}
+    rebuild = (P.get("doc", {}).get("rebuild") or {})
+    dcs = []
+    for dc, meta in sorted(c["dcs"].items()):
+        st = container_state(dc)
+        row = {"name": dc, "ip": meta["ip"], "state": "running" if st == "running" else "down",
+               "roles": [], "replication": [], "time_offset_s": None, "chrony_li": None,
+               "sysvol_hash": sysvol_hash(sysvol_dir(dc)), "rid_pool_pct": None,
+               "last_inbound_age_days": None}
+        if dc in rebuild:
+            row["state"] = "rebuild"
+        held = (jread("held.json", {}) or {})
+        if dc in held and st != "running":
+            row["state"] = "held"
+            row["held_reason"] = held[dc]
+        if st == "running":
+            try:
+                owners = fsmo_owners(dc)
+                row["roles"] = sorted(r for r, o in owners.items() if o == dc.lower())
+                lr = jread("last_roles.json", {}) or {}
+                if lr.get(dc) != row["roles"]:
+                    lr[dc] = row["roles"]
+                    jwrite("last_roles.json", lr)
+            except Refused:
+                pass
+            reps = repl_summary(dc) or []
+            row["replication"] = reps
+            okt = [r["last_success"] for r in reps if r["last_success"]]
+            if okt:
+                row["last_inbound_age_days"] = round((t - max(okt)) / 86400.0, 4)
+            row["chrony_li"], row["time_offset_s"] = chrony_state(dc)
+            cache = jread("usn_check.json", {}) or {}
+            ent = cache.get(dc) or {}
+            if t - ent.get("t", 0) > 60:
+                ent = {"t": t, "r": usn_rollback_check(dc)}
+                cache[dc] = ent
+                jwrite("usn_check.json", cache)
+                if ent["r"].get("rollback"):
+                    audit("usn_rollback_detected", dc=dc, detail=ent["r"])
+            row["usn"] = {k: ent["r"].get(k) for k in ("local_usn", "rollback", "partners_ahead")}
+        if (jread("usn_check.json", {}) or {}).get(dc, {}).get("r", {}).get("rollback"):
+            row["usn_rollback"] = True
+        dcs.append(row)
+    # peer reachability, as this host sees it (feeds the controller's classifier)
+    reach = {}
+    for h, ip in sorted(c.get("peer_hosts", {}).items()):
+        dc_ips = [ip2 for d, ip2 in c.get("all_dcs", {}).items() if c.get("dc_host", {}).get(d) == h]
+        reach[h] = {"sh0_tcp_8444": tcp_alive(ip, 8444) or tcp_alive(ip, 22),
+                    "dc_ldap": any(tcp_alive(x, 389) for x in dc_ips)}
+    W = (P.get("doc", {}).get("sysvol_writer") or {})
+    whash = None
+    if W.get("dc") in c["dcs"]:
+        whash = sysvol_hash(sysvol_dir(W["dc"]))
+    st = {"schema_version": SCHEMA, "host": c["host_id"], "collected_at": round(t, 3),
+          "supported_schemas": [SCHEMA], "epoch": epoch(), "lease": lv["lease"],
+          "lease_valid": lv["valid"], "may_write": lv["may_write"],
+          "fenced": not lv["may_write"] and lv["holder"] == c["host_id"] or lv["manual_fence"],
+          "drained": lv["drained"], "dcs": dcs, "sysvol_writer_hash": whash,
+          "sysvol_last": jread("sysvol_last.json"), "peer_reach": reach,
+          "placement_hash": P.get("hash"), "capacity": capacity()}
+    jwrite("status.json", st, mode=0o644)
+    return st
+
+
+def capacity():
+    try:
+        mem = {l.split(":")[0]: int(l.split()[1]) for l in open("/proc/meminfo") if ":" in l}
+        st = os.statvfs("/")
+        return {"cpu_count": os.cpu_count(), "load1": os.getloadavg()[0],
+                "mem_avail_mb": mem.get("MemAvailable", 0) // 1024,
+                "disk_free_gb": round(st.f_bavail * st.f_frsize / 1e9, 1)}
+    except OSError:
+        return {}
+
+
+# ---------------------------------------------------------------- verbs
+def need_local_dc(dc):
+    if dc not in conf()["dcs"]:
+        raise Refused("refused", "%s is not a DC on this host" % dc)
+    if container_state(dc) != "running":
+        raise Refused("refused", "%s is not running" % dc, True)
+
+
+def v_status(a, env):
+    st = jread("status.json") or collect()
+    st = dict(st)
+    st["age_s"] = int(now() - st.get("collected_at", 0))
+    return st
+
+
+def v_health(a, env):
+    dc = a["dc"]
+    need_local_dc(dc)
+    checks = {}
+    rc, out, _ = dc_exec(dc, "ss -ltn")
+    checks["ports"] = {p: (":%d " % p) in out for p in (53, 88, 389, 445, 636, 3268)}
+    checks["rootdse"] = ldap_alive(dc, conf()["dcs"][dc]["ip"])
+    rc, out, err = dc_exec(dc, "samba-tool drs showrepl --summary", timeout=40)
+    checks["showrepl"] = out.strip()[-200:]
+    rc, out, err = dc_exec(dc, "samba-tool ntacl sysvolcheck", timeout=120)
+    checks["sysvolcheck"] = "ok" if rc == 0 else (err or out).strip()[-200:]
+    return {"dc": dc, "checks": checks}
+
+
+def v_lease_renew(a, env):
+    L = a.get("lease") or {}
+    for k in ("host", "epoch", "expires_at"):
+        if k not in L:
+            raise Refused("refused", "lease.%s missing" % k)
+    if int(L["epoch"]) < epoch():
+        raise Refused("stale_epoch", "lease epoch %s < host epoch %s" % (L["epoch"], epoch()))
+    old = jread("lease.json") or {}
+    rec = store_lease(L)
+    # a renewal NEVER moves this host's epoch: only a placement does. (Drill D2, 2026-11-11: a
+    # renewal raised it first, the same-epoch placement then looked like a second controller and
+    # was refused, the host kept a stale SYSVOL writer, and the failback's pulls became no-ops.)
+    if old.get("host") != rec["host"] or old.get("epoch") != rec["epoch"]:
+        audit("lease_change", host=rec["host"], epoch=rec["epoch"], from_host=old.get("host"))
+    return {"lease": rec, "may_write": lease_view()["may_write"]}
+
+
+def v_placement_apply(a, env):
+    doc = a.get("placement") or {}
+    e = int(env.get("epoch") or 0)
+    h = canon_hash(doc)
+    cur = jread("placement.json") or {}
+    if e < epoch():
+        raise Refused("stale_epoch", "placement epoch %d < host epoch %d" % (e, epoch()))
+    if e == epoch() and cur and cur.get("hash") != h:
+        audit("placement_conflict", epoch=e, have=cur.get("hash"), got=h)
+        raise Refused("stale_epoch", "same epoch %d, different placement: two controllers?" % e)
+    jwrite("placement.json", {"epoch": e, "hash": h, "doc": doc, "applied_at": now()})
+    set_epoch(e)
+    if a.get("lease"):
+        store_lease(a["lease"])
+    audit("placement_apply", epoch=e, hash=h[:12], writer=doc.get("sysvol_writer"))
+    return {"epoch": e, "hash": h}
+
+
+def v_fsmo_transfer(a, env):
+    role, to = a["role"], a["to"]
+    need_local_dc(to)
+    roles = CLASS_A if role == "class-a" else (CLASS_A + CLASS_B if role == "all" else [role])
+    done = []
+    auth, seen_by = fsmo_owners_remote(to)
+    if auth is None:
+        raise Refused("refused", "no DC on another host answered fsmo show: cannot tell the real owner", True)
+    for r in roles:
+        if r not in CLASS_A + CLASS_B:
+            raise Refused("refused", "unknown role %s" % r)
+        if auth.get(r) == to.lower():
+            done.append({"role": r, "already": True})
+            continue
+        rc, out, err = dc_auth_exec(to, "samba-tool fsmo transfer --role=%s" % r, timeout=180)
+        if rc != 0:
+            raise Refused("refused", "transfer %s -> %s failed: %s" % (r, to, (err or out).strip()[-300:]), True)
+        done.append({"role": r, "ok": True, "from": auth.get(r)})
+    after, _ = fsmo_owners_remote(to)
+    bad = [r for r in roles if (after or {}).get(r) != to.lower()]
+    audit("fsmo_transfer", roles=roles, to=to, epoch=env.get("epoch"), seen_by=seen_by, unverified=bad)
+    if bad:
+        raise Refused("refused", "transfer not visible from %s yet for %s" % (seen_by, ",".join(bad)), True)
+    return {"transferred": done, "evidence": {"fsmo_show_remote": after, "seen_by": seen_by}}
+
+
+def _attestation_ok(att_id, host, e):
+    A = jread("attest.json", {}) or {}
+    rec = (A.get("attestations") or {}).get(att_id)
+    if not rec or rec["host"] != host:
+        return False, "no attestation %s for %s" % (att_id, host)
+    if rec.get("contradicted"):
+        return False, "attestation contradicted: %s answered" % host
+    if now() > rec["expires"]:
+        return False, "attestation expired"
+    if rec.get("consumed"):
+        return False, "attestation already consumed by epoch %s" % rec.get("bound_epoch")
+    if rec.get("bound_epoch") not in (None, e):
+        return False, "attestation bound to epoch %s, not %s" % (rec["bound_epoch"], e)
+    rec["bound_epoch"] = e
+    A["attestations"][att_id] = rec
+    jwrite("attest.json", A)
+    return True, ""
+
+
+def v_fsmo_seize(a, env):
+    c = conf()
+    role, to = a["role"], a["to"]
+    need_local_dc(to)
+    e = int(env.get("epoch") or 0)
+    roles = CLASS_A if role == "class-a" else (CLASS_B if role == "class-b" else [role])
+    for r in roles:
+        if r in CLASS_B:
+            if not (a.get("class_b") and a.get("i_understand") is True and a.get("actor") and a.get("reason")):
+                raise Refused("refused", "class-B role %s: needs class_b, i_understand=true, actor, reason" % r)
+        elif r not in CLASS_A:
+            raise Refused("refused", "unknown role %s" % r)
+    proof = a.get("lease_proof") or {}
+    pl = proof.get("lease") or {}
+    L = jread("lease.json") or {}
+    if not L:
+        raise Refused("refused", "no lease record on this host to verify the proof against")
+    grace = float(timers()["grace_s"])
+    if pl.get("host") == L.get("host"):
+        # takeover now: the proof is the lost holder's CURRENT lease, which must have lapsed here
+        if int(pl.get("epoch", -1)) != int(L.get("epoch", -2)):
+            raise Refused("refused", "proof lease %s@%s does not match this host's record %s@%s"
+                          % (pl.get("host"), pl.get("epoch"), L.get("host"), L.get("epoch")))
+        left = L["expires_local"] + grace - now()
+        if left > 0:
+            raise Refused("refused", "lease expiry + grace not reached here (%.0f s left)" % left, True)
+    else:
+        # after a takeover (e.g. an operator's later class-B seize): the lease has already moved
+        # away from the proof's host; the proof must match a lease of that host in our history
+        hist = jread("lease_history.json", []) or []
+        if not any(h.get("host") == pl.get("host") and int(h.get("epoch") or -1) == int(pl.get("epoch", -2)) and
+                   (h.get("expires_local") or 0) + grace < now() for h in hist):
+            raise Refused("refused", "proof lease %s@%s matches neither the current lease (%s@%s) nor an expired "
+                          "lease in this host's history" % (pl.get("host"), pl.get("epoch"), L.get("host"), L.get("epoch")))
+    cls = proof.get("classification")
+    att = proof.get("attestation_id")
+    if cls == "split":
+        raise Refused("refused", "classification split: no seize (lease-only failover)")
+    if cls not in ("down", "isolated", "unknown") or (cls == "unknown" and not att) or (
+            proof.get("takeover") == "attestation" and not att):
+        raise Refused("refused", "classification %r / takeover %r not sufficient" % (cls, proof.get("takeover")))
+    if att:
+        if any(r in CLASS_B for r in roles):
+            raise Refused("refused", "an attestation never authorises a class-B seize")
+        ok, why = _attestation_ok(att, L.get("host"), e)
+        if not ok:
+            raise Refused("refused", why)
+    owners = fsmo_owners(to)
+    results = []
+    for r in roles:
+        holder = owners.get(r)
+        if holder == to.lower():
+            results.append({"role": r, "already": True})
+            continue
+        hip = c.get("all_dcs", {}).get(holder)
+        if hip and ldap_alive(to, hip):
+            audit("seize_refused_holder_alive", role=r, holder=holder)
+            raise Refused("refused", "holder alive: %s (%s) answers LDAP from %s" % (holder, hip, to), True)
+        rc, out, err = dc_auth_exec(to, "samba-tool fsmo seize --role=%s --force" % r, timeout=180)
+        if rc != 0:
+            raise Refused("internal", "seize %s failed: %s" % (r, (err or out).strip()[-300:]), True)
+        results.append({"role": r, "seized_from": holder, "ok": True})
+        if r in CLASS_B:
+            sz = jread("class_b_seized.json", {}) or {}
+            sz.setdefault(holder, []).append({"role": r, "epoch": e, "t": now()})
+            jwrite("class_b_seized.json", sz)
+    audit("fsmo_seize", roles=roles, to=to, epoch=e, classification=cls, attestation=att,
+          actor=a.get("actor"), reason=a.get("reason"), results=results)
+    return {"seized": results, "evidence": {"fsmo_show": fsmo_owners(to)}}
+
+
+def v_sysvol_writer(a, env):
+    """prepare: pull the CURRENT writer's SYSVOL into dc (no switch). commit: final
+    delta pull; the switch itself is the next placement-apply naming dc."""
+    dc, phase = a["dc"], a.get("phase", "commit")
+    need_local_dc(dc)
+    c = conf()
+    P = jread("placement.json", {}) or {}
+    if int(P.get("epoch", -1)) != int(env.get("epoch", -2)):
+        raise Refused("refused", "placement behind: host has epoch %s, call is epoch %s (apply the placement first)"
+                      % (P.get("epoch"), env.get("epoch")), True)
+    W = (P.get("doc", {}).get("sysvol_writer") or {})
+    if W.get("dc") == dc:
+        return {"dc": dc, "phase": phase, "already_writer": True}
+    if W.get("host") == c["host_id"]:
+        src = "local:" + W["dc"]
+    elif W.get("host") in c.get("peer_hosts", {}):
+        src = "rsync://%s/sysvol/" % c["peer_hosts"][W["host"]]
+    else:
+        raise Refused("refused", "no current writer to pull from")
+    ok, why = sysvol_pull(dc, src)
+    if not ok:
+        raise Refused("refused", "pull from writer failed: %s" % why, True)
+    audit("sysvol_writer_" + phase, dc=dc, src=src)
+    return {"dc": dc, "phase": phase, "pulled_from": src, "hash": sysvol_hash(sysvol_dir(dc))}
+
+
+def v_fence(a, env):
+    jwrite("fence.json", {"manual": True, "reason": a.get("reason", ""), "since": now()})
+    audit("fence", reason=a.get("reason"))
+    return {"fenced": True}
+
+
+def v_unfence(a, env):
+    jwrite("fence.json", {"manual": False, "since": now()})
+    audit("unfence")
+    return {"fenced": False}
+
+
+def v_drain(a, env):
+    c = conf()
+    jwrite("drain.json", {"drained": True, "since": now(), "reason": a.get("reason", "")})
+    held = []
+    for dc in c["dcs"]:
+        if container_state(dc) == "running":
+            try:
+                held += [{"dc": dc, "role": r} for r, o in fsmo_owners(dc).items() if o == dc.lower()]
+            except Refused:
+                pass
+            break
+    audit("drain")
+    # the controller moves these with ha-fsmo-transfer on the receiving host
+    return {"drained": True, "roles_held_here": held}
+
+
+def v_undrain(a, env):
+    jwrite("drain.json", {"drained": False, "since": now()})
+    audit("undrain")
+    return {"drained": False}
+
+
+def v_attest(a, env):
+    for k in ("host", "actor", "reason", "attestation_id"):
+        if not a.get(k):
+            raise Refused("refused", "%s required" % k)
+    A = jread("attest.json", {}) or {}
+    A.setdefault("attestations", {})[a["attestation_id"]] = {
+        "host": a["host"], "host_name": a.get("host_name"), "actor": a["actor"], "reason": a["reason"],
+        "received": now(), "expires": now() + float(timers()["attest_max_s"]),
+        "bound_epoch": None, "consumed": False, "contradicted": False}
+    jwrite("attest.json", A)
+    audit("attest_host_dead", host=a["host"], actor=a["actor"], reason=a["reason"], id=a["attestation_id"])
+    return {"stored": a["attestation_id"]}
+
+
+def v_attest_clear(a, env):
+    A = jread("attest.json", {}) or {}
+    rec = (A.get("attestations") or {}).pop(a.get("attestation_id"), None)
+    jwrite("attest.json", A)
+    audit("attest_clear", id=a.get("attestation_id"))
+    return {"cleared": bool(rec)}
+
+
+def v_rejoin_check(a, env):
+    c = conf()
+    P = (jread("placement.json", {}) or {}).get("doc", {})
+    rebuild = P.get("rebuild") or {}
+    may, must, held = [], {}, []
+    for dc in sorted(c["dcs"]):
+        if dc in rebuild:
+            must[dc] = rebuild[dc]
+        else:
+            may.append(dc)
+    held = sorted((jread("held.json", {}) or {}).keys())
+    lv = lease_view(c)
+    return {"may_start": [d for d in may if d not in held], "must_rebuild": must, "held": held,
+            "ok_to_unfence": not must and lv["valid"]}
+
+
+def v_dc_remove_dead(a, env):
+    """Metadata cleanup for a DC that will be rebuilt (run on a SURVIVING host's DC)."""
+    dead, via = a["dc"], a["via"]
+    need_local_dc(via)
+    rc, out, err = dc_auth_exec(via, "samba-tool domain demote --remove-other-dead-server=%s" % dead, timeout=300)
+    if rc != 0 and "is not an AD DC" in (err or out):
+        audit("dc_remove_dead", dc=dead, via=via, already=True)
+        return {"removed": dead, "already": True}          # idempotent: a retry after success
+    if rc != 0:
+        raise Refused("refused", "remove-other-dead-server %s failed: %s" % (dead, (err or out).strip()[-300:]), True)
+    audit("dc_remove_dead", dc=dead, via=via)
+    return {"removed": dead}
+
+
+def v_dc_rejoin(a, env):
+    """Wipe a local DC's state and join it fresh (after ha-dc-remove-dead elsewhere)."""
+    c = conf()
+    dc, peer = a["dc"], a["peer_ip"]
+    if dc not in c["dcs"]:
+        raise Refused("refused", "%s is not a DC on this host" % dc)
+    meta = c["dcs"][dc]
+    run(["podman", "rm", "-f", "-t", "5", dc], timeout=60)
+    sd = meta["state_dir"]
+    run(["sh", "-c", "rm -rf '%s/var-lib-samba' '%s/etc-samba' && install -d '%s/var-lib-samba' '%s/etc-samba'"
+         % (sd, sd, sd, sd)], timeout=120)
+    argv = ["podman", "run", "-d", "--init", "--name", dc, "--hostname", dc, "--network", c["dc_network"],
+            "--ip", meta["ip"], "--restart=no", "--cap-add", "SYS_ADMIN,NET_ADMIN,SYS_TIME",
+            "--security-opt", "seccomp=unconfined", "--label", "adl-ha.role=dc",
+            "-v", c["admin_pass_file"] + ":/run/adminpass:ro",
+            "-v", sd + "/var-lib-samba:/var/lib/samba", "-v", sd + "/etc-samba:/etc/samba",
+            "-v", sd + "/chrony.conf:/etc/chrony/adlab-dc.conf:ro",
+            "-e", "ROLE=join", "-e", "REALM=" + c["realm"], "-e", "DOMAIN_NB=" + c["domain_nb"],
+            "-e", "DC_IP=" + meta["ip"], "-e", "PEER_IP=" + peer, "-e", "FORWARDER=" + c.get("forwarder", "10.31.0.11"),
+            "-e", "ADMIN_PASS_FILE=/run/adminpass", "-e", "SITE=" + meta.get("site", ""), c["dc_image"]]
+    rc, out, err = run(argv, timeout=120)
+    if rc != 0:
+        raise Refused("internal", "rejoin run failed: %s" % (err or out).strip()[-300:])
+    lr = jread("last_roles.json", {}) or {}
+    lr[dc] = []
+    jwrite("last_roles.json", lr)
+    cache = jread("usn_check.json", {}) or {}
+    cache.pop(dc, None)
+    jwrite("usn_check.json", cache)
+    held = jread("held.json", {}) or {}
+    held.pop(dc, None)
+    jwrite("held.json", held)
+    audit("dc_rejoin", dc=dc, peer=peer)
+    return {"rejoining": dc}
+
+
+def v_dc_restart(a, env):
+    """Restart one local DC (samba). Used after a partner was rebuilt under the same name:
+    samba's replication service keeps Kerberos tickets for the OLD incarnation and fails
+    DsReplicaSync (WERR_GEN_FAILURE) until they expire or samba restarts (drill D9)."""
+    dc = a["dc"]
+    need_local_dc(dc)
+    rc, out, err = run(["podman", "restart", "-t", "10", dc], timeout=120)
+    if rc != 0:
+        raise Refused("internal", "restart %s failed: %s" % (dc, (err or out).strip()[-200:]), True)
+    audit("dc_restart", dc=dc, reason=a.get("reason", ""))
+    return {"restarted": dc}
+
+
+VERBS = {"ha-status": v_status, "ha-dc-restart": v_dc_restart, "ha-health": v_health, "ha-lease-renew": v_lease_renew,
+         "ha-placement-apply": v_placement_apply, "ha-fsmo-transfer": v_fsmo_transfer,
+         "ha-fsmo-seize": v_fsmo_seize, "ha-sysvol-writer": v_sysvol_writer, "ha-fence": v_fence,
+         "ha-unfence": v_unfence, "ha-drain": v_drain, "ha-undrain": v_undrain,
+         "ha-attest-host-dead": v_attest, "ha-attest-clear": v_attest_clear,
+         "ha-rejoin-check": v_rejoin_check, "ha-dc-remove-dead": v_dc_remove_dead,
+         "ha-dc-rejoin": v_dc_rejoin}
+
+
+def handle(req):
+    """One envelope in, one envelope out (design §7.3)."""
+    op_id = req.get("op_id")
+    base = {"schema_version": SCHEMA, "op_id": op_id, "epoch_seen": epoch(), "replayed": False}
+    sv = str(req.get("schema_version", ""))
+    if sv.split("/")[0] != SCHEMA.split("/")[0] or sv.split("/")[-1].split(".")[0] != "1":
+        return dict(base, ok=False, error={"code": "unsupported_schema", "message": "want %s" % SCHEMA, "retryable": False})
+    verb = req.get("verb")
+    if verb not in VERBS:
+        return dict(base, ok=False, error={"code": "not_found", "message": "unknown verb %r" % verb, "retryable": False})
+    if os.geteuid() != 0 and verb not in READ_NONROOT:
+        return dict(base, ok=False, error={"code": "refused", "message": "requires root", "retryable": False})
+    mutating = verb in MUTATING
+    lockf = open(os.path.join(STATE, ".lock"), "w")
+    try:
+        if mutating:
+            if not op_id or "epoch" not in req:
+                return dict(base, ok=False, error={"code": "refused", "message": "epoch and op_id required", "retryable": False})
+            if not re.match(r"^[A-Za-z0-9._:-]{1,128}$", str(op_id)):
+                return dict(base, ok=False, error={"code": "refused", "message": "bad op_id", "retryable": False})
+            try:
+                fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return dict(base, ok=False, error={"code": "busy", "message": "another mutating op holds the host lock", "retryable": True})
+            prev = jread(os.path.join("opids", op_id + ".json"))
+            if prev:
+                prev["replayed"] = True
+                return prev
+            if verb != "ha-placement-apply" and int(req["epoch"]) < epoch():
+                return dict(base, ok=False, error={"code": "stale_epoch", "message": "epoch %s < %s" % (req["epoch"], epoch()), "retryable": False})
+        try:
+            res = VERBS[verb](req.get("args") or {}, req)
+            out = dict(base, ok=True, result=res, error=None, epoch_seen=epoch())
+        except Refused as r:
+            out = dict(base, ok=False, error={"code": r.code, "message": r.message, "retryable": r.retryable}, epoch_seen=epoch())
+        except (KeyError, ValueError, TypeError) as ex:
+            out = dict(base, ok=False, error={"code": "refused", "message": "bad args: %s" % ex, "retryable": False})
+        if mutating:
+            os.makedirs(os.path.join(STATE, "opids"), exist_ok=True)
+            jwrite(os.path.join("opids", op_id + ".json"), out)
+            audit("call", verb=verb, op_id=op_id, epoch=req.get("epoch"), ok=out["ok"],
+                  err=(out.get("error") or {}).get("code"))
+        return out
+    finally:
+        lockf.close()
+
+
+def prune_opids(max_age=7 * 86400):
+    d = os.path.join(STATE, "opids")
+    if not os.path.isdir(d):
+        return
+    cut = now() - max_age
+    for fn in os.listdir(d):
+        p = os.path.join(d, fn)
+        try:
+            if os.path.getmtime(p) < cut:
+                os.unlink(p)
+        except OSError:
+            pass
+
+
+def contradict_attestations(st):
+    """Self-drop an attestation when the attested host's DCs replicate to us again."""
+    A = jread("attest.json", {}) or {}
+    c = conf()
+    changed = False
+    for aid, rec in (A.get("attestations") or {}).items():
+        if rec.get("contradicted") or rec.get("consumed"):
+            continue
+        theirs = {d for d, h in c.get("dc_host", {}).items() if h == rec["host"]}
+        for dcrow in st["dcs"]:
+            for r in dcrow["replication"]:
+                if r["from"] in theirs and r["last_success"] and r["last_success"] > rec["received"]:
+                    rec["contradicted"] = True
+                    changed = True
+                    audit("attest_contradicted", id=aid, by=r["from"])
+    # an epoch's placement landing consumes the attestation bound to it
+    e = epoch()
+    for aid, rec in (A.get("attestations") or {}).items():
+        if rec.get("bound_epoch") is not None and e >= rec["bound_epoch"] and \
+                (jread("placement.json", {}) or {}).get("epoch") == rec["bound_epoch"] and not rec.get("consumed"):
+            rec["consumed"] = True
+            changed = True
+    if changed:
+        jwrite("attest.json", A)
+
+
+def supervise(boot_t):
+    """The agent, not podman, starts DCs (they run --restart=no; design §5.3 boot fencing):
+      - a DC flagged for rebuild in the placement stays HELD;
+      - a DC that held a class-B role when last seen stays HELD after a (re)start of this agent
+        until the controller has spoken since then (a lease or placement received after boot),
+        or - full cold start - no controller contact and no peer DC answering for hold_boot_s
+        (then nobody else can have seized);
+      - everything else is started (boot, or after a crash)."""
+    c = conf()
+    T = timers()
+    P = jread("placement.json", {}) or {}
+    rebuild = (P.get("doc", {}).get("rebuild") or {})
+    last_roles = jread("last_roles.json", {}) or {}
+    L = jread("lease.json") or {}
+    heard = max(L.get("received_at", 0), P.get("applied_at", 0)) > boot_t
+    held = {}
+    for dc in sorted(c["dcs"]):
+        st = container_state(dc)
+        if st == "missing" or st == "running":
+            continue
+        why = None
+        if dc in rebuild:
+            why = "rebuild: %s" % rebuild[dc]
+        elif (jread("usn_check.json", {}) or {}).get(dc, {}).get("r", {}).get("rollback"):
+            why = "USN rollback detected: held for rebuild"
+        elif any(r in CLASS_B for r in last_roles.get(dc, [])) and not heard:
+            peers_up = any(tcp_alive(ip, 389) for d, ip in c.get("all_dcs", {}).items() if d not in c["dcs"])
+            if peers_up or now() - boot_t < float(T["hold_boot_s"]):
+                why = "held class-B roles %s when last seen; waiting for the controller" % last_roles[dc]
+        if why:
+            held[dc] = why
+            continue
+        rc, out, err = run(["podman", "start", dc], timeout=60)
+        audit("dc_start", dc=dc, ok=rc == 0, err=(err or "")[:200])
+    old = jread("held.json", {}) or {}
+    if held != old:
+        jwrite("held.json", held)
+        if held:
+            audit("dc_held", held=held)
+
+
+def hold_flagged_running():
+    """A running DC that the placement flags for rebuild, or that this host detected as USN-
+    rolled-back, is stopped (it must not serve)."""
+    P = jread("placement.json", {}) or {}
+    cache = jread("usn_check.json", {}) or {}
+    for dc, ent in cache.items():
+        if ent.get("r", {}).get("rollback") and dc in conf()["dcs"] and container_state(dc) == "running":
+            run(["podman", "stop", "-t", "10", dc], timeout=60)
+            held = jread("held.json", {}) or {}
+            held[dc] = "USN rollback detected: partners ahead %s" % ent["r"].get("partners_ahead")
+            jwrite("held.json", held)
+            audit("dc_quarantined_usn_rollback", dc=dc)
+    for dc in (P.get("doc", {}).get("rebuild") or {}):
+        if dc in conf()["dcs"] and container_state(dc) == "running":
+            run(["podman", "stop", "-t", "10", dc], timeout=60)
+            audit("dc_stopped_for_rebuild", dc=dc)
+
+
+def agent():
+    """Collector + watchdog + SYSVOL timer. The watchdog needs no network: it fences
+    by the local clock the moment the lease lapses (rsyncd stopped, may_write false)."""
+    os.makedirs(STATE, exist_ok=True)
+    last_collect = last_sysvol = 0
+    was_writer = None
+    # boot fence: nothing is served until a lease arrives (lease.json from before the
+    # boot is honoured only if still unexpired by the local clock)
+    rsyncd_stop()
+    boot_t = now()
+    audit("agent_start")
+    last_sup = 0
+    while True:
+        t = now()
+        T = timers()
+        lv = lease_view()
+        if was_writer is not None and was_writer and not lv["may_write"]:
+            if not (lv["valid"] and lv["holder"] == conf()["host_id"]):
+                rsyncd_stop()          # lease lapsed: stop serving too
+            audit("self_fence", reason="lease lapsed" if not lv["valid"] else "manual fence/drain (writes only)")
+        was_writer = lv["may_write"]
+        if t - last_sup >= 5:
+            try:
+                hold_flagged_running()
+                supervise(boot_t)
+            except Exception as ex:
+                audit("supervise_error", err=str(ex)[:200])
+            last_sup = t
+        if t - last_collect >= T["collect_s"]:
+            try:
+                st = collect()
+                contradict_attestations(st)
+            except Exception as ex:  # keep the watchdog alive whatever the collector does
+                audit("collect_error", err=str(ex)[:200])
+            last_collect = t
+        if t - last_sysvol >= T["sysvol_s"]:
+            try:
+                sysvol_cycle()
+            except Exception as ex:
+                audit("sysvol_error", err=str(ex)[:200])
+            last_sysvol = t
+            prune_opids()
+        time.sleep(2)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "json":
+        try:
+            req = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            print(json.dumps({"schema_version": SCHEMA, "ok": False,
+                              "error": {"code": "unsupported_schema", "message": "unreadable request", "retryable": False}}))
+            return 2
+        os.makedirs(STATE, exist_ok=True)
+        out = handle(req)
+        print(json.dumps(out, sort_keys=True))
+        return 0 if out.get("ok") else 1
+    if cmd == "agent":
+        agent()
+        return 0
+    if cmd == "status":
+        print(json.dumps(collect(), indent=1, sort_keys=True))
+        return 0
+    if cmd == "sysvol-cycle":
+        print(json.dumps(sysvol_cycle(), indent=1))
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
