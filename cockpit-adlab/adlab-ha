@@ -140,6 +140,26 @@ def fsmo_owners(dc):
     return owners
 
 
+def fsmo_owners_remote(via_dc):
+    """role -> owner as seen by a DC on another host (queried over LDAP from local via_dc,
+    with creds). A DC that just came back may hold a STALE local view of fSMORoleOwner."""
+    c = conf()
+    for d, ip in sorted(c.get("all_dcs", {}).items()):
+        if d in c["dcs"]:
+            continue
+        rc, out, err = dc_auth_exec(via_dc, "timeout 30 samba-tool fsmo show -H ldap://%s" % ip, timeout=60)
+        if rc != 0:
+            continue
+        owners = {}
+        for line in out.splitlines():
+            m = re.match(r"(\w+) owner: CN=NTDS Settings,CN=([^,]+),", line.strip())
+            if m and m.group(1) in ROLE_NAMES:
+                owners[ROLE_NAMES[m.group(1)]] = m.group(2).lower()
+        if owners:
+            return owners, d
+    return None, None
+
+
 def repl_summary(dc):
     rc, out, _ = dc_exec(dc, "samba-tool drs showrepl --json", timeout=40)
     if rc != 0:
@@ -150,7 +170,7 @@ def repl_summary(dc):
         return None
     rows = []
     for r in d.get("repsFrom", []):
-        ts = r.get("last success time") or ""
+        ts = r.get("last success") or r.get("last success time") or ""
         try:
             last = datetime.datetime.strptime(ts, "%a %b %d %H:%M:%S %Y %Z").replace(
                 tzinfo=datetime.timezone.utc).timestamp()
@@ -341,9 +361,12 @@ def sysvol_cycle():
                 src = ("local:" + wdc) if whost == c["host_id"] else "rsync://%s/sysvol/" % c["peer_hosts"][whost]
                 ok, why = sysvol_pull(d, src)
                 res["pulled"].append({"dc": d, "ok": ok, "err": why})
-    if whost == c["host_id"] and lv["may_write"] and res["action"] == "replicate":
+    # serving is READ-ONLY and follows the lease only: a manual fence or a drain stops
+    # WRITES (GPO edits), but the failback's final pull still needs this copy
+    serve_ok = whost == c["host_id"] and lv["valid"] and lv["holder"] == c["host_id"]
+    if serve_ok and res["action"] == "replicate":
         rsyncd_serve(wdc)
-    elif whost != c["host_id"] or not lv["may_write"]:
+    elif not serve_ok:
         rsyncd_stop()
     jwrite("sysvol_last.json", res)
     return res
@@ -481,18 +504,25 @@ def v_fsmo_transfer(a, env):
     need_local_dc(to)
     roles = CLASS_A if role == "class-a" else [role]
     done = []
+    auth, seen_by = fsmo_owners_remote(to)
+    if auth is None:
+        raise Refused("refused", "no DC on another host answered fsmo show: cannot tell the real owner", True)
     for r in roles:
         if r not in CLASS_A + CLASS_B:
             raise Refused("refused", "unknown role %s" % r)
-        if fsmo_owners(to).get(r) == to.lower():
+        if auth.get(r) == to.lower():
             done.append({"role": r, "already": True})
             continue
         rc, out, err = dc_auth_exec(to, "samba-tool fsmo transfer --role=%s" % r, timeout=180)
         if rc != 0:
             raise Refused("refused", "transfer %s -> %s failed: %s" % (r, to, (err or out).strip()[-300:]), True)
-        done.append({"role": r, "ok": True})
-    audit("fsmo_transfer", roles=roles, to=to, epoch=env.get("epoch"))
-    return {"transferred": done, "evidence": {"fsmo_show": fsmo_owners(to)}}
+        done.append({"role": r, "ok": True, "from": auth.get(r)})
+    after, _ = fsmo_owners_remote(to)
+    bad = [r for r in roles if (after or {}).get(r) != to.lower()]
+    audit("fsmo_transfer", roles=roles, to=to, epoch=env.get("epoch"), seen_by=seen_by, unverified=bad)
+    if bad:
+        raise Refused("refused", "transfer not visible from %s yet for %s" % (seen_by, ",".join(bad)), True)
+    return {"transferred": done, "evidence": {"fsmo_show_remote": after, "seen_by": seen_by}}
 
 
 def _attestation_ok(att_id, host, e):
@@ -599,7 +629,6 @@ def v_sysvol_writer(a, env):
 
 def v_fence(a, env):
     jwrite("fence.json", {"manual": True, "reason": a.get("reason", ""), "since": now()})
-    rsyncd_stop()
     audit("fence", reason=a.get("reason"))
     return {"fenced": True}
 
@@ -613,7 +642,6 @@ def v_unfence(a, env):
 def v_drain(a, env):
     c = conf()
     jwrite("drain.json", {"drained": True, "since": now(), "reason": a.get("reason", "")})
-    rsyncd_stop()
     held = []
     for dc in c["dcs"]:
         if container_state(dc) == "running":
@@ -820,8 +848,9 @@ def agent():
         T = timers()
         lv = lease_view()
         if was_writer is not None and was_writer and not lv["may_write"]:
-            rsyncd_stop()
-            audit("self_fence", reason="lease lapsed or manual fence")
+            if not (lv["valid"] and lv["holder"] == conf()["host_id"]):
+                rsyncd_stop()          # lease lapsed: stop serving too
+            audit("self_fence", reason="lease lapsed" if not lv["valid"] else "manual fence/drain (writes only)")
         was_writer = lv["may_write"]
         if t - last_collect >= T["collect_s"]:
             try:

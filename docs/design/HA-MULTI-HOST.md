@@ -72,6 +72,13 @@ live DC.
 | edt1 | `edt1` | `172.15.4.0/24` (`static-edt`, unchanged) | `dc1`, `dc2`, `dc3` | **active**: holds all FSMO roles and the SYSVOL writer lease |
 | mini-srv | `mini-srv` | `172.15.5.0/24` (new bridge `static-mini`) | `dc6`, `dc7` | **passive**: warm DCs, no roles, takes roles only on failover |
 
+- **Both sites must be in one site link, with change notification on.** A site that
+  belongs to no site link gets no inter-site connections from the KCC, so the hosts
+  silently stop replicating with each other. The testbed hit exactly this: a seize on
+  B never reached A. Use `DEFAULTIPSITELINK` (or a dedicated link) containing both
+  sites, with `options=1` (change notification across the link) and `replInterval=15`.
+  AD's inter-site default is 180 minutes, far too slow for HA. Health alarm: a
+  DC with no inbound connection from the other site.
 - **Each host gets its own routed subnet** and one AD site with that subnet.
   The KCC builds inter-site replication; clients prefer DCs in their own site
   and fall back to others. AD is built for this, and it needs no VXLAN/EVPN.
@@ -313,7 +320,15 @@ read-only rsyncd, every other DC pulls with `-rlptD -X -H --delete-after`, then
    HA, a host replicates only if it holds a valid writer lease, and only from
    `placement.sysvol_writer.dc`. It also cross-checks the directory's PDC owner
    and freezes if the two disagree.
-2. **Cross-host transport.** Each host's replicator updates **its own** DCs.
+2. **Fence vs. serve (testbed finding).** A manual fence or a drain stops
+   *writes* (GPO edits), never the writer's *read-only* serving. The failback's
+   final delta pull needs it. Serving stops only when the lease lapses.
+3. **Role transfer reads the authoritative owner.** A DC that just came back
+   holds a stale local `fSMORoleOwner` until it replicates. Transfer decisions,
+   and the check after them, use a DC on the *other* host. The controller does
+   not start failback until the returning host's DCs agree with the survivor on
+   the PDC owner.
+4. **Cross-host transport.** Each host's replicator updates **its own** DCs.
    The writer host serves the read-only rsyncd; the other host's DCs pull it
    across the routed link (port 873, limited to the DC subnets). Same flags.
 3. **Failback pull.** Before the writer lease returns to edt1, edt1's DCs pull

@@ -102,6 +102,12 @@ if [ "\$ROLE" = provision ]; then
     samba-tool sites subnet create 10.31.0.16/28 $SITE_A >/dev/null 2>&1 || true
     samba-tool sites subnet create 10.31.0.32/28 $SITE_B >/dev/null 2>&1 || true
     samba-tool sites list'
+  # BOTH sites must be in a site link, or the KCC builds NO inter-site connections and the
+  # hosts stop replicating with each other (found 2026-11-11: a seize never reached dc1).
+  # Change notification across the link (options=1) and a 15-min interval instead of 180.
+  podman exec \$N sh -c 'B="DC=ha,DC=test,DC=lab"; L="CN=DEFAULTIPSITELINK,CN=IP,CN=Inter-Site Transports,CN=Sites,CN=Configuration,\$B"
+    printf "dn: %s\nchangetype: modify\nadd: siteList\nsiteList: CN=$SITE_B,CN=Sites,CN=Configuration,%s\n-\nreplace: replInterval\nreplInterval: 15\n-\nreplace: options\noptions: 1\n" "\$L" "\$B" > /tmp/sl.ldif
+    ldbmodify -H /var/lib/samba/private/sam.ldb /tmp/sl.ldif | tail -1'
 fi
 EOF
   done

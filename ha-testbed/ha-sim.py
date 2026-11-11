@@ -136,9 +136,12 @@ class Sim:
         self.st["placement"] = doc
         L = self.lease(holder)
         res = {}
+        self.st["placement_hosts"] = {}
         for h in hosts or HOSTS:
             r = call(h, "ha-placement-apply", {"placement": doc, "lease": L}, epoch=self.st["epoch"])
             res[h] = r.get("ok"), (r.get("error") or {}).get("message")
+            if r.get("ok"):
+                self.st["placement_hosts"][h] = self.st["epoch"]
         log("placement_apply", epoch=self.st["epoch"], holder=holder, writer=writer_dc, results=res)
         save(self.st)
         return res
@@ -149,6 +152,13 @@ class Sim:
             r = call(h, "ha-lease-renew", {"lease": L}, timeout=15)
             if not r.get("ok"):
                 log("renew_refused", host=h, err=r.get("error"))
+            # a host that comes back behind gets the current placement (same epoch, identical doc)
+            ph = ((self.st.get("placement_hosts") or {}).get(h))
+            if self.st.get("placement") and ph != self.st["epoch"]:
+                r2 = call(h, "ha-placement-apply", {"placement": self.st["placement"], "lease": L}, epoch=self.st["epoch"])
+                if r2.get("ok"):
+                    self.st.setdefault("placement_hosts", {})[h] = self.st["epoch"]
+                log("placement_resend", host=h, epoch=self.st["epoch"], ok=r2.get("ok"), err=r2.get("error"))
         save(self.st)
 
     # -- observation
@@ -258,12 +268,6 @@ class Sim:
             return
         if holder in reach:
             self.st["lost_since"] = None
-            # a host that comes back behind gets the current placement (same epoch, identical doc)
-            for h in reach:
-                if statuses[h].get("epoch", 0) < self.st["epoch"] and self.st.get("placement"):
-                    r = call(h, "ha-placement-apply", {"placement": self.st["placement"],
-                                                       "lease": self.lease(holder)}, epoch=self.st["epoch"])
-                    log("placement_resend", host=h, epoch=self.st["epoch"], ok=r.get("ok"), err=r.get("error"))
             self.renew(reach)
         else:
             # holder lost: keep renewing to the others with the OLD holder (they learn nothing new)
@@ -296,8 +300,12 @@ class Sim:
         if self.st["mode"] in ("degraded", "degraded-split"):
             home = self.st["failed_from"]
             s = statuses.get(home)
-            healthy = bool(s) and all(d["state"] == "running" and sum(r["failures"] for r in d["replication"]) == 0
-                                      for d in s["dcs"])
+            away = statuses.get(self.st["holder"]) or {}
+            away_pdc = [d["name"] for d in away.get("dcs", []) if "pdc" in d["roles"]]
+            home_view_pdc = [d["name"] for d in (s or {}).get("dcs", []) if "pdc" in d["roles"]]
+            converged = self.st["mode"] == "degraded-split" or (away_pdc and not home_view_pdc)
+            healthy = bool(s) and converged and all(
+                d["state"] == "running" and sum(r["failures"] for r in d["replication"]) == 0 for d in s["dcs"])
             if healthy:
                 self.st["healthy_since"] = self.st.get("healthy_since") or now()
                 if now() - self.st["healthy_since"] >= T["hold_s"]:
