@@ -104,11 +104,12 @@ testbed host. The stress program (design §12) must pass before any HA test on e
 - [ ] **Owner: sign off the design as final** and choose the testbed host (edt1 after sign-off, mini-srv, or another).
 - [ ] **Phase 0: testbed** (`ha-testbed/`, written + dry-run only). Two Ubuntu 24.04 VMs `adl-ha-a`/`adl-ha-b`
   (4 vCPU / 8 GB / 40 GB; ssh key-only, cockpit + cockpit-podman + the cockpit-adlab plugin, rootful podman). Per VM:
-  LAN `192.168.2.41`/`.42`, an isolated subnet (`172.31.4.0/24` / `172.31.5.0/24`, in-VM podman bridge), and the shared HA
-  subnet `10.31.0.0/24` (libvirt `adl-ha`, no host IP; VIPs .53 DNS anycast, .100 writer). **Isolated edy-proxy-go
+  LAN `192.168.2.41`/`.42`, an isolated VM-local subnet (`172.31.4.0/24` / `172.31.5.0/24`, in-VM podman bridge, no DCs),
+  and a shared subnet on edt1 `10.31.0.0/24` (libvirt `adl-shared`, edt1 .1, no forward/DHCP/DNS) where the DCs of BOTH
+  VMs live (macvlan, A .16/28, B .32/28; VIPs .53 DNS anycast, .100 writer). **Isolated edy-proxy-go
   deployment**: A runs first-run new cluster, B registers with A; nothing registers with or uses edt1's edy (script still
   to write: port the `edy-testcluster` recipe into the VMs, listen on ha0 only, DHCP/PXE/netboot/ARP off). Then the test
-  forest `HA.TEST.LAB` (never `AD.EDT1.LAB`), 2 DCs per VM on the isolated subnets, AD site per VM; admin password
+  forest `HA.TEST.LAB` (never `AD.EDT1.LAB`), 2 DCs per VM on the shared subnet, AD site per VM (by /28); admin password
   generated root-only on the VM; `qemu-img` snapshot once green. Exit: `30-verify.sh` green on both VMs, cross-site
   replication green.
 - [ ] **Phase 1: lab.env multi-host.** A per-host block in lab.env (host → subnet, network, DC indexes, site,

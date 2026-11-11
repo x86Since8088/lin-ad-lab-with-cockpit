@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tb.sh — the HA testbed's two Ubuntu VMs (design docs/design/HA-MULTI-HOST.md §10). Run as eddie;
 # root steps go through the host job runner (rj), like edy-rapid-update's vm.sh.
-#   tb.sh net [--dry-run]            define+start libvirt network adl-ha (isolated L2, no host IP)
+#   tb.sh net [--dry-run]            define+start libvirt network adl-shared (10.31.0.0/24, edt1 .1, no forward/DHCP/DNS)
 #   tb.sh create VM [--dry-run]      stock Ubuntu noble cloud image (full copy), cloud-init seed:
 #                                    ssh (key only) + cockpit + podman + guest agent; runner share
 #   tb.sh status [VM]                one line per VM
@@ -28,9 +28,11 @@ x=\$(mktemp)
 cat > "\$x" <<'XML'
 <network>
   <name>$TB_NET</name>
-  <!-- HA testbed: isolated L2 between the two test VMs. No <forward>, no <ip>: no host address,
-       no dnsmasq, no NAT rules. docs/design/HA-MULTI-HOST.md §10 -->
+  <!-- HA testbed shared subnet on edt1: both test VMs + edt1 (.1). No <forward> (not routed to the
+       LAN), DNS off, no DHCP. docs/design/HA-MULTI-HOST.md §10 -->
   <bridge name='$TB_BRIDGE' stp='on' delay='0'/>
+  <dns enable='no'/>
+  <ip address='$TB_SHARED_HOST_IP' netmask='255.255.255.0'/>
 </network>
 XML
 virsh -q net-define "\$x"; rm -f "\$x"
@@ -52,7 +54,7 @@ render_seed() { # -> $OUT/{user-data,meta-data,network-config}
     hosts+="      ${f[5]} ${f[0]}.$TB_DOMAIN ${f[0]} edy-${f[0]#adl-ha-}.$TB_DOMAIN\n"
     [ "${f[0]}" != "$VM" ] && { peer=${f[0]}; peer_ha=${f[5]}; }
   done
-  local sv="TB_ISO_SUBNET_${peer//-/_}" mv="TB_ISO_SUBNET_${VM//-/_}"; peer_sub=${!sv}; my_sub=${!mv}
+  local mv="TB_ISO_SUBNET_${VM//-/_}" dv="TB_DC_RANGE_${VM//-/_}"; my_sub=${!mv}; dc_range=${!dv}
   cat > "$OUT/user-data" <<EOF
 #cloud-config
 # adl-ha testbed seed for $VM (tb.sh). Contains a password HASH, no secret.
@@ -83,11 +85,13 @@ write_files:
       127.0.1.1 $VM.$TB_DOMAIN $VM
 $(printf "$hosts")
   - path: /etc/adl-ha/identity
-    content: "vm=$VM lan0=$LAB_IP ha0=$HA_IP iso=$my_sub peer=$peer peer_ha0=$peer_ha peer_iso=$peer_sub testbed=adl-ha isolated-edy=1\n"
+    content: "vm=$VM lan0=$LAB_IP sh0=$HA_IP iso=$my_sub dc_range=$dc_range peer=$peer peer_sh0=$peer_ha testbed=adl-ha isolated-edy=1\n"
 runcmd:
   - [ systemctl, enable, --now, qemu-guest-agent, ssh, cockpit.socket ]
-  # isolated host-local subnet for this host's DCs/clients (testbed.env TB_ISO_*); rootful podman bridge
+  # isolated VM-local subnet: NON-DC test containers only (testbed.env TB_ISO_*)
   - [ /bin/bash, -c, "podman network exists $TB_ISO_NET || podman network create --subnet $my_sub --gateway ${my_sub%.0/24}.1 $TB_ISO_NET" ]
+  # DC network: macvlan on sh0 = the shared subnet on edt1; this VM hands out only its own /28 to DCs
+  - [ /bin/bash, -c, "podman network exists $TB_DC_NET || podman network create -d macvlan -o parent=sh0 --subnet $TB_SHARED_SUBNET --ip-range $dc_range $TB_DC_NET" ]
   - [ /bin/bash, -c, "echo net.ipv4.ip_forward=1 > /etc/sysctl.d/60-adl-ha.conf && sysctl -q -p /etc/sysctl.d/60-adl-ha.conf" ]
   - [ /bin/bash, -c, "mkdir -p /mnt/edt1 && chmod 0700 /mnt/edt1 && for i in \$(seq 1 10); do mountpoint -q /mnt/edt1 || mount -t 9p -o trans=virtio,version=9p2000.L,access=0,rw,nodev,nosuid edt1 /mnt/edt1; [ -x /mnt/edt1/app/setup-guest-runner.sh ] && break; sleep 3; done; /mnt/edt1/app/setup-guest-runner.sh" ]
 final_message: "adl-ha $VM first boot done after \$UPTIME s"
@@ -103,12 +107,11 @@ network:
       addresses: ["$LAB_IP/24"]
       routes: [{to: default, via: $TB_LAN_GW}]
       nameservers: {addresses: [$(sed 's/ /, /' <<<"$TB_DNS")]}
-    ha0:
+    sh0:
       match: {macaddress: "$MACP:02"}
-      set-name: ha0
+      set-name: sh0
       dhcp4: false
       addresses: ["$HA_IP/24"]
-      routes: [{to: "$peer_sub", via: "$peer_ha"}]
       optional: true
 EOF
   printf 'instance-id: %s-%s\nlocal-hostname: %s\n' "$VM" "$(cat "$OUT/user-data" "$OUT/network-config" | sha256sum | cut -c1-12)" "$VM" > "$OUT/meta-data"
@@ -156,7 +159,7 @@ cmd_status() {
     st=$("${V[@]}" domstate "${f[0]}")
     ssh_ok=$(ssh -o BatchMode=yes -o ConnectTimeout=3 "eddie@${f[4]}" 'echo ok' 2>/dev/null || echo NO)
     ck=$(curl -sk -m 3 -o /dev/null -w '%{http_code}' "https://${f[4]}:9090/" 2>/dev/null || true)
-    echo "${f[0]}  $st  lab0=${f[4]} ha0=${f[5]}  ssh=$ssh_ok  cockpit=${ck:-000}"
+    echo "${f[0]}  $st  lab0=${f[4]} sh0=${f[5]}  ssh=$ssh_ok  cockpit=${ck:-000}"
   done
 }
 

@@ -423,23 +423,30 @@ and mini-srv. The live lab and the shared lab VMs are never touched (memory
   1. **LAN** `lan0` on `192.168.2.0/24` (edt1's `bridge0`): A `.41`, B `.42`,
      static, below the BGW320's DHCP leases, gateway `.254`. It carries ssh,
      cockpit and apt egress. No port forwards point at these addresses.
-  2. **An isolated subnet per VM**, local to that host: a rootful podman bridge
-     `adl-iso` inside the VM, the same model as `static-edt` on edt1. A has
-     `172.31.4.0/24` and B has `172.31.5.0/24`. That host's DCs and test
-     clients live here, pinned to the host as in §3.1. It is never stretched;
-     the other VM reaches it only through a route over the HA subnet.
-  3. **The HA subnet** `ha0`, `10.31.0.0/24`, on `adl-ha`: a libvirt network
-     with **no host address, no forward and no dnsmasq**, so it is a pure L2
-     segment between the two VMs. Each VM has a unique address (`.11` and
-     `.12`), plus reserved VIPs: `.53` for anycast DNS (health-gated, both
-     hosts, §6.2) and `.100` for the floating SYSVOL/GPO writer VIP (lease
-     holder only, §5.3). The HA subnet also carries inter-host replication and
-     the isolated-subnet routes. This is the owner's HA-subnet model at testbed
-     scale: unique IP per instance plus anycast or floating IPs, with no
-     stateful DC state on the HA subnet itself.
+  2. **An isolated subnet per VM**, VM-local: a podman bridge `adl-iso` inside
+     the VM (A `172.31.4.0/24`, B `172.31.5.0/24`). It is not routed. It is for
+     that VM's non-DC test containers. **DCs are not placed here** (owner).
+  3. **A shared subnet on edt1** that both VMs reach (owner: "instead of an ha
+     subnet, just a subnet on edt1 that they both have access to"): libvirt
+     network `adl-shared`, `10.31.0.0/24`, with edt1 at `.1`. It has no forward
+     (not routed to the LAN), no DHCP and no libvirt DNS. The VMs are `.11`/`.12`
+     on `sh0`. **The DCs of both VMs live here**, on a podman macvlan `adl-dc` on
+     `sh0`. Each VM hands out only its own range: A `10.31.0.16/28`, B
+     `10.31.0.32/28`. The AD sites `adl-ha-a`/`adl-ha-b` are defined by those
+     /28s, so site-aware DC location still works on one L2 subnet. Reserved
+     VIPs: `.53` for anycast DNS (§6.2) and `.100` for the floating SYSVOL/GPO
+     writer VIP (lease holder only, §5.3). Replication and the edy cluster also
+     run here.
+  - **Consequence for §3.1 (open):** the testbed puts DCs of both hosts on one
+    shared L2 subnet, instead of the routed per-host subnets §3.1 proposes for
+    the live pair. Whether the live edt1 + mini-srv layout follows the testbed
+    (one shared DC subnet reachable from both hosts) or stays routed is an
+    owner decision for the final design. Either way the AD-site and FSMO logic
+    is the same. Sites come from address ranges, not from L2 boundaries.
 - **Forest:** a separate test forest `HA.TEST.LAB` built from this repo's
-  images and scripts, never joined to `AD.EDT1.LAB`. Its DCs sit on each VM's
-  isolated subnet, with one AD site per VM.
+  images and scripts, never joined to `AD.EDT1.LAB`. Its DCs sit on the shared
+  subnet, with one AD site per VM. The DCs' DNS forwarder is the testbed's own
+  edy node on `sh0`, never edt1's.
 - **Secrets:** the test forest's administrator password is generated on the
   VM into a root-only `.secrets/administrator.pass` (0600), the same layout as
   the lab. edy API keys for the controller are minted with `edy-root-ops`
@@ -472,6 +479,8 @@ and mini-srv. The live lab and the shared lab VMs are never touched (memory
    of §10; mini-srv once it is netbooted; or another host.
 3. **The third-failure-domain witness.** This blocks only automatic failover
    (Phase 6).
+4. **Live DC networking:** routed per-host subnets (§3.1) or one shared DC
+   subnet reachable from both hosts (the testbed model, §10).
 
 ## 12. Stress program (must pass before any test on edt1)
 
