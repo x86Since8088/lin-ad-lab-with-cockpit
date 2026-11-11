@@ -210,6 +210,20 @@ def gpo_names(vm, dc):
     return sorted(l.strip() for l in out.splitlines() if l.strip() and not l.startswith("["))
 
 
+def gpo_folder_everywhere(name):
+    """The GPO's SYSVOL folder must exist on EVERY DC (directory entry alone is not enough)."""
+    rc, out, err = rootjob("adlha-gpo-guid", "podman exec dc1 samba-tool gpo listall 2>/dev/null | grep -B1 -i 'display name *: *%s$' | awk '/^GPO/{print $3}'\n" % name, vm="adl-ha-a")
+    guid = ([l.strip() for l in out.splitlines() if l.strip().startswith("{")] or [None])[0]
+    if not guid:
+        return False, {"guid": None}
+    seen = {}
+    for vm, meta in VMS.items():
+        for dc in meta["dcs"]:
+            rc, o2, e2 = rootjob("adlha-gpo-dir", "test -d /opt/adl-forest/state/%s/var-lib-samba/sysvol/ha.test.lab/Policies/%s && echo yes || echo no\n" % (dc, guid), vm=vm)
+            seen[dc] = "yes" in o2
+    return all(seen.values()), {"guid": guid, "on": seen}
+
+
 def sid_dupes(vm, dc):
     rc, out, err = rootjob("adlha-sid-scan",
                            "podman exec %s ldbsearch -H /var/lib/samba/private/sam.ldb '(objectSid=*)' objectSid 2>/dev/null "
@@ -268,9 +282,12 @@ def d_failover_cycle(kind, vm="adl-ha-a", gpo=True, label=None):
     res["pdc_after"] = pdc_owner(fin)
     if marker:
         res["gpo_survived_on_dc1"] = marker.lower() in [g.lower() for g in gpo_names("adl-ha-a", "dc1")]
+        time.sleep(70)          # one SYSVOL cycle after failback
+        res["gpo_folder_everywhere"], res["gpo_folder"] = gpo_folder_everywhere(marker)
     res["sysvol_hashes"] = sorted({x["sv"] for x in fin["dcs"].values()})
     res["ok"] = bool(s) and (exp_cls is None or res["class"] == exp_cls) and \
-        (kind != "split" or res["seizes"] == 0) and (not marker or res.get("gpo_survived_on_dc1"))
+        (kind != "split" or res["seizes"] == 0) and \
+        (not marker or (res.get("gpo_survived_on_dc1") and res.get("gpo_folder_everywhere")))
     record(label or ("cycle-" + kind), **res)
     return res["ok"]
 
@@ -319,7 +336,8 @@ def drill(name):
                                "sudo", "-n", "/usr/local/sbin/adlab-ha", "json"], inp=json.dumps(req), timeout=600)
             return json.loads(out)
         a = env("ha-fsmo-transfer", {"role": "class-a", "to": "dc3"})
-        mid = pdc_owner(snapshot())
+        # status.json is collected every few seconds: poll until the move is visible
+        mid, _ = wait_for(lambda: "dc3" if pdc_owner(snapshot()) == "dc3" else None, 60, step=3)
         b = env("ha-fsmo-transfer", {"role": "class-a", "to": "dc1"})
         s, took = wait_healthy(300)
         record("D6", ok=a["ok"] and b["ok"] and mid == "dc3" and bool(s), pdc_mid=mid, took_s=round(time.time() - t, 1),

@@ -474,8 +474,9 @@ def v_lease_renew(a, env):
         raise Refused("stale_epoch", "lease epoch %s < host epoch %s" % (L["epoch"], epoch()))
     old = jread("lease.json") or {}
     rec = store_lease(L)
-    if int(L["epoch"]) > epoch():
-        set_epoch(L["epoch"])
+    # a renewal NEVER moves this host's epoch: only a placement does. (Drill D2, 2026-11-11: a
+    # renewal raised it first, the same-epoch placement then looked like a second controller and
+    # was refused, the host kept a stale SYSVOL writer, and the failback's pulls became no-ops.)
     if old.get("host") != rec["host"] or old.get("epoch") != rec["epoch"]:
         audit("lease_change", host=rec["host"], epoch=rec["epoch"], from_host=old.get("host"))
     return {"lease": rec, "may_write": lease_view()["may_write"]}
@@ -611,7 +612,11 @@ def v_sysvol_writer(a, env):
     dc, phase = a["dc"], a.get("phase", "commit")
     need_local_dc(dc)
     c = conf()
-    W = ((jread("placement.json", {}) or {}).get("doc", {}).get("sysvol_writer") or {})
+    P = jread("placement.json", {}) or {}
+    if int(P.get("epoch", -1)) != int(env.get("epoch", -2)):
+        raise Refused("refused", "placement behind: host has epoch %s, call is epoch %s (apply the placement first)"
+                      % (P.get("epoch"), env.get("epoch")), True)
+    W = (P.get("doc", {}).get("sysvol_writer") or {})
     if W.get("dc") == dc:
         return {"dc": dc, "phase": phase, "already_writer": True}
     if W.get("host") == c["host_id"]:

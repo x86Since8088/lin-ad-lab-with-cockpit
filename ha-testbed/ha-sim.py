@@ -237,10 +237,24 @@ class Sim:
                  ("commit", home, "ha-sysvol-writer", {"dc": home_dc, "phase": "commit"})]
         if self.st["mode"] == "degraded-split":
             steps = [s for s in steps if s[0] not in ("transfer",)]
+        old_writer = (self.st.get("placement") or {}).get("sysvol_writer", {})
         for name, h, verb, args in steps:
             t0 = now()
             r = call(h, verb, args, epoch=e, timeout=600)
-            log("failback_" + name, host=h, ok=r.get("ok"), err=r.get("error"), took_s=round(now() - t0, 1))
+            res = r.get("result") or {}
+            log("failback_" + name, host=h, ok=r.get("ok"), err=r.get("error"), took_s=round(now() - t0, 1),
+                pulled_from=res.get("pulled_from"), hash=(res.get("hash") or "")[:12])
+            if r.get("ok") and name in ("prepare", "commit") and old_writer.get("dc") != home_dc:
+                if res.get("already_writer") or not res.get("pulled_from"):
+                    log("failback_refused", step=name, why="no pull from the outage writer %s" % old_writer)
+                    return False
+            if r.get("ok") and name == "commit" and old_writer.get("dc") != home_dc:
+                ws = call(old_writer["host"], "ha-status", timeout=15).get("result") or {}
+                wh = [d["sysvol_hash"] for d in ws.get("dcs", []) if d["name"] == old_writer["dc"]]
+                if not wh or wh[0] != res.get("hash"):
+                    log("failback_refused", step="commit", why="SYSVOL of %s != outage writer %s" % (home_dc, old_writer["dc"]),
+                        new=(res.get("hash") or "")[:12], old=(wh[0] if wh else "?")[:12])
+                    return False
             if not r.get("ok"):
                 if name in ("prepare", "fence"):
                     return False          # repeatable: retry next tick
@@ -277,7 +291,8 @@ class Sim:
                 log("holder_lost", holder=holder)
             survivor = [h for h in HOSTS if h != holder][0]
             expired_for = now() - self.st["lease_expires"]
-            if expired_for > T["grace_s"] and survivor in reach and mode in ("healthy",):
+            fresh = (statuses.get(survivor) or {}).get("collected_at", 0) > self.st["lost_since"]
+            if expired_for > T["grace_s"] and survivor in reach and mode in ("healthy",) and fresh:
                 cls, ev = self.classify(holder, statuses.get(survivor))
                 ok, votes = self.quorum_for(survivor, statuses)
                 att = None
