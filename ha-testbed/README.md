@@ -22,7 +22,8 @@ Design: [docs/design/HA-MULTI-HOST.md](../docs/design/HA-MULTI-HOST.md) §10 and
 - The cockpit/sudo password is generated into `~/.config/adl-ha/eddie.pass` (0600). The seed holds its hash only.
 - Root work inside a VM goes through the edt1 job runner share (`rj -M adl-ha-a …`).
 - **Isolated edy-proxy-go:** its own cluster (A = first-run new cluster, B registers with A). It never
-  registers with or uses edt1's edy deployment (DNS, DHCP, CA, NTP). Not scripted yet (next step after sign-off).
+  registers with or uses edt1's edy deployment (DNS, DHCP, CA, NTP). Kept current with edy main: `tb-edy.sh update`
+  rolls B then A with health gates and rollback (design §10). Not scripted yet (next step after sign-off).
 
 ```bash
 ./tb.sh net --dry-run               # libvirt network adl-ha: no host IP, no forward, no dnsmasq

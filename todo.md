@@ -110,7 +110,11 @@ testbed host. The stress program (design §12) must pass before any HA test on e
   deployment**: A runs first-run new cluster, B registers with A; nothing registers with or uses edt1's edy (script still
   to write: port the `edy-testcluster` recipe into the VMs, listen on ha0 only, DHCP/PXE/netboot/ARP off). Then the test
   forest `HA.TEST.LAB` (never `AD.EDT1.LAB`), 2 DCs per VM on the shared subnet, AD site per VM (by /28); admin password
-  generated root-only on the VM; `qemu-img` snapshot once green. Exit: `30-verify.sh` green on both VMs, cross-site
+  generated root-only on the VM; `qemu-img` snapshot once green.
+  **Keep edy-proxy-go current on both VMs** (owner 2026-11-11): `ha-testbed/tb-edy.sh update`. It takes the promoted main
+  build (as `edy-testcluster` does), rolls B then A, gates each step on health, rolls back automatically, logs to
+  `ha-testbed/edy-versions.log`, and runs on every new main build plus daily. Both VMs must be current before each
+  stress run. Exit: `30-verify.sh` green on both VMs, cross-site
   replication green.
 - [ ] **Phase 1: lab.env multi-host.** A per-host block in lab.env (host → subnet, network, DC indexes, site,
   forwarder), `dc_ip` that follows the host, `20-up.sh --host H` that brings up only that host's DCs, a site/subnet
@@ -128,7 +132,8 @@ testbed host. The stress program (design §12) must pass before any HA test on e
 - [ ] **Phase 3b: stress program** (design §12, S1–S9: failover soak ×50, partition flapping, lease edge cases, cross-host
   write load, SYSVOL churn, boot storms, mini-srv-budget pressure, negative tests, controller loss). All rows pass three
   runs in a row; results in `docs/design/HA-STRESS-RESULTS.md`; owner review. Required before ANY HA test on edt1.
-- [ ] **Phase 4: edy controller** (edy-proxy-go session, not this repo): host-cluster entity, Hosting Domain
+- [ ] **Phase 4: edy controller** (edy-proxy-go session, not this repo; feature requests relayed 2026-11-11 to the
+  "edy-proxy-go dev" session): host-cluster entity, Hosting Domain
   Authentication toggle, controller on raft leader, lease renewal, state machine, alerts; conditional forwarding for AD
   zones, DHCP DNS = one DC per site, Kerberos settings hints (`_gc._tcp`, kdc fallback list). Re-run D1–D9 with
   `edy-testcluster` as controller + witness. Live-fleet registration of test nodes needs the owner's go-ahead.
