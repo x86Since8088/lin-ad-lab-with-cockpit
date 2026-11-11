@@ -200,8 +200,28 @@ The AD lab does not run its own quorum. It uses edy's:
     still apply: lease expiry plus grace, and the holder-alive refusal (§7.3
     v1.1 #3).
   - Implementing the vote is edy work (relayed to the edy-proxy-go dev session
-    on 2026-11-11). The AD-lab side needs no change: it consumes edy's
-    `has_quorum` and lease exactly as before.
+    on 2026-11-11). The AD-lab side consumes edy's `has_quorum` and lease
+    exactly as before, plus the classification below.
+- **Owner, 2026-11-11: the reachability reports also tell the trusted nodes
+  what happened.** Every node reports what it can reach to every trusted node
+  it can reach. From those reports the controller **classifies** the lost
+  side, and the class decides how far an AD failover goes:
+
+  | Class | Evidence (reports from voting domains) | AD action after lease expiry + grace |
+  |---|---|---|
+  | **down** | No domain reaches the lost side's trusted node or host agent, and its own host's nodes report nothing | Full failover (§5.4): seize class A, move the writer lease |
+  | **isolated** | The lost side is alive (its own host's nodes still reach it) but no other domain reaches it | Full failover: the isolated host self-fenced at lease expiry, and its roles are useless to everyone else. Its DCs keep serving local clients; flagged for normal rejoin |
+  | **split** | Both trusted sides are still reached, each by a different set of domains | **Lease-only failover:** the writer lease (SYSVOL/GPO) moves to the majority side, and the minority self-fences. **No FSMO seize.** Both PDCs would be alive, so roles move only by a graceful `ha-fsmo-transfer` after the split heals |
+  | **unknown** | Too few reports to tell (for example, no third domain) | Nothing automatic. Alert; operator attestation (§5.2) can upgrade it to down |
+
+  - The classification and a summary of its evidence (which domains reached
+    which side, report times) travel in the takeover proof
+    (`lease_proof.classification`). The host **refuses `ha-fsmo-seize` when
+    the class is `split` or `unknown`** without an attestation. The writer
+    lease may still move.
+  - The host's own holder-alive LDAP probe (§7.3 v1.1 #3) stays as a second,
+    independent check: a `down` or `isolated` class that the host can
+    contradict is refused.
 
 ### 5.3 Leases and self-fencing (no power fencing needed)
 
@@ -244,7 +264,11 @@ else may take over.
                  ▼
             suspect ── edt1 back within lease+grace ──► healthy (no action)
                  │  lease expired + grace, AND (quorum says edt1 gone OR operator attested)
-                 ▼
+                 │  classify from reachability reports (§5.2): down | isolated | split | unknown
+                 ├── split ──► lease-only: writer lease → mini-srv, NO seize;
+                 │             on heal: graceful fsmo-transfer or failback (HOLD applies)
+                 ├── unknown ─► alert, wait for attestation (= down)
+                 ▼ down | isolated
             failover: seize class A onto fsmo_standby (dc6); grant writer lease to mini-srv;
                       SYSVOL source := dc6; alert "class B roles stranded on dc1/dc2"
                  │
@@ -477,6 +501,9 @@ proposal, it is marked **change**.
      proof.
    - `class_b` needs `i_understand: true`, plus `actor` and `reason`; all three
      are written to the audit log.
+   - **addition (owner, 2026-11-11):** `lease_proof.classification` is
+     `down|isolated|split|unknown` plus an `evidence` summary. Seize is
+     refused for `split`, and for `unknown` without an attestation (§5.2).
 4. **Attestation lifecycle.** Each surviving host stores it in
    `/var/lib/adlab/ha/attest.json`. It is good for **one** takeover and at most
    **60 min** from receipt, and is consumed by the first seize that uses it.
@@ -571,7 +598,8 @@ proposal, it is marked **change**.
 | D1 | edt1 clean reboot | No failover (fits in lease + grace). The writer lease is renewed after boot |
 | D2 | edt1 hard power-off for 30 min | Class A seized onto dc6 at expiry + grace; auth continues on mini-srv; class-B alert. Fails back 30 min after edt1 is healthy; GPO edits made during the outage survive |
 | D3 | Link cut, both hosts alive | Without the witness: edt1 keeps the roles (majority), mini-srv self-fences nothing (it holds no lease), auth works on both sides, directory writes converge on heal. With a witness on mini-srv's side: same, roles stay with the lease holder |
-| D4 | Link cut, and the witness is with mini-srv | edt1's lease lapses and it self-fences SYSVOL/GPO; mini-srv takes class A after grace. On heal: rejoin plus failback. Never two SYSVOL writers |
+| D4 | Link cut, and the witness is with mini-srv | Classified **split** (edt1 still reached by its own host's nodes and clients). edt1's lease lapses and it self-fences SYSVOL/GPO; mini-srv gets the writer lease only, **no FSMO seize**. On heal: graceful transfer per HOLD. Never two SYSVOL writers, never two seized PDCs |
+| D4b | edt1's uplink cut, edt1 still running, witness with mini-srv | Classified **isolated**: full failover (class A seize) after grace; edt1's DCs serve only edt1-local clients and rejoin normally |
 | D5 | mini-srv down | No role change. Alert only |
 | D6 | Operator drain of edt1 | Roles move to mini-srv by transfer (no seize); edt1 stops cleanly; undrain + failback |
 | D7 | Class-B seize by an operator, then edt1 returns | dc1/dc2 flagged for rebuild, boot fenced, rebuilt by `ha-dc-rebuild`; no duplicate SIDs (`dbcheck`, a SID uniqueness scan) |
@@ -725,6 +753,7 @@ with numbers recorded (rates and latencies, not just "it worked"; same style as
 | S7 | **Resource pressure on B** (mini-srv budget): B at 4 vCPU / 8 GB with the failover profile plus `stress-ng` at 80 % CPU and memory | S1 auth load | auth p99 latency recorded and below the agreed threshold (proposed: 500 ms); no OOM kill of samba |
 | S8 | **Negative tests:** D7 (class-B seize then return) and D9 (snapshot-restored DC) | — | detected, quarantined, rebuilt; never silently rejoined |
 | S9 | **Controller loss:** kill the edy leader during a failover, repeatedly | S1 auth load | the new leader resumes from the stored placement and epoch; no double seize; op_id replays are no-ops |
+| S10 | **Classification accuracy:** randomized down (power-off), isolated (uplink cut), split (link between hosts cut) and lossy-link (30 % loss) cases, 100 runs | S1 auth load | class matches the injected fault every time it is not `unknown`; never `down`/`isolated` for a split (zero FSMO seizes in split runs); `unknown` only when reports are missing; time to classify recorded |
 
 Exit for the program: all rows pass three runs in a row, results are written to
 `docs/design/HA-STRESS-RESULTS.md`, and the owner reviews them. Only then is any
