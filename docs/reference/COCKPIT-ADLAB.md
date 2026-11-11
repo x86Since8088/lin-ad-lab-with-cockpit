@@ -31,6 +31,36 @@ single `route()` renders from the URL; tabs and modals are deep-linkable and the
 browser Back/Forward buttons move through them. The tab body re-renders only
 when the path tab changes, so opening or closing a modal never tears it down.
 
+## Object pickers (schema-driven)
+
+Every place that names a directory object (a member, a manager, an account, a
+container, an authentication policy or silo) uses the same "Select objects"
+dialog. It is driven entirely by data from the helper; the page has one
+component and knows no attribute or verb names.
+
+- **Catalog:** `PICKERS` in `adlab-admin`. Each entry gives the object types
+  (`classes`), the search `base` (`domain`, or `config:<RDNs>` below
+  `CN=Configuration`), the `value` handed back (`dn`, `sAMAccountName` or
+  `name`), and optionally `trim_suffix` (`$` for machine names) and
+  `include_base` (offer the domain head itself). `schema` publishes the catalog
+  resolved for the current domain as `pickers`. Single vs multi is NOT part of
+  the catalog; the consumer decides.
+- **Verb arguments:** `arg("member", picker="member")`. The generic verb form
+  puts a **Search…** button beside every argument that names a picker. Never
+  attach a picker to an argument that names a NEW object (`user-create name`).
+- **Attributes:** `object-schema` adds a resolved `picker` to every writable
+  DN-syntax attribute: `ATTR_PICKERS[attr]`, else `object-dn`. Multi follows
+  the attribute's `isSingleValued`. The object editor renders it through
+  `fieldEditor`, so a new DN attribute on a form gets a picker with no UI change.
+- **Hand-built modals** call `objectPicker("<picker name>", {multi, title,
+  acceptLabel, onAccept})` directly (Rename / Move, Add to a group).
+- **Search** is `object-list --scope sub --classes … --search …` (substring over
+  cn/name/sAMAccountName/displayName/description/mail, first 200). In
+  multi-select mode, the Selected list persists across searches.
+- To add a picker: add a catalog entry (its classes need a
+  `PICKER_CLASS_LABELS` label), reference it, and the `TestObjectPickers`
+  closure test checks the reference resolves.
+
 ## Group Policy: stacking
 
 The **compose** modal builds an ordered stack of layers and applies them to a

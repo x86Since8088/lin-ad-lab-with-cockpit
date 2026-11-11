@@ -2038,6 +2038,107 @@ class TestObjectSchemaVerb(Base):
         self.assertEqual(sorted(out["mandatory"]), ["cn"])
 
 
+# ---- object pickers (schema-driven "Select objects" dialog) ----------------
+
+CLS_USER_DN = CLS_USER + "mayContain: manager\nmayContain: seeAlso\nmayContain: msDS-LabRef\n"
+ATTRS_LDIF_DN = ATTRS_LDIF + "\n" + "\n".join([
+    _attrschema("manager", "2.5.5.1"),                    # single-valued DN, catalogued
+    _attrschema("seeAlso", "2.5.5.1", single="FALSE"),    # multi-valued DN
+    _attrschema("msDS-LabRef", "2.5.5.1"),                # DN not in ATTR_PICKERS
+])
+
+def _schema_lab_dn(fake):
+    fake.lab_up()
+    fake.on(lambda a: any("lDAPDisplayName=user)" in str(x) for x in a), out=CLS_USER_DN)
+    fake.on(lambda a: any("lDAPDisplayName=person)" in str(x) for x in a), out=CLS_PERSON)
+    fake.on(lambda a: any("lDAPDisplayName=top)" in str(x) for x in a), out=CLS_TOP)
+    fake.on(lambda a: any(str(x).startswith("(&(objectClass=attributeSchema)") for x in a), out=ATTRS_LDIF_DN)
+    fake.on(lambda a: any("user-Display" in str(x) for x in a), out=USER_DISPLAY)
+    return fake
+
+
+class TestObjectPickers(Base):
+    def test_catalog_is_closed(self):
+        # every reference resolves, and every offered class has a label
+        for name, spec_ in mod.VERBS.items():
+            for a in spec_.get("args", []):
+                if "picker" in a:
+                    self.assertIn(a["picker"], mod.PICKERS, "%s.%s" % (name, a["name"]))
+        for attr, pk in mod.ATTR_PICKERS.items():
+            self.assertIn(pk, mod.PICKERS, attr)
+        for pk, p in mod.PICKERS.items():
+            self.assertIn(p["value"], ("dn", "sAMAccountName", "name"), pk)
+            for c in p["classes"]:
+                self.assertIn(c, mod.PICKER_CLASS_LABELS, "%s:%s" % (pk, c))
+
+    def test_object_naming_args_carry_pickers(self):
+        want = {("group-add-member", "group"): "group", ("group-add-member", "member"): "member",
+                ("gpo-link", "container_dn"): "container-dn", ("rbcd-add", "principal"): "account",
+                ("authsilo-create", "user_policy"): "authpolicy", ("member-verify", "name"): "machine-name",
+                ("user-setpassword", "name"): "user", ("object-create", "parent"): "container-dn"}
+        for (verb, an), pk in want.items():
+            a = next(x for x in mod.VERBS[verb]["args"] if x["name"] == an)
+            self.assertEqual(a.get("picker"), pk, "%s.%s" % (verb, an))
+        # a NEW object's name is never a picker
+        a = next(x for x in mod.VERBS["user-create"]["args"] if x["name"] == "name")
+        self.assertNotIn("picker", a)
+
+    def test_schema_publishes_resolved_catalog(self):
+        rc, out = self.call_main(["schema"])
+        self.assertEqual(rc, 0)
+        pk = out["pickers"]
+        self.assertEqual(set(pk), set(mod.PICKERS))
+        self.assertEqual(pk["member"]["base"], "@domain")            # resolved per --domain at search time
+        self.assertEqual(pk["member"]["base_dn"], "DC=ad,DC=edt1,DC=lab")
+        self.assertEqual(pk["member"]["value"], "sAMAccountName")
+        self.assertEqual([c["id"] for c in pk["member"]["classes"]], ["user", "group", "computer"])
+        self.assertEqual(pk["member"]["classes"][0]["label"], "User")
+        self.assertEqual(pk["authpolicy"]["base_dn"],
+                         "CN=AuthN Policies,CN=AuthN Policy Configuration,CN=Services,CN=Configuration,DC=ad,DC=edt1,DC=lab")
+        self.assertTrue(pk["container-dn"]["include_base"])
+        self.assertEqual(pk["machine-name"]["trim_suffix"], "$")
+        json.dumps(pk)
+
+    def test_dn_fields_get_a_picker_from_the_schema(self):
+        _schema_lab_dn(self.fake)
+        rc, out = self.call_main(["object-schema", "--class", "user"])
+        self.assertEqual(rc, 0)
+        by = {a["attr"]: a for a in out["attributes"]}
+        self.assertEqual(by["manager"]["picker"]["name"], "person-dn")
+        self.assertFalse(by["manager"]["picker"]["multi"])          # isSingleValued TRUE
+        self.assertTrue(by["seeAlso"]["picker"]["multi"])           # multi-valued attribute
+        self.assertEqual(by["msDS-LabRef"]["picker"]["name"], "object-dn")   # default
+        self.assertNotIn("picker", by["memberOf"])                  # read-only back-link
+        self.assertNotIn("picker", by["cn"])                        # not a DN
+
+    def test_list_resolves_base_tokens(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out="")
+        self.call_main(["object-list", "--base", "@domain", "--scope", "sub"])
+        self.call_main(["object-list", "--base", "@config:CN=AuthN Silos,CN=AuthN Policy Configuration,CN=Services",
+                        "--scope", "sub", "--classes", "msDS-AuthNPolicySilo"])
+        calls = self.fake.argv_containing("ldbsearch")
+        bases = [c[c.index("-b") + 1] for c in calls]
+        self.assertEqual(bases, ["DC=ad,DC=edt1,DC=lab",
+            "CN=AuthN Silos,CN=AuthN Policy Configuration,CN=Services,CN=Configuration,DC=ad,DC=edt1,DC=lab"])
+        self.assertIn("(objectClass=msDS-AuthNPolicySilo)", " ".join(calls[1]))
+
+    def test_list_include_base_returns_the_base(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a,
+                     out="dn: DC=ad,DC=edt1,DC=lab\nobjectClass: top\nobjectClass: domainDNS\nname: ad\n\n"
+                         "dn: OU=X,DC=ad,DC=edt1,DC=lab\nobjectClass: top\nobjectClass: organizationalUnit\nname: X\n\n")
+        base = "DC=ad,DC=edt1,DC=lab"
+        rc, out = self.call_main(["object-list", "--base", base, "--scope", "sub",
+                                  "--classes", "organizationalUnit,domainDNS", "--include_base", "yes"])
+        self.assertEqual(rc, 0)
+        self.assertEqual([o["dn"] for o in out["objects"]], [base, "OU=X,DC=ad,DC=edt1,DC=lab"])
+        self.assertIn("(objectClass=domainDNS)", " ".join(self.fake.argv_containing("ldbsearch")[0]))
+        rc, out = self.call_main(["object-list", "--base", base, "--scope", "sub",
+                                  "--classes", "organizationalUnit,domainDNS"])
+        self.assertEqual([o["dn"] for o in out["objects"]], ["OU=X,DC=ad,DC=edt1,DC=lab"])
+
+
 class TestObjectVerbs(Base):
     def test_list_builds_class_and_search_filter(self):
         self.fake.lab_up()

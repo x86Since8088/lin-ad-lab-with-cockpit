@@ -126,7 +126,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.18.0"
+VERSION = "1.19.0"
 
 
 def _require_config():
@@ -973,7 +973,10 @@ def v_schema(a):
             "danger": spec.get("danger", False),
             "args": spec.get("args", []),
         }
-    return {"version": VERSION, "verbs": table}
+    # the object-picker catalog, resolved for the current domain; verb args and
+    # object-schema fields reference it by name (see PICKERS)
+    return {"version": VERSION, "verbs": table,
+            "pickers": {n: picker_spec(n) for n in sorted(PICKERS)}}
 
 def v_status(a):
     out = []
@@ -1828,9 +1831,101 @@ OBJECT_CLASS_FILTERS = {
     "container": "(objectClass=container)",
     "printQueue": "(objectClass=printQueue)",
     "volume":   "(objectClass=volume)",
+    "domainDNS": "(objectClass=domainDNS)",
 }
 DEFAULT_LIST_CLASSES = ["user", "computer", "group", "organizationalUnit", "contact"]
 DEFAULT_COLUMNS = ["name", "class", "description"]
+
+# ---- object pickers (the ADUC "Select Users, Contacts, Computers…" dialog) --
+# One catalog, published by `schema` (top-level "pickers") and referenced by
+# name from verb args (arg(..., picker="member")) and from DN-syntax
+# attributes in `object-schema` (ATTR_PICKERS, default "object-dn"). The UI has
+# ONE generic picker component that renders whatever a spec says; nothing in
+# the UI names an attribute or a verb. A spec:
+#   classes      object types offered (ids from OBJECT_CLASS_FILTERS, or any
+#                objectClass); all ticked by default
+#   base         "domain" | "config:<RDNs below CN=Configuration>". Published as
+#                a TOKEN ("@domain" / "@config:<RDNs>") that object-list resolves
+#                for the forest it runs against (--domain), plus base_dn (the
+#                current forest's DN) for display only
+#   value        what the picker hands back: "dn" | "sAMAccountName" | "name"
+#   trim_suffix  strip this from the value (machine names without the "$")
+#   include_base offer the search base itself (the domain head for links)
+#   title        what the dialog asks for
+# `multi` is NOT in the catalog: it follows the consumer (a multi-valued
+# attribute, a single verb arg), so one picker serves both.
+PICKER_CLASS_LABELS = {
+    "user": "User", "group": "Group", "computer": "Computer", "contact": "Contact",
+    "organizationalUnit": "Organizational unit", "container": "Container",
+    "domainDNS": "Domain", "msDS-AuthNPolicy": "Authentication policy",
+    "msDS-AuthNPolicySilo": "Authentication silo",
+}
+_AUTHN_CFG = "CN=AuthN Policy Configuration,CN=Services"
+PICKERS = {
+    "object-dn":    {"title": "an object", "value": "dn",
+                     "classes": ["user", "group", "computer", "contact", "organizationalUnit", "container"]},
+    "principal-dn": {"title": "users, groups, computers or contacts", "value": "dn",
+                     "classes": ["user", "group", "computer", "contact"]},
+    "manager-dn":   {"title": "a user, group or contact", "value": "dn",
+                     "classes": ["user", "group", "contact"]},
+    "person-dn":    {"title": "a user or contact", "value": "dn", "classes": ["user", "contact"]},
+    "container-dn": {"title": "a container", "value": "dn", "include_base": True,
+                     "classes": ["organizationalUnit", "container", "domainDNS"]},
+    "ou-dn":        {"title": "an organizational unit", "value": "dn", "classes": ["organizationalUnit"]},
+    "user":         {"title": "a user", "value": "sAMAccountName", "classes": ["user"]},
+    "group":        {"title": "a group", "value": "sAMAccountName", "classes": ["group"]},
+    "member":       {"title": "a user, group or computer", "value": "sAMAccountName",
+                     "classes": ["user", "group", "computer"]},
+    "account":      {"title": "a user or computer account", "value": "sAMAccountName",
+                     "classes": ["user", "computer"]},
+    "computer":     {"title": "a computer", "value": "sAMAccountName", "classes": ["computer"]},
+    "machine-name": {"title": "a computer", "value": "sAMAccountName", "trim_suffix": "$",
+                     "classes": ["computer"]},
+    "authpolicy":   {"title": "an authentication policy", "value": "name",
+                     "classes": ["msDS-AuthNPolicy"], "base": "config:CN=AuthN Policies," + _AUTHN_CFG},
+    "authsilo":     {"title": "an authentication silo", "value": "name",
+                     "classes": ["msDS-AuthNPolicySilo"], "base": "config:CN=AuthN Silos," + _AUTHN_CFG},
+    "authpolicy-dn": {"title": "an authentication policy", "value": "dn",
+                      "classes": ["msDS-AuthNPolicy"], "base": "config:CN=AuthN Policies," + _AUTHN_CFG},
+    "authsilo-dn":  {"title": "an authentication silo", "value": "dn",
+                     "classes": ["msDS-AuthNPolicySilo"], "base": "config:CN=AuthN Silos," + _AUTHN_CFG},
+}
+# DN-syntax attribute -> picker. Unlisted writable DN attributes get "object-dn".
+ATTR_PICKERS = {
+    "member": "principal-dn", "managedBy": "manager-dn", "manager": "person-dn",
+    "secretary": "person-dn", "assistant": "person-dn", "seeAlso": "object-dn",
+    "msDS-AssignedAuthNPolicy": "authpolicy-dn", "msDS-AssignedAuthNPolicySilo": "authsilo-dn",
+    "msDS-AuthNPolicySiloMembers": "account-dn",
+}
+PICKERS["account-dn"] = {"title": "a user or computer account", "value": "dn",
+                         "classes": ["user", "computer"]}
+
+def resolve_base(base):
+    """A search base: "@domain" / "@config:<RDNs>" tokens resolve against the
+    forest this invocation targets (--domain), so a picker published once works
+    for whichever forest the UI has selected; anything else is a literal DN."""
+    b = (base or "").strip()
+    if b == "@domain":
+        return domain_dn()
+    if b.startswith("@config:"):
+        return b[len("@config:"):] + "," + config_dn()
+    return b
+
+def picker_spec(name, multi=False):
+    """A catalog entry for publishing (base as a token + base_dn for display,
+    class ids -> {id,label}), or None for an unknown name."""
+    p = PICKERS.get(name)
+    if not p:
+        return None
+    tok = "@" + p.get("base", "domain")
+    out = {"name": name, "title": p["title"], "value": p["value"], "base": tok,
+           "base_dn": resolve_base(tok),
+           "scope": "sub", "multi": bool(multi),
+           "classes": [{"id": c, "label": PICKER_CLASS_LABELS.get(c, c)} for c in p["classes"]]}
+    for k in ("trim_suffix", "include_base"):
+        if p.get(k):
+            out[k] = p[k]
+    return out
 
 # The friendly tabbed forms. MS's schema does NOT describe these — in real
 # ADUC the tab layouts live in property-page COM extensions (referenced by
@@ -2104,11 +2199,12 @@ def v_object_tree(a):
 
 def v_object_list(a):
     d = first_up_dc()
-    base = a["base"]
+    base = resolve_base(a["base"])
     scope = a.get("scope", "one")
     classes = [c for c in (a.get("classes", "") or "").split(",") if c]
     search = (a.get("search") or "").strip()
     extra = [x for x in (a.get("attrs", "") or "").split(",") if x]
+    include_base = (a.get("include_base") or "").lower() in ("1", "yes", "true")
     try:
         limit = int(a.get("limit") or 2000)
     except ValueError:
@@ -2128,7 +2224,7 @@ def v_object_list(a):
     ents = _ldb(d, base, scope, filt, want)
     rows = []
     for e in ents:
-        if e["dn"] == base:
+        if e["dn"] == base and not include_base:
             continue
         at = e["attrs"]
         row_attrs = {}
@@ -2196,6 +2292,10 @@ def v_object_schema(a):
         m["mandatory"] = attr in res["mandatory"]
         if kind:
             m["kind"] = kind
+        if m.get("type") == "dn" and not m.get("readonly"):
+            # schema-driven object picker: which objects this DN attribute may
+            # name, and single vs multi from the attribute's own isSingleValued
+            m["picker"] = picker_spec(ATTR_PICKERS.get(attr, "object-dn"), multi=m.get("multi"))
         return m
 
     attributes = [enrich(x) for x in allowed]
@@ -6022,10 +6122,11 @@ def v_audit_log(a):
 # the verb table — the schema that drives every UI control
 # --------------------------------------------------------------------------
 
-def arg(name, type_="str", required=True, help_="", choices=None, default=None):
+def arg(name, type_="str", required=True, help_="", choices=None, default=None, picker=None):
     a = {"name": name, "type": type_, "required": required, "help": help_}
     if choices: a["choices"] = choices
     if default is not None: a["default"] = default
+    if picker: a["picker"] = picker      # a PICKERS name; `schema` publishes the catalog
     return a
 
 # all_dcs() now consults podman (to catch a promoted dc6); never let that break
@@ -7267,47 +7368,47 @@ VERBS = {
     "user-list":     {"fn": v_user_list, "group": "users", "help": "All users, optionally filtered.",
                       "args": [arg("filter", required=False, help_="substring filter")]},
     "user-show":     {"fn": v_user_show, "group": "users", "help": "One user's directory entry.",
-                      "args": [arg("name")]},
+                      "args": [arg("name", picker="user")]},
     "user-create":   {"fn": v_user_create, "group": "users",
                       "help": "Create a user; a generated password is returned once.",
                       "args": [arg("name"), arg("given", required=False),
                                arg("surname", required=False), arg("mail", required=False)]},
     "user-delete":   {"fn": v_user_delete, "group": "users", "danger": True,
-                      "help": "Delete a user.", "args": [arg("name")]},
+                      "help": "Delete a user.", "args": [arg("name", picker="user")]},
     "user-enable":   {"fn": v_user_enable, "group": "users", "help": "Enable an account.",
-                      "args": [arg("name")]},
+                      "args": [arg("name", picker="user")]},
     "user-disable":  {"fn": v_user_disable, "group": "users", "help": "Disable an account.",
-                      "args": [arg("name")]},
+                      "args": [arg("name", picker="user")]},
     "user-setpassword": {"fn": v_user_setpassword, "group": "users",
                       "help": "Set a user's password (sent on stdin, never argv).",
-                      "args": [arg("name"),
+                      "args": [arg("name", picker="user"),
                                arg("password", "password-stdin", help_="new password, via stdin")]},
     "group-list":    {"fn": v_group_list, "group": "groups", "help": "All groups."},
     "group-show":    {"fn": v_group_show, "group": "groups", "help": "Group entry and members.",
-                      "args": [arg("name")]},
+                      "args": [arg("name", picker="group")]},
     "group-create":  {"fn": v_group_create, "group": "groups", "help": "Create a group.",
                       "args": [arg("name")]},
     "group-delete":  {"fn": v_group_delete, "group": "groups", "danger": True,
-                      "help": "Delete a group.", "args": [arg("name")]},
+                      "help": "Delete a group.", "args": [arg("name", picker="group")]},
     "group-add-member":    {"fn": v_group_add_member, "group": "groups",
-                      "help": "Add a member.", "args": [arg("group"), arg("member")]},
+                      "help": "Add a member.", "args": [arg("group", picker="group"), arg("member", picker="member")]},
     "group-remove-member": {"fn": v_group_remove_member, "group": "groups",
-                      "help": "Remove a member.", "args": [arg("group"), arg("member")]},
+                      "help": "Remove a member.", "args": [arg("group", picker="group"), arg("member", picker="member")]},
     "computer-list": {"fn": v_computer_list, "group": "users", "help": "All computer accounts."},
     "spn-list":      {"fn": v_spn_list, "group": "spn",
                       "help": "setspn -L: the SPNs registered on one account.",
-                      "args": [arg("account", help_="sAMAccountName (a computer may omit the trailing $)")]},
+                      "args": [arg("account", help_="sAMAccountName (a computer may omit the trailing $)", picker="account")]},
     "spn-list-all":  {"fn": v_spn_list_all, "group": "spn",
                       "help": "Every user/computer account that carries a servicePrincipalName."},
     "spn-add":       {"fn": v_spn_add, "group": "spn",
                       "help": "setspn -S/-A: register an SPN on an account (refuses a duplicate; force=true bypasses samba-tool's pre-check but samba still enforces SPN uniqueness).",
-                      "args": [arg("account"),
+                      "args": [arg("account", picker="account"),
                                arg("spn", help_="service/host[:port][/name], e.g. HTTP/web01.ad.edt1.lab"),
                                arg("force", "enum", required=False, choices=["true", "false"],
                                    help_="true = skip the pre-check (setspn -A); samba still refuses a real duplicate")]},
     "spn-delete":    {"fn": v_spn_delete, "group": "spn", "danger": True,
                       "help": "setspn -D: remove an SPN from an account.",
-                      "args": [arg("account"), arg("spn", help_="the exact SPN to remove")]},
+                      "args": [arg("account", picker="account"), arg("spn", help_="the exact SPN to remove")]},
     "spn-query":     {"fn": v_spn_query, "group": "spn",
                       "help": "setspn -Q: which account(s) hold a given SPN.",
                       "args": [arg("spn", help_="the SPN to look up")]},
@@ -7338,7 +7439,7 @@ VERBS = {
                       "help": "Schema-backed inventory of all crypto settings across situations (Kerberos etypes, SMB, NTLM, LDAP/TLS, schannel) with current values."},
     "crypto-account-etypes": {"fn": v_crypto_account_etypes, "group": "crypto",
                       "help": "Get, or with --set, set one account's Kerberos encryption types (msDS-SupportedEncryptionTypes).",
-                      "args": [arg("account"),
+                      "args": [arg("account", picker="account"),
                                arg("set", "enum", required=False, choices=list(CRYPTO_ETYPE_PRESETS),
                                    help_="etype preset to apply (omit to just read)")]},
     "crypto-harden": {"fn": v_crypto_harden, "group": "crypto", "danger": True,
@@ -7375,45 +7476,46 @@ VERBS = {
     "ou-create":     {"fn": v_ou_create, "group": "users", "help": "Create an OU by DN.",
                       "args": [arg("dn", help_="e.g. OU=Workstations")]},
     "ou-delete":     {"fn": v_ou_delete, "group": "users", "danger": True,
-                      "help": "Delete an OU by DN.", "args": [arg("dn")]},
+                      "help": "Delete an OU by DN.", "args": [arg("dn", picker="ou-dn")]},
 
     "object-tree":   {"fn": v_object_tree, "group": "objects",
                       "help": "The container/OU tree (Advanced Features reveals system containers).",
                       "args": [arg("system", required=False, help_="yes = include system containers")]},
     "object-list":   {"fn": v_object_list, "group": "objects",
                       "help": "Objects under a container, by type/search, with chosen columns.",
-                      "args": [arg("base", help_="container DN"),
+                      "args": [arg("base", help_="container DN, or @domain / @config:<RDNs>", picker="container-dn"),
                                arg("scope", "enum", required=False, choices=["one", "sub", "base"], default="one"),
                                arg("classes", required=False, help_="comma list: user,computer,group,organizationalUnit,contact,container,printQueue,volume"),
                                arg("search", required=False, help_="substring over name/sAM/displayName/description"),
                                arg("attrs", required=False, help_="comma list of extra column attributes"),
-                               arg("limit", "int", required=False)]},
+                               arg("limit", "int", required=False),
+                               arg("include_base", required=False, help_="yes = also return the base object itself")]},
     "object-get":    {"fn": v_object_get, "group": "objects",
                       "help": "One object's full attribute set (drives the preview + Attribute Editor).",
-                      "args": [arg("dn"), arg("acl", required=False, help_="yes = include nTSecurityDescriptor"),
+                      "args": [arg("dn", picker="object-dn"), arg("acl", required=False, help_="yes = include nTSecurityDescriptor"),
                                arg("protected", required=False, help_="yes = also report the accidental-deletion flag")]},
     "object-schema": {"fn": v_object_schema, "group": "objects",
                       "help": "Schema-driven tabbed form layout + full allowed-attribute catalog for a class/object.",
                       "args": [arg("class", required=False, help_="lDAPDisplayName of the class"),
-                               arg("dn", required=False, help_="resolve the class from this object")]},
+                               arg("dn", required=False, help_="resolve the class from this object", picker="object-dn")]},
     "object-modify": {"fn": v_object_modify, "group": "objects", "danger": True,
                       "help": "Apply attribute changes (ldbmodify on the PDC emulator).",
-                      "args": [arg("dn"),
+                      "args": [arg("dn", picker="object-dn"),
                                arg("changes", help_="JSON array of {attr,op:replace|add|delete,values,[b64]}")]},
     "object-rename": {"fn": v_object_rename, "group": "objects", "danger": True,
                       "help": "Rename or move an object (ldbrename on the PDC emulator).",
-                      "args": [arg("dn"), arg("new_dn", help_="new full DN")]},
+                      "args": [arg("dn", picker="object-dn"), arg("new_dn", help_="new full DN")]},
     "object-delete": {"fn": v_object_delete, "group": "objects", "danger": True,
                       "help": "Delete an object (ldbdel on the PDC emulator).",
-                      "args": [arg("dn"), arg("recursive", required=False, help_="yes = delete a subtree")]},
+                      "args": [arg("dn", picker="object-dn"), arg("recursive", required=False, help_="yes = delete a subtree")]},
     "object-protect": {"fn": v_object_protect, "group": "objects", "danger": True,
                       "help": "Protect/unprotect an object from accidental deletion (Deny-delete ACE).",
-                      "args": [arg("dn"), arg("state", "enum", choices=["on", "off"])]},
+                      "args": [arg("dn", picker="object-dn"), arg("state", "enum", choices=["on", "off"])]},
     "object-create": {"fn": v_object_create, "group": "objects", "danger": True,
                       "help": "Create an object (OU/user/group/computer/contact) inside a container.",
                       "args": [arg("class", "enum", choices=["organizationalUnit", "user", "group", "computer", "contact"]),
                                arg("name"),
-                               arg("parent", required=False, help_="container DN (default: domain root)"),
+                               arg("parent", required=False, help_="container DN (default: domain root)", picker="container-dn"),
                                arg("given", required=False), arg("surname", required=False),
                                arg("description", required=False)]},
 
@@ -7432,10 +7534,10 @@ VERBS = {
                       "help": "Delete a GPO.", "args": [arg("gpo", help_="{GUID}")]},
     "gpo-link":      {"fn": v_gpo_link, "group": "gpo",
                       "help": "Link a GPO to a container (site/domain/OU DN).",
-                      "args": [arg("gpo", help_="{GUID}"), arg("container_dn")]},
+                      "args": [arg("gpo", help_="{GUID}"), arg("container_dn", picker="container-dn")]},
     "gpo-unlink":    {"fn": v_gpo_unlink, "group": "gpo", "danger": True,
                       "help": "Remove a GPO link.",
-                      "args": [arg("gpo"), arg("container_dn")]},
+                      "args": [arg("gpo"), arg("container_dn", picker="container-dn")]},
     "gpo-show":      {"fn": v_gpo_show, "group": "gpo",
                       "help": "GPO detail: metadata, links, and registry settings.",
                       "args": [arg("gpo", help_="{GUID}")]},
@@ -7692,41 +7794,41 @@ VERBS = {
                       "help": "Every account with any Kerberos delegation, classified and risk-ranked (unconstrained highest). The security inventory — drives the Delegation tab."},
     "delegation-show": {"fn": v_delegation_show, "group": "delegation",
                       "help": "Outbound delegation of one account (samba-tool delegation show).",
-                      "args": [arg("account", help_="sAMAccountName (computer with or without $)")]},
+                      "args": [arg("account", help_="sAMAccountName (computer with or without $)", picker="account")]},
     "delegation-set-unconstrained": {"fn": v_delegation_set_unconstrained, "group": "delegation", "danger": True,
                       "help": "Set/unset UNCONSTRAINED delegation (UF_TRUSTED_FOR_DELEGATION). High risk — prefer constrained/RBCD.",
-                      "args": [arg("account"), arg("state", "enum", choices=["on", "off"])]},
+                      "args": [arg("account", picker="account"), arg("state", "enum", choices=["on", "off"])]},
     "delegation-set-protocol-transition": {"fn": v_delegation_set_protocol_transition, "group": "delegation", "danger": True,
                       "help": "Set/unset protocol transition (UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION / S4U2Proxy).",
-                      "args": [arg("account"), arg("state", "enum", choices=["on", "off"])]},
+                      "args": [arg("account", picker="account"), arg("state", "enum", choices=["on", "off"])]},
     "delegation-add-service": {"fn": v_delegation_add_service, "group": "delegation",
                       "help": "Add a service SPN to msDS-AllowedToDelegateTo (constrained delegation).",
-                      "args": [arg("account"), arg("service", help_="SPN, e.g. cifs/fs01.ad.edt1.lab")]},
+                      "args": [arg("account", picker="account"), arg("service", help_="SPN, e.g. cifs/fs01.ad.edt1.lab")]},
     "delegation-remove-service": {"fn": v_delegation_remove_service, "group": "delegation", "danger": True,
                       "help": "Remove a service SPN from msDS-AllowedToDelegateTo.",
-                      "args": [arg("account"), arg("service", help_="SPN to remove")]},
+                      "args": [arg("account", picker="account"), arg("service", help_="SPN to remove")]},
     "rbcd-show": {"fn": v_rbcd_show, "group": "delegation",
                       "help": "Resource-based constrained delegation: which principals may act on behalf of this resource (decoded from its security descriptor).",
-                      "args": [arg("account", help_="the RESOURCE account")]},
+                      "args": [arg("account", help_="the RESOURCE account", picker="account")]},
     "rbcd-add": {"fn": v_rbcd_add, "group": "delegation",
                       "help": "Allow a principal to act on behalf of the resource account (RBCD).",
-                      "args": [arg("account", help_="the RESOURCE account"),
-                               arg("principal", help_="principal allowed to impersonate, e.g. web01$")]},
+                      "args": [arg("account", help_="the RESOURCE account", picker="account"),
+                               arg("principal", help_="principal allowed to impersonate, e.g. web01$", picker="account")]},
     "rbcd-remove": {"fn": v_rbcd_remove, "group": "delegation", "danger": True,
                       "help": "Revoke a principal from the resource account's RBCD set.",
-                      "args": [arg("account", help_="the RESOURCE account"), arg("principal")]},
+                      "args": [arg("account", help_="the RESOURCE account", picker="account"), arg("principal", picker="account")]},
     "protected-users-list": {"fn": v_protected_users_list, "group": "authpolicy",
                       "help": "Members of the Protected Users group (credentials hardened: no NTLM/DES/RC4, no delegation, short TGT)."},
     "protected-users-add": {"fn": v_protected_users_add, "group": "authpolicy", "danger": True,
                       "help": "Add a member to Protected Users. Do not add accounts relying on NTLM/RC4/delegation.",
-                      "args": [arg("member", help_="sAMAccountName")]},
+                      "args": [arg("member", help_="sAMAccountName", picker="member")]},
     "protected-users-remove": {"fn": v_protected_users_remove, "group": "authpolicy", "danger": True,
                       "help": "Remove a member from Protected Users.",
-                      "args": [arg("member")]},
+                      "args": [arg("member", picker="member")]},
     "authpolicy-list": {"fn": v_authpolicy_list, "group": "authpolicy",
                       "help": "Authentication policies on the domain (TGT lifetime, allowed-from/to)."},
     "authpolicy-show": {"fn": v_authpolicy_show, "group": "authpolicy",
-                      "help": "View one authentication policy.", "args": [arg("name")]},
+                      "help": "View one authentication policy.", "args": [arg("name", picker="authpolicy")]},
     "authpolicy-create": {"fn": v_authpolicy_create, "group": "authpolicy",
                       "help": "Create an authentication policy. Defaults to AUDIT; enforce=true to enforce.",
                       "args": [arg("name"),
@@ -7735,26 +7837,26 @@ VERBS = {
                                arg("tgt_lifetime_mins", "int", required=False, help_="user TGT lifetime in minutes"),
                                arg("description", required=False)]},
     "authpolicy-delete": {"fn": v_authpolicy_delete, "group": "authpolicy", "danger": True,
-                      "help": "Delete an authentication policy.", "args": [arg("name")]},
+                      "help": "Delete an authentication policy.", "args": [arg("name", picker="authpolicy")]},
     "authsilo-list": {"fn": v_authsilo_list, "group": "authpolicy",
                       "help": "Authentication silos on the domain."},
     "authsilo-show": {"fn": v_authsilo_show, "group": "authpolicy",
-                      "help": "View one authentication silo (its policies + members).", "args": [arg("name")]},
+                      "help": "View one authentication silo (its policies + members).", "args": [arg("name", picker="authsilo")]},
     "authsilo-create": {"fn": v_authsilo_create, "group": "authpolicy",
                       "help": "Create an authentication silo binding user/computer/service policies. Defaults to AUDIT.",
                       "args": [arg("name"),
-                               arg("user_policy", required=False, help_="user authentication policy name"),
-                               arg("computer_policy", required=False, help_="computer authentication policy name"),
-                               arg("service_policy", required=False, help_="service authentication policy name"),
+                               arg("user_policy", required=False, help_="user authentication policy name", picker="authpolicy"),
+                               arg("computer_policy", required=False, help_="computer authentication policy name", picker="authpolicy"),
+                               arg("service_policy", required=False, help_="service authentication policy name", picker="authpolicy"),
                                arg("enforce", "enum", required=False, choices=["true", "false"], default="false")]},
     "authsilo-delete": {"fn": v_authsilo_delete, "group": "authpolicy", "danger": True,
-                      "help": "Delete an authentication silo.", "args": [arg("name")]},
+                      "help": "Delete an authentication silo.", "args": [arg("name", picker="authsilo")]},
     "authsilo-member-grant": {"fn": v_authsilo_member_grant, "group": "authpolicy",
                       "help": "Grant an account membership in an authentication silo.",
-                      "args": [arg("name", help_="silo name"), arg("member", help_="sAMAccountName")]},
+                      "args": [arg("name", help_="silo name", picker="authsilo"), arg("member", help_="sAMAccountName", picker="account")]},
     "authsilo-member-revoke": {"fn": v_authsilo_member_revoke, "group": "authpolicy", "danger": True,
                       "help": "Revoke an account's membership in an authentication silo.",
-                      "args": [arg("name", help_="silo name"), arg("member")]},
+                      "args": [arg("name", help_="silo name", picker="authsilo"), arg("member", picker="account")]},
     "container-list": {"fn": v_container_list, "group": "containers",
                       "help": "Every lab container with state/health/exit-code/restarts + its supervisor retry state. Drives the Containers tab."},
     "container-start": {"fn": v_container_start, "group": "containers",
@@ -7800,15 +7902,15 @@ VERBS = {
     "member-provision": {"fn": v_member_provision, "group": "members",
                       "help": "Create a machine account and return its offline-join blob (a credential, returned once).",
                       "args": [arg("name", help_="machine account name, <=15 chars"),
-                               arg("ou", required=False, help_="OU DN to place the account in"),
+                               arg("ou", required=False, help_="OU DN to place the account in", picker="ou-dn"),
                                arg("reuse", "enum", required=False, choices=["yes", "no"], default="no",
                                    help_="yes = re-provision an existing account (invalidates the previous blob)")]},
     "member-verify": {"fn": v_member_verify, "group": "members",
                       "help": "Distinguish 'account provisioned' from 'machine actually joined'.",
-                      "args": [arg("name")]},
+                      "args": [arg("name", picker="machine-name")]},
     "member-deprovision": {"fn": v_member_deprovision, "group": "members", "danger": True,
                       "help": "Delete a member server's machine account.",
-                      "args": [arg("name")]},
+                      "args": [arg("name", picker="machine-name")]},
     "audit-log":     {"fn": v_audit_log, "group": "activity",
                       "help": "Recent adlab-admin invocations (the API activity log).",
                       "args": [arg("lines", "int", required=False, default=100)]},

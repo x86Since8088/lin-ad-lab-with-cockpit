@@ -118,6 +118,10 @@
             "Reusable GPO snapshots: back a GPO up into the template store, stack template settings into a target GPO, or restore a template as a new GPO."] },
         "object-edit": { title: "Edit object", body: [
             "Edit an object's attributes through class-aware tabs (General, Account, …) validated against the live schema. Only changed, writable attributes are sent; read-only / binary / back-link attributes are not editable."] },
+        "object-picker": { title: "Select objects", body: [
+            "Search the directory for the objects this field or action accepts. The object types, the search base and what is handed back (DN, logon name or name) come from the helper's schema, so every picker in the console behaves the same way.",
+            "Type part of a name, logon name, display name, description or mail and press Search (an empty search lists the first 200). Untick object types to narrow it.",
+            "Where several values are allowed, ticked objects collect in the Selected list across searches; Accept adds them all. Where one value is allowed, pick a row (double-click accepts)."] },
         "object-attrs": { title: "Attribute Editor", body: [
             "The raw Attribute Editor: every attribute the object's classes allow, typed from the live schema. Binary / SID / security-descriptor values are shown but not editable here."] }
     };
@@ -503,7 +507,10 @@
                     input = el("input"); input.type = "text";
                 }
                 input.name = a.name;
-                form.appendChild(input);
+                var aPicker = a.type === "str" || !a.type ? pickerSpec(a.picker) : null;
+                form.appendChild(aPicker ? withObjectPicker(input, aPicker, { multi: false,
+                    get: function () { return input.value ? [input.value] : []; },
+                    set: function (v) { input.value = v[0] || ""; } }) : input);
                 inputs[a.name] = { spec: a, node: input };
             });
             var needTyped = ["fsmo-seize", "dc-demote", "dc-decommission", "domain-remove",
@@ -1451,20 +1458,33 @@
             });
             return { node: sel, get: function () { return sel.value ? [sel.value] : []; } };
         }
+        var picker = type === "dn" ? pickerSpec(field.picker) : null;
         if (multi || type === "multitext") {
             var ta = el("textarea", "al-ta"); ta.rows = Math.min(8, Math.max(2, values.length + 1));
             ta.value = values.join("\n");
-            ta.placeholder = multi ? "one value per line" : "";
-            return { node: ta, get: function () {
+            ta.placeholder = multi ? (picker ? "one DN per line — or Search…" : "one value per line") : "";
+            var getTa = function () {
                 return ta.value.split("\n").map(function (s) { return s.replace(/\r$/, ""); })
                     .filter(function (s) { return s.length; });
-            } };
+            };
+            if (picker) {
+                return { node: withObjectPicker(ta, picker, { multi: !!multi, get: getTa,
+                    set: function (v) { ta.value = v.join("\n"); ta.rows = Math.min(8, Math.max(2, v.length + 1)); } }),
+                    get: getTa };
+            }
+            return { node: ta, get: getTa };
         }
         var inp = el("input", "al-in"); inp.type = "text"; inp.value = values[0] || "";
         if (type === "int" || type === "int64") inp.inputMode = "numeric";
         if (field.maxlen) inp.maxLength = field.maxlen;
         if (type === "time") inp.placeholder = "AD time (raw)";
-        return { node: inp, get: function () { return inp.value.trim() ? [inp.value.trim()] : []; } };
+        var getInp = function () { return inp.value.trim() ? [inp.value.trim()] : []; };
+        if (picker) {
+            inp.placeholder = "DN — or Search…";
+            return { node: withObjectPicker(inp, picker, { multi: false, get: getInp,
+                set: function (v) { inp.value = v[0] || ""; } }), get: getInp };
+        }
+        return { node: inp, get: getInp };
     }
 
     function sameVals(a, b) {
@@ -1631,6 +1651,15 @@
             box.appendChild(el("label", null, "new DN"));
             var inp = el("input", "al-in"); inp.type = "text"; inp.value = dn; box.appendChild(inp);
             box.appendChild(el("div", "hint", "change the RDN to rename, or the parent to move."));
+            var mv = el("button", "al-btn secondary", "Move to… (search)"); mv.type = "button";
+            mv.addEventListener("click", function () {
+                objectPicker("container-dn", { multi: false, title: "Move to which container?",
+                    onAccept: function (v) {
+                        var cur = inp.value.trim() || dn;
+                        inp.value = dnParts(cur)[0] + "," + v[0];
+                    } });
+            });
+            box.appendChild(mv);
             var msg = el("span", "hint", "");
             var ok = el("button", "al-btn", "Rename");
             ok.addEventListener("click", function () {
@@ -1746,32 +1775,25 @@
     // Add a user to a group — the ADUC 'Add to a group' workflow, backed by the
     // existing group-add-member verb (memberOf is read-only on the object).
     function addToGroupPrompt(sam) {
-        transientModal("Add to a group", function (box) {
-            box.appendChild(el("div", "hint", "member: ")).appendChild(el("kbd", "al", sam));
-            var host = el("div"); host.appendChild(el("div", "al-loading", "loading groups…")); box.appendChild(host);
-            var msg = el("span", "hint", ""); var chosen = null;
-            run("group-list").then(function (r) {
-                clear(host);
-                var rows = (r.groups || []).map(function (g) { return { group: g }; });
-                var pk = pickerTable({
-                    columns: [{ key: "group", label: "group" }],
-                    rows: rows, mode: "single", height: 240,
-                    rowKey: function (g) { return g.group; },
-                    onChange: function (sel) { chosen = sel[0] || null; },
+        // the shared schema-driven picker (spec "group"), multi-select: one
+        // search can add the member to several groups; each add is reported.
+        objectPicker("group", { multi: true, title: "Add " + sam + " to groups", acceptLabel: "Add",
+            onAccept: function (groups) {
+                transientModal("Add to groups", function (box) {
+                    box.appendChild(el("div", "hint", "member: ")).appendChild(el("kbd", "al", sam));
+                    var list = el("ul", "al-objpick-report"); box.appendChild(list);
+                    var chain = Promise.resolve();
+                    groups.forEach(function (g) {
+                        var li = el("li", null, g + " … "); list.appendChild(li);
+                        chain = chain.then(function () {
+                            return run("group-add-member", { group: g, member: sam })
+                                .then(function () { li.textContent = g + " — added"; li.className = "ok"; })
+                                .catch(function (e) { li.textContent = g + " — " + e; li.className = "err"; });
+                        });
+                    });
+                    chain.then(function () { if (aducReload) aducReload(); });
                 });
-                host.appendChild(pk.node);
-                var add = el("button", "al-btn", "Add to group");
-                add.addEventListener("click", function () {
-                    if (!chosen) { msg.textContent = " pick a group first"; return; }
-                    msg.textContent = " …";
-                    run("group-add-member", { group: chosen.group, member: sam }).then(function () {
-                        msg.textContent = " added to " + chosen.group; if (aducReload) aducReload();
-                    }).catch(function (e) { msg.textContent = " " + e; });
-                });
-                var row = el("div", "row"); row.appendChild(add); row.appendChild(msg);
-                box.appendChild(row);
-            }).catch(function (e) { clear(host); host.appendChild(el("div", "al-alert err", String(e))); });
-        });
+            } });
     }
 
     var aducSelect = null;   // set by renderObjects: select+preview a DN in the console
@@ -1928,7 +1950,8 @@
     /* Reusable picker: a filterable table with a vertically scrolling body and
      * horizontal scroll, single- or multi-select. Cells cap at 420px and wrap.
      * opts: {columns:[{key,label}], rows, mode:"single"|"multi", rowKey,
-     *        height, selectedKeys, actions:row->node, onChange:rows->void} */
+     *        height, selectedKeys, actions:row->node, onChange:rows->void,
+ *        onActivate:row->void (double-click)} */
     function pickerTable(opts) {
         var mode = opts.mode || "single";
         var rowKey = opts.rowKey || function (r, i) { return String(i); };
@@ -1986,6 +2009,7 @@
                     if (tag === "BUTTON" || tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
                     toggle(k, row, !selected[k]);
                 });
+                if (opts.onActivate) tr.addEventListener("dblclick", function () { opts.onActivate(row); });
                 opts.columns.forEach(function (c) {
                     var td = el("td", "al-wrapcell");
                     var v = row[c.key];
@@ -2004,6 +2028,176 @@
             setRows: function (r) { rows = r; selected = {}; draw(); },
             clearSel: function () { selected = {}; draw(); }
         };
+    }
+
+    /* ---- schema-driven object picker ("Select Users, Groups, …") --------
+     * ONE component for every place that names a directory object. What it
+     * offers is a spec the helper publishes (adlab-admin PICKERS): the object
+     * types, the search base, and what to hand back (dn | sAMAccountName |
+     * name, optional trim_suffix). Nothing here knows an attribute or a verb.
+     *   pickerSpec(nameOrSpec) -> resolved spec or null
+     *   objectPicker(spec, {multi, title, acceptLabel, onAccept(values, rows)})
+     *   withObjectPicker(node, spec, {multi, get, set}) -> node + "Search…"
+     * Multi-select keeps a basket across searches, so several searches can
+     * build one selection before Accept. */
+    var PICKER_LIMIT = 200;
+    // DN -> its RDN components, honouring "\," escapes (CN=Doe\, John,OU=…)
+    function dnParts(dn) { return String(dn || "").match(/(?:\\.|[^,])+/g) || []; }
+    function pickerSpec(p) {
+        if (!p) return null;
+        if (typeof p === "object") return p;
+        return (SCHEMA && SCHEMA.pickers && SCHEMA.pickers[p]) || null;
+    }
+    function pickerValue(spec, row) {
+        var v = spec.value === "dn" ? row.dn
+            : spec.value === "name" ? row.name
+            : ((row.attrs && row.attrs[spec.value]) || row.name);
+        if (spec.trim_suffix && v && v.slice(-spec.trim_suffix.length) === spec.trim_suffix)
+            v = v.slice(0, -spec.trim_suffix.length);
+        return v;
+    }
+    function objectPicker(spec, opts) {
+        spec = pickerSpec(spec); opts = opts || {};
+        if (!spec) return;
+        var multi = opts.multi !== undefined ? !!opts.multi : !!spec.multi;
+        var labelOf = {}; (spec.classes || []).forEach(function (c) { labelOf[c.id] = c.label; });
+        transientModal(opts.title || ("Select " + spec.title), function (box, close) {
+            box.classList.add("al-objpick");
+            // object types (all on by default)
+            var types = el("div", "al-objpick-types");
+            types.appendChild(el("span", "hint", "Object types: "));
+            var typeBoxes = [];
+            (spec.classes || []).forEach(function (c) {
+                var lab = el("label", "al-check al-inline");
+                var cb = el("input"); cb.type = "checkbox"; cb.checked = true; cb.value = c.id;
+                lab.appendChild(cb); lab.appendChild(el("span", null, " " + c.label));
+                types.appendChild(lab); typeBoxes.push(cb);
+            });
+            if (typeBoxes.length > 1) box.appendChild(types);
+            box.appendChild(el("div", "hint al-objpick-base", "in: " + (spec.base_dn || spec.base)));
+            // search row
+            var srow = el("form", "row al-objpick-search");
+            var q = el("input", "al-in"); q.type = "search";
+            q.placeholder = "name, logon name, display name, description or mail…";
+            q.setAttribute("aria-label", "search text");
+            var go = el("button", "al-btn", "Search"); go.type = "submit";
+            srow.appendChild(q); srow.appendChild(go); box.appendChild(srow);
+            var status = el("div", "hint", ""); box.appendChild(status);
+            var results = el("div", "al-objpick-results"); box.appendChild(results);
+            // basket (multi only): survives across searches
+            var basket = {}, order = [];
+            var basketEl = el("div", "al-objpick-basket");
+            if (multi) box.appendChild(basketEl);
+            var single = null, table = null;
+            var bar = el("div", "row al-modal-actions");
+            var accept = el("button", "al-btn", opts.acceptLabel || "Accept"); accept.type = "button";
+            var cancel = el("button", "al-btn secondary", "Cancel"); cancel.type = "button";
+            bar.appendChild(accept); bar.appendChild(cancel); box.appendChild(bar);
+
+            function chosen() { return multi ? order.map(function (k) { return basket[k]; }) : (single ? [single] : []); }
+            function refreshBar() {
+                var n = chosen().length;
+                accept.disabled = n === 0;
+                accept.textContent = (opts.acceptLabel || "Accept") + (multi && n ? " (" + n + ")" : "");
+                if (!multi) return;
+                clear(basketEl);
+                if (!n) { basketEl.appendChild(el("span", "hint", "nothing selected yet")); return; }
+                basketEl.appendChild(el("span", "hint", "Selected: "));
+                chosen().forEach(function (r) {
+                    var chip = el("span", "al-chip", r.name + " ");
+                    chip.title = r.dn;
+                    var x = el("button", "al-chip-x", "×"); x.type = "button";
+                    x.setAttribute("aria-label", "remove " + r.name);
+                    x.addEventListener("click", function () {
+                        delete basket[r.dn]; order = order.filter(function (k) { return k !== r.dn; });
+                        refreshBar(); if (table) drawTable(lastRows);
+                    });
+                    chip.appendChild(x); basketEl.appendChild(chip);
+                });
+            }
+            var lastRows = [];
+            function drawTable(rows) {
+                lastRows = rows; clear(results);
+                table = pickerTable({
+                    columns: [{ key: "name", label: "name" }, { key: "type", label: "type" },
+                              { key: "sam", label: "logon name" }, { key: "where", label: "in" },
+                              { key: "desc", label: "description" }],
+                    rows: rows, mode: multi ? "multi" : "single", height: 300,
+                    rowKey: function (r) { return r.dn; },
+                    selectedKeys: multi ? order.filter(function (k) { return rows.some(function (r) { return r.dn === k; }); })
+                                        : (single ? [single.dn] : []),
+                    onChange: function (sel) {
+                        if (!multi) { single = sel[0] || null; refreshBar(); return; }
+                        var on = {}; sel.forEach(function (r) { on[r.dn] = r; });
+                        rows.forEach(function (r) {
+                            if (on[r.dn] && !basket[r.dn]) { basket[r.dn] = r; order.push(r.dn); }
+                            if (!on[r.dn] && basket[r.dn]) { delete basket[r.dn]; order = order.filter(function (k) { return k !== r.dn; }); }
+                        });
+                        refreshBar();
+                    },
+                    onActivate: multi ? null : function (r) { single = r; doAccept(); },
+                });
+                results.appendChild(table.node);
+            }
+            function search() {
+                var cls = typeBoxes.filter(function (b) { return b.checked; }).map(function (b) { return b.value; });
+                if (!cls.length) { status.textContent = "pick at least one object type"; return; }
+                status.textContent = "searching…"; go.disabled = true;
+                var args = { base: spec.base, scope: spec.scope || "sub", classes: cls.join(","),
+                             limit: String(PICKER_LIMIT) };
+                if (q.value.trim()) args.search = q.value.trim();
+                if (spec.include_base) args.include_base = "yes";
+                run("object-list", args).then(function (r) {
+                    go.disabled = false;
+                    var rows = (r.objects || []).map(function (o) {
+                        return { dn: o.dn, name: o.name, cls: o["class"], attrs: o.attrs || {},
+                                 type: labelOf[o["class"]] || o["class"],
+                                 sam: (o.attrs || {}).sAMAccountName || "",
+                                 desc: (o.attrs || {}).description || "",
+                                 where: dnParts(o.dn).slice(1).filter(function (p) { return !/^DC=/i.test(p); })
+                                            .map(function (p) { return p.slice(p.indexOf("=") + 1); }).reverse().join(" / ") || "(root)" };
+                    });
+                    status.textContent = rows.length + " found" + (r.truncated ? " — first " + PICKER_LIMIT + " shown, refine the search" : "");
+                    drawTable(rows);
+                }).catch(function (e) { go.disabled = false; status.textContent = String(e); });
+            }
+            function doAccept() {
+                var rows = chosen(); if (!rows.length) return;
+                var vals = rows.map(function (r) { return pickerValue(spec, r); });
+                close();
+                if (opts.onAccept) opts.onAccept(vals, rows);
+            }
+            srow.addEventListener("submit", function (ev) { ev.preventDefault(); search(); });
+            typeBoxes.forEach(function (b) { b.addEventListener("change", search); });
+            accept.addEventListener("click", doAccept);
+            cancel.addEventListener("click", close);
+            refreshBar();
+            search();                      // browse immediately; typing narrows
+            setTimeout(function () { try { q.focus(); } catch (e) { /* gone */ } }, 0);
+        }, "object-picker");
+    }
+    /* Put a "Search…" button beside an editor node. io.get/io.set read/write
+     * the field's values (arrays); multi appends (de-duplicated, DNs compared
+     * case-insensitively), single replaces. */
+    function withObjectPicker(node, spec, io) {
+        spec = pickerSpec(spec);
+        if (!spec) return node;
+        var wrap = el("div", "al-pickfield");
+        wrap.appendChild(node);
+        var b = el("button", "al-btn secondary al-pickbtn", "Search…"); b.type = "button";
+        b.title = "Search the directory for " + spec.title;
+        b.setAttribute("aria-label", "search the directory for " + spec.title);
+        b.addEventListener("click", function () {
+            objectPicker(spec, { multi: io.multi, onAccept: function (vals) {
+                if (!io.multi) { io.set(vals.slice(0, 1)); return; }
+                var cur = io.get(), seen = {};
+                cur.forEach(function (v) { seen[v.toLowerCase()] = true; });
+                vals.forEach(function (v) { if (!seen[v.toLowerCase()]) { cur.push(v); seen[v.toLowerCase()] = true; } });
+                io.set(cur);
+            } });
+        });
+        wrap.appendChild(b);
+        return wrap;
     }
 
     /* Editor for one registry value. Adapts to the type (single-select picker),

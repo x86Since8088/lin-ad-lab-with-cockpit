@@ -376,3 +376,27 @@ table.al-objtable th.al-kebhdr { width: 1%; }
     word-break: break-word;
 }
 .al-edit-gpo-name.muted { font-weight: 400; opacity: 0.7; }
+
+/* ---- schema-driven object picker (objectPicker / withObjectPicker) ---- */
+.al-pickfield { display: flex; gap: 0.4rem; align-items: flex-start; }
+.al-pickfield > input, .al-pickfield > textarea { flex: 1 1 auto; min-width: 0; }
+.al-modal .al-pickfield .al-pickbtn { width: auto; flex: 0 0 auto; white-space: nowrap; }
+.al-modal.al-objpick { width: min(900px, 95vw); }
+.al-objpick-types { display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; align-items: center; margin: 0.2rem 0 0.4rem; }
+.al-modal .al-check.al-inline { display: inline-flex; align-items: center; margin: 0; font-weight: 400; }
+.al-modal .al-check.al-inline input { width: auto; }
+.al-objpick-base { font-family: monospace; font-size: 0.78rem; overflow-wrap: anywhere; }
+.al-objpick-search { display: flex; gap: 0.4rem; margin: 0.4rem 0 0.2rem; }
+.al-modal .al-objpick-search input { flex: 1 1 auto; }
+.al-modal .al-objpick-search .al-btn { width: auto; }
+.al-objpick-results .al-picker-filter { display: none; }   /* the search box is the filter */
+.al-objpick-basket { display: flex; flex-wrap: wrap; gap: 0.3rem; align-items: center; min-height: 1.8rem;
+    padding: 0.3rem 0; border-top: 1px solid var(--al-border); }
+.al-chip { display: inline-flex; align-items: center; gap: 0.15rem; padding: 0.1rem 0.15rem 0.1rem 0.5rem;
+    border-radius: 999px; background: var(--al-accent-soft); color: var(--al-ink); font-size: 0.82rem; }
+.al-modal .al-chip-x { width: auto; border: 0; background: transparent; color: var(--al-sub); cursor: pointer;
+    padding: 0 0.35rem; font-size: 0.95rem; line-height: 1; margin: 0; }
+.al-chip-x:hover, .al-chip-x:focus-visible { color: var(--al-err); }
+.al-objpick-report li.ok { color: var(--al-ok); }
+.al-objpick-report li.err { color: var(--al-err); }
+@media (max-width: 600px) { .al-pickfield { flex-direction: column; align-items: stretch; } }
