@@ -343,12 +343,15 @@ cases that replication spreads instead of fixing.
 | `ha-dc-rebuild --dc D` | yes | Metadata cleanup from a live peer, wipe the state dir, fresh join. Used after a class-B seize or a tombstone/USN-rollback finding |
 | `ha-fsmo-transfer --role R --to D` | yes | Graceful transfer. Both owners must be reachable |
 | `ha-fsmo-seize --role R --to D --lease-proof P` | yes | Class A only, unless `--class-b --i-understand` from an operator. Requires a valid takeover proof: the expired lease plus a quorum or attestation token. Records the old holder for the rejoin check |
-| `ha-sysvol-writer --dc D` | yes | Move the SYSVOL source (with the lease). A cold or out-of-date target pulls from the old writer first if it is reachable |
+| `ha-sysvol-writer --dc D [--phase prepare\|commit]` | yes | Move the SYSVOL source (with the lease). A cold or out-of-date target pulls from the old writer first if it is reachable |
 | `ha-drain` | yes | Maintenance: transfer every role off this host's DCs, give up the writer lease, then report `drained`. Refuses if no other host has a healthy DC to take the roles |
 | `ha-undrain` | yes | Clears the drain flag. Roles come back only through the normal failback (hysteresis) |
 | `ha-fence` / `ha-unfence` | yes | Stop or allow the host's single-writer functions by hand (SYSVOL, GPO verbs). DCs keep running |
 | `ha-attest-host-dead --host H` | yes | Operator-only stand-in for a quorum vote while no witness exists (§5.2). Logged with who and why |
 | `ha-rejoin-check` | no | After a return: which local DCs may start normally, which must be rebuilt, and why |
+| `ha-lease-renew` | lease only | The 15 s heartbeat lease renewal (§7.3 v1.1 #2). Idempotent; op_id not stored; audited only when holder or epoch changes |
+| `ha-attest-clear --host H` | yes | Drop an attestation when the host answers again (§7.3 v1.1 #4) |
+| `ha-json` | — | The single machine entrypoint: one request envelope on stdin, one response envelope on stdout; dispatches to the verbs above (§7.3 v1.1 #1) |
 
 ### 7.3 Contract details (agreed with the "edy-proxy-go dev" session, 2026-11-11)
 
@@ -402,6 +405,113 @@ so the collector runs as root. **Reading** does not:
 - Every mutating verb runs as root through `adlab-admin` and enforces the
   epoch/op_id/safety checks itself (receiver authority). A non-root caller of
   a mutating verb is refused.
+
+#### Contract v1.1: answers to edy PR #525 (Q1–Q10, 2026-11-11)
+
+These answers are binding on both sides. Where an answer changes edy's
+proposal, it is marked **change**.
+
+1. **Entrypoint: `adlab-admin ha-json`**, confirmed. It reads **one** request
+   envelope on stdin and writes **one** response envelope on stdout.
+   - The envelope is printed even on a non-zero exit. Exit codes: 0 = `ok:true`,
+     1 = error envelope, 2 = unreadable request (the envelope then carries
+     `unsupported_schema` or `internal`).
+   - edy's `printf %s "$1" | base64 -d | …` with the request in argv is
+     acceptable, because envelopes carry no secrets. The receiving side never
+     puts the request on its own argv.
+   - **Reads work as `adlab-ha`** (`ha-status`, `ha-rejoin-check`). `ha-health`
+     needs root (live `podman exec`), and so does every mutating verb. Run as
+     `adlab-ha`, those return `refused` with "requires root".
+   - Reads by `adlab-ha` are not written to the root audit log. Every root call
+     is.
+   - Ask to edy: restrict the agent to this one command (an allow-list entry
+     for `adlab-admin ha-json`) rather than general `--enable-run-shell`, once
+     the agent supports that.
+2. **change: lease renewal gets its own verb, `ha-lease-renew`.** Sending
+   `ha-placement-apply` every 15 s would write the audit log and the 7-day
+   op_id store about 40k times a week, and mix rare placement changes with a
+   heartbeat.
+   - `ha-lease-renew {lease:{host, epoch, expires_at, ttl_s}}` is idempotent
+     by construction. It accepts an op_id but does not store it. It is audited
+     only when the lease holder or epoch changes.
+   - `ha-placement-apply {placement, lease, proof?}` stays for real changes,
+     with `hosts` keyed by **host GUID** (each entry also carries `name`).
+   - **change: the lease carries `ttl_s`.** The host fences at
+     `min(expires_at, local_receive_time + ttl_s)` on its **own** clock, so
+     controller-to-host skew can only shorten a lease, never lengthen it.
+3. **`ha-fsmo-seize` args** are confirmed as proposed. On top of edy's proof,
+   the host enforces three things itself:
+   - The proof's lease must match the host's own `lease.json` record for the
+     old holder and epoch.
+   - expiry + grace must have passed **by the host's own clock**.
+   - **addition:** the host refuses (`refused: holder alive`) if the current
+     role holder still answers an LDAP rootDSE probe from this host. That makes
+     a seize from a partitioned but alive owner impossible even with a valid
+     proof.
+   - `class_b` needs `i_understand: true`, plus `actor` and `reason`; all three
+     are written to the audit log.
+4. **Attestation lifecycle.** Each surviving host stores it in
+   `/var/lib/adlab/ha/attest.json`. It is good for **one** takeover and at most
+   **60 min** from receipt, and is consumed by the first seize that uses it.
+   The host drops it **itself** when it observes inbound replication from the
+   attested host's DCs after the attestation time (proof the host is alive),
+   recorded as `contradicted`. **addition:** `ha-attest-clear {host,
+   attestation_id}` is the explicit drop that edy sends when the host answers
+   again.
+5. **`ha-status` fields**, confirmed with units:
+   - All timestamps are **unix seconds UTC**: `collected_at`,
+     `replication[].last_success`, `lease.expires_at`.
+   - `age_s` is int; `epoch` is int; `lease` is an object or null; `fenced`
+     and `drained` are bool.
+   - `dcs[].state` is `running|down|rebuild|held`. **addition:** `held` means
+     boot-fenced and not started.
+   - `roles[]` uses samba role names (`pdc`, `rid`, `schema`, `naming`,
+     `infrastructure`, `domaindns`, `forestdns`).
+   - `time_offset_s` is a signed float; `chrony_li` is an int 0–3.
+   - `sysvol_hash` and `sysvol_writer_hash` are lowercase sha256 hex.
+   - `rid_pool_pct` is the **remaining** percentage as a float 0–100.
+   - `last_inbound_age_days` is a float.
+   - `capacity` is `{cpu_count, load1, mem_avail_mb, disk_free_gb}`.
+6. **`ha-rejoin-check`** returns `{may_start[], must_rebuild{dc: why},
+   held[], ok_to_unfence: bool}`, confirmed with two additions: `held` (DCs
+   kept stopped pending a decision) and `ok_to_unfence`.
+7. **The SYSVOL cycle is 5 min** (`sysvol-replicate.timer`
+   `OnUnitActiveSec=5min`, the same on edt1 today), so warn after >2 cycles
+   (>10 min) and page after >1 h, as in §8.
+8. **Confirmed:** an operator attestation replaces **only** the quorum vote.
+   Lease expiry plus the 5-min grace is still required, checked by the host's
+   own clock (point 3).
+9. **change: failback order.** edy's order would make SYSVOL's source disagree
+   with the directory's PDC owner mid-way, and the replicator freezes on that
+   disagreement (§6.1). The order is:
+   1. Home host: `ha-sysvol-writer {dc: <home PDC DC>, phase: "prepare"}`
+      pulls from the outage writer, with no switch.
+   2. Outage host: `ha-fence` (stops GPO/SYSVOL writes there; DCs keep
+      serving).
+   3. `ha-fsmo-transfer` each class-A role to its `fsmo_home`.
+   4. Home host: `ha-sysvol-writer {phase: "commit"}` does a final delta pull,
+      then becomes the source.
+   5. `ha-placement-apply` (new epoch, lease to home) on both hosts.
+   6. Outage host: `ha-unfence`.
+
+   If any step fails, stop and alert. Steps 1–2 are safe to repeat. After
+   step 3, roll forward, not back.
+10. **Epoch** bumps on failover, failback, a class-B seize **and any placement
+    change** (DC added or removed, drain/undrain), so on every change of who
+    may write or where DCs live. Renewals reuse it.
+    - An equal-epoch `ha-placement-apply` is accepted **only if the document
+      is identical** (canonical-JSON hash). Same epoch with different content
+      means two controllers, so it returns `stale_epoch` and raises an alert.
+    - An equal-epoch `ha-lease-renew` is always accepted.
+
+**edy limits (recorded from edy, 2026-11-11):**
+- The controller runs only where succession names that node master of
+  `host_clusters` **with quorum**. Reachability is self-only today, which in
+  practice means a single trusted node.
+- Host calls need that host's agent connected to the controller node, with
+  `--enable-run-shell` (see the allow-list ask in point 1).
+- The witness location is still an owner decision: any member flagged as
+  witness in a third failure domain.
 
 ### 7.4 edy side (for the edy-proxy-go session, not built here)
 
