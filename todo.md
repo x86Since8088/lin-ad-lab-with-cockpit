@@ -98,12 +98,19 @@ Owner directive 2026-11-11: edt1 is the active host, mini-srv (later) is the pas
 across hosts, and edy trusted nodes drive this through a management API. **No phase touches the live lab until the owner
 approves that phase.** Phases 0–3 run on the two-VM testbed only (design §10).
 
-**GATE (owner 2026-11-11): "you cannot test this on edt1 until design is finalized and fully stress tested."** Nothing
-is created or run on edt1 (not even the testbed VMs) before the owner signs the design off as final and approves the
-testbed host. The stress program (design §12) must pass before any HA test on edt1.
+**GATE (owner 2026-11-11): "you cannot test this on edt1 until design is finalized and fully stress tested."** The design
+was signed off as final on 2026-11-11, and the isolated testbed was approved on edt1. **No HA test touches the live lab**
+until the stress program (design §12) passes and the owner reviews the results.
 
-- [ ] **Owner: sign off the design as final** and choose the testbed host (edt1 after sign-off, mini-srv, or another).
-- [ ] **Phase 0: testbed** (`ha-testbed/`, written + dry-run only). Two Ubuntu 24.04 VMs `adl-ha-a`/`adl-ha-b`
+- [x] **Owner: sign off the design as final** and choose the testbed host. Signed off 2026-11-11; testbed host = edt1 (isolated VMs).
+- [x] **Phase 0a: testbed VMs + plugins + isolated edy (built 2026-11-11).** `adl-ha-a` (192.168.2.41 / 10.31.0.11) and
+  `adl-ha-b` (.42 / .12) on edt1, libvirt net `adl-shared` (edt1 10.31.0.1). Both VMs carry edt1's six cockpit plugins at
+  edt1's versions. The isolated edy cluster runs `adl-edy-a` (founder) + `adl-edy-b` (second trusted, PKI replica) on edy
+  1.0.0.202611110517, replicating both ways. edt1's fleet has no record of them. Autostart is OFF, so after an edt1 reboot
+  start them with `virsh start`. Secrets (cockpit/sudo password, edy API keys) are in `~/.config/adl-ha/` (0600); the edy
+  admin/master/safe passwords stay root-only in the VMs.
+- [ ] **Phase 0b: keep edy current** — install the trigger for `tb-edy.sh update` (new promoted main build + daily).
+- [ ] **Phase 0: testbed** (remaining: test forest, snapshot). Two Ubuntu 24.04 VMs `adl-ha-a`/`adl-ha-b`
   (4 vCPU / 8 GB / 40 GB; ssh key-only, cockpit + cockpit-podman + the cockpit-adlab plugin, rootful podman). Per VM:
   LAN `192.168.2.41`/`.42`, an isolated VM-local subnet (`172.31.4.0/24` / `172.31.5.0/24`, in-VM podman bridge, no DCs),
   and a shared subnet on edt1 `10.31.0.0/24` (libvirt `adl-shared`, edt1 .1, no forward/DHCP/DNS) where the DCs of BOTH

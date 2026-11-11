@@ -1,19 +1,19 @@
 # Multi-host HA for the AD lab (design)
 
-**Status:** design draft, **not final**; nothing built. Owner directive 2026-11-11:
-AD-lab HA logic is worked out in its own session, in this repo. The phased plan is
-in [`todo.md`](../../todo.md) under "HA: multi-host DCs".
+**Status: FINAL, signed off by the owner on 2026-11-11.** Owner directive
+2026-11-11: AD-lab HA logic is worked out in its own session, in this repo. The
+phased plan is in [`todo.md`](../../todo.md) under "HA: multi-host DCs".
 
-**Gate (owner, 2026-11-11): "you cannot test this on edt1 until design is finalized
-and fully stress tested."** Nothing is created, run or drilled on edt1 (not the
-live lab, and not the testbed VMs, network or edy cluster, which would also live on
-edt1) until two things are true:
+**Gate (owner, 2026-11-11): "you cannot test this on edt1 until design is
+finalized and fully stress tested."** The design is now final, and the owner
+approved building the **isolated two-VM testbed on edt1** (§10) to run the
+stress program (§12). What remains gated:
 
-1. the owner has signed off this design as final, and
-2. the stress program (§12) has passed, with the owner approving where it runs.
-
-The testbed scripts in `ha-testbed/` are written and syntax-checked but have
-**never been run**.
+- **No HA test against the live lab** (`AD.EDT1.LAB`, `dc1`–`dc5`, the lab
+  clients and the shared lab VMs) until the stress program (§12) has passed and
+  the owner has reviewed the results.
+- The testbed never touches the live lab or edt1's edy deployment. Its own
+  forest is `HA.TEST.LAB`, and it runs its own edy cluster.
 
 ## 1. Goal and inputs
 
@@ -664,8 +664,13 @@ and mini-srv. The live lab and the shared lab VMs are never touched (memory
 - **Second trusted node join (confirmed by edy-proxy-go dev, from its PR #515
   two-trusted-node test).** B joins as a **trusted** node with a registration
   bundle, the same way an edge does. Caveats for `tb-edy.sh up`:
-  - Both nodes must start with the **same fleet master password**, otherwise B
-    mints its own CA and distrusts A. It is generated once into a 0600 file
+  - Both nodes must use the **same fleet master password**, otherwise B
+    mints its own CA and distrusts A.
+  - **Correction from the testbed build (2026-11-11):** B must leave
+    `pki.enabled` **unset**. An explicit `true` makes it a CA origin that mints
+    its own root, even with the right password. Unset, it runs as a replica and
+    adopts A's root through `ca_key` replication. Registration names must be in
+    the issued certificates (the VM hostnames). It is generated once into a 0600 file
     in `~/.config/adl-ha/` and handed over through the root-only runner share
     `secrets/`, deleted on use.
   - Set `EDY_VAULT_PASSPHRASE` on B, otherwise B has no vault passphrase.

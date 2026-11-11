@@ -73,3 +73,6 @@ tools/dc-ca.jks
 # plugin reads -- so it is never committed, in any project, at any depth.
 .env
 **/.env
+
+# ha-testbed runtime log (versions per update; kept on the host only)
+ha-testbed/edy-versions.log

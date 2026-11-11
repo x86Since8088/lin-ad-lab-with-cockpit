@@ -130,7 +130,7 @@ cmd_create() {
   cloud-localds -N "$S/seed/network-config" "$S/seed.iso" "$S/seed/user-data" "$S/seed/meta-data"
   ((DRY)) && { echo "--- seed user-data (hash masked)"; sed 's/hashed_passwd: .*/hashed_passwd: <hash>/' "$S/seed/user-data" | cut -c1-160; echo "--- network-config"; cat "$S/seed/network-config"; }
   local OS=$TB_IMG_DIR/$VM.qcow2 SEED=$TB_IMG_DIR/$VM-seed.iso
-  local VI="virt-install --connect qemu:///system --name $VM --memory $MEM --vcpus $CPUS --cpu host-passthrough --machine q35 --os-variant ubuntu24.04 --import --disk path=$OS,format=qcow2,bus=virtio --disk path=$SEED,device=cdrom --network bridge=$TB_LAN_BRIDGE,model=virtio,mac=$MACP:01 --network bridge=$TB_BRIDGE,model=virtio,mac=$MACP:02 --filesystem source=/srv/jobs/byMachine/$VM,target=edt1,accessmode=squash --graphics none --noautoconsole --metadata title=$VM,description=adl-ha_HA_testbed_isolated_edy_(samba-ad-lab_ha-testbed)"
+  local VI="virt-install --connect qemu:///system --name $VM --memory $MEM --vcpus $CPUS --cpu host-passthrough --machine q35 --os-variant ubuntu24.04 --import --disk path=$OS,format=qcow2,bus=virtio --disk path=$SEED,device=cdrom --network bridge=$TB_LAN_BRIDGE,model=virtio,mac=$MACP:01 --network bridge=$TB_BRIDGE,model=virtio,mac=$MACP:02 --filesystem source=/srv/jobs/byMachine/$VM,target=edt1,accessmode=squash --graphics none --noautoconsole --metadata title=$VM,description=adl-ha-HA-testbed-isolated-edy-samba-ad-lab-ha-testbed"
   root_job "adlha-create-$VM" 900 <<EOF
 set -Eeuo pipefail
 OS=$OS; SEED=$SEED
