@@ -91,7 +91,46 @@ open work appears. Memory only points here (`samba-ad-lab-todo`; incident record
   (269 passed / 1 failed) exactly as on current main. Either skip it when `os.geteuid() == 0`, or document the suite as
   non-root-only. As eddie: 273 passed.
 
+## HA: multi-host DCs (design: [docs/design/HA-MULTI-HOST.md](docs/design/HA-MULTI-HOST.md))
+
+Owner directive 2026-11-11: edt1 is the active host, mini-srv (later) is the passive failover host, DCs are balanced
+across hosts, and edy trusted nodes drive this through a management API. **No phase touches the live lab until the owner
+approves that phase.** Phases 0–3 run on the two-VM testbed only (design §10).
+
+- [ ] **Phase 0: testbed.** Add stack role `adhost` (rootful podman) to `epg-stack`. Create `epg-stack-adl-os1-01`/`-02`
+  with `epg-vm` (one at a time, `uptime` first; deploy at 6 vCPU/16 GB, then size down, -02 capped to mini-srv's budget).
+  Routed libvirt network `172.31.4.0/24` ↔ `172.31.5.0/24`. Build test forest `HA.TEST.LAB` from this repo (lab.env
+  override, never `AD.EDT1.LAB`); admin password generated root-only on the VM. AD sites `host-a`/`host-b`; 2 DCs per VM.
+  `epg-snap create … --kind os` once green. Exit: `30-verify.sh` green on both VMs, cross-site replication green.
+- [ ] **Phase 1: lab.env multi-host.** A per-host block in lab.env (host → subnet, network, DC indexes, site,
+  forwarder), `dc_ip` that follows the host, `20-up.sh --host H` that brings up only that host's DCs, a site/subnet
+  bootstrap (`samba-tool sites create`, `sites subnet create`, `sites setsite` at join), and `fix_ad_resolv` with one DC
+  per host. No behavior change for a single-host lab.env (the live lab file stays valid). Exit: testbed rebuilt from these
+  scripts; existing `tests/` pass.
+- [ ] **Phase 2: read-only `ha-*` verbs.** `ha-status`, `ha-health`, `ha-rejoin-check` in `cockpit-adlab/adlab-admin` +
+  schema + tests (non-root suite). Can deploy to live edt1 after review since they are read-only (owner OK still asked).
+- [ ] **Phase 3: lease, watchdog, fenced SYSVOL.** `adlab-ha-watchdog` timer + `/var/lib/adlab/ha/{placement,lease}.json`;
+  `sysvol-replicate.sh` uses the writer lease + directory cross-check, freezes on mismatch; GPO/SYSVOL verbs refuse
+  without the lease; `21-start.sh` boot fencing. All gated on `HA_MODE=1` (off = today's behavior). Mutating `ha-*` verbs
+  with `epoch` + `op_id`: placement-apply, dc-deploy/remove/rebuild, fsmo-transfer/seize (class A gate), sysvol-writer,
+  drain/undrain, fence/unfence, attest-host-dead. `tools/ha-sim.sh` = scripted controller. Exit: drills D1–D9 (design §9)
+  pass on the testbed, each with a recorded result.
+- [ ] **Phase 4: edy controller** (edy-proxy-go session, not this repo): host-cluster entity, Hosting Domain
+  Authentication toggle, controller on raft leader, lease renewal, state machine, alerts; conditional forwarding for AD
+  zones, DHCP DNS = one DC per site, Kerberos settings hints (`_gc._tcp`, kdc fallback list). Re-run D1–D9 with
+  `edy-testcluster` as controller + witness. Live-fleet registration of test nodes needs the owner's go-ahead.
+- [ ] **Phase 5: mini-srv live** (needs owner approval + mini-srv netbooted): `static-mini` 172.15.5.0/24 routed, sites
+  `edt1`/`mini-srv`, join `dc6`/`dc7`, move dc4/dc5's roles to dc1, demote dc4/dc5 one at a time (`30-verify.sh` between
+  each), `HA_MODE=1` with manual-attest failover, nightly `domain backup online` kept cross-host. Then drill D1, D5, D6
+  live with the owner present.
+- [ ] **Phase 6: automatic failover** (blocked on the owner's witness decision: a third-failure-domain trusted node).
+  Prerequisite also: extra forests get persistent state before they join HA (see the code follow-up above).
+
 ## Owner decisions
+
+- **HA witness placement (blocks Phase 6 only).** Automatic failover to mini-srv needs a trusted voter outside both
+  edt1 and mini-srv (edy L1/L4: a flagged witness node — small VM/SBC on separate power, or a cloud node). Until then
+  failover is manual-attest (`ha-attest-host-dead`). Other HA defaults are in design §11 and stand unless overridden.
 
 - **Root executes lab scripts from the SMB share.** `samba-ad-lab.service` has
   `ExecStart=/srv/smb/share/sc/ai-orchestrator-group/ai-orchestrator-storage/projects/samba-ad-lab/source/21-start.sh`
