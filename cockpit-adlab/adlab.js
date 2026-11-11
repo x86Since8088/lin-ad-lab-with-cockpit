@@ -2073,7 +2073,12 @@
                 lab.appendChild(cb); lab.appendChild(el("span", null, " " + c.label));
                 types.appendChild(lab); typeBoxes.push(cb);
             });
-            if (typeBoxes.length > 1) box.appendChild(types);
+            // ADUC "Advanced Features": system objects (showInAdvancedViewOnly) hidden by default
+            var advLab = el("label", "al-check al-inline");
+            var adv = el("input"); adv.type = "checkbox";
+            advLab.appendChild(adv); advLab.appendChild(el("span", null, " Advanced (system objects)"));
+            types.appendChild(advLab);
+            box.appendChild(types);
             box.appendChild(el("div", "hint al-objpick-base", "in: " + (spec.base_dn || spec.base)));
             // search row
             var srow = el("form", "row al-objpick-search");
@@ -2147,6 +2152,7 @@
                              limit: String(PICKER_LIMIT) };
                 if (q.value.trim()) args.search = q.value.trim();
                 if (spec.include_base) args.include_base = "yes";
+                if (!adv.checked) args.hide_advanced = "yes";
                 run("object-list", args).then(function (r) {
                     go.disabled = false;
                     var rows = (r.objects || []).map(function (o) {
@@ -2156,6 +2162,11 @@
                                  desc: (o.attrs || {}).description || "",
                                  where: dnParts(o.dn).slice(1).filter(function (p) { return !/^DC=/i.test(p); })
                                             .map(function (p) { return p.slice(p.indexOf("=") + 1); }).reverse().join(" / ") || "(root)" };
+                    });
+                    var baseDn = (spec.base_dn || "").toLowerCase();
+                    rows.sort(function (x, y) {              // the base (domain head) first, then by name
+                        var bx = x.dn.toLowerCase() === baseDn ? 0 : 1, by = y.dn.toLowerCase() === baseDn ? 0 : 1;
+                        return bx - by || x.name.localeCompare(y.name, undefined, { sensitivity: "base" });
                     });
                     status.textContent = rows.length + " found" + (r.truncated ? " — first " + PICKER_LIMIT + " shown, refine the search" : "");
                     drawTable(rows);
@@ -2169,6 +2180,7 @@
             }
             srow.addEventListener("submit", function (ev) { ev.preventDefault(); search(); });
             typeBoxes.forEach(function (b) { b.addEventListener("change", search); });
+            adv.addEventListener("change", search);
             accept.addEventListener("click", doAccept);
             cancel.addEventListener("click", close);
             refreshBar();

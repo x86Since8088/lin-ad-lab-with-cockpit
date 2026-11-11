@@ -2123,6 +2123,15 @@ class TestObjectPickers(Base):
             "CN=AuthN Silos,CN=AuthN Policy Configuration,CN=Services,CN=Configuration,DC=ad,DC=edt1,DC=lab"])
         self.assertIn("(objectClass=msDS-AuthNPolicySilo)", " ".join(calls[1]))
 
+    def test_list_hide_advanced_filters_system_objects(self):
+        self.fake.lab_up()
+        self.fake.on(lambda a: "ldbsearch" in a, out="")
+        self.call_main(["object-list", "--base", "@domain", "--scope", "sub", "--hide_advanced", "yes"])
+        self.call_main(["object-list", "--base", "@domain", "--scope", "sub"])
+        calls = [" ".join(c) for c in self.fake.argv_containing("ldbsearch")]
+        self.assertIn("(!(showInAdvancedViewOnly=TRUE))", calls[0])
+        self.assertNotIn("showInAdvancedViewOnly", calls[1])
+
     def test_list_include_base_returns_the_base(self):
         self.fake.lab_up()
         self.fake.on(lambda a: "ldbsearch" in a,
