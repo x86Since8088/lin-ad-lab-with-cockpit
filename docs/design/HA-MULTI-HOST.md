@@ -222,6 +222,14 @@ The AD lab does not run its own quorum. It uses edy's:
   - The host's own holder-alive LDAP probe (§7.3 v1.1 #3) stays as a second,
     independent check: a `down` or `isolated` class that the host can
     contradict is refused.
+  - **edy implementation (PR #525, 2026-11-11):** the rules are in edy's
+    `go/docs/HOST-CLUSTER-QUORUM.md`. A 100-run randomized fault loop gave zero
+    wrong classes and zero seizes in split or lossy runs. Time to classify was
+    45–60 s, which fits inside lease expiry plus the 5-min grace, so
+    classification never delays a takeover. **Gap until edy lands a report
+    transport and a node-identity verifier:** reports from other nodes don't
+    reach the controller yet, so production stays **manual-attest**, which
+    fails closed. Stress S10 runs against the real transport once it exists.
 
 ### 5.3 Leases and self-fencing (no power fencing needed)
 
@@ -505,13 +513,18 @@ proposal, it is marked **change**.
      `down|isolated|split|unknown` plus an `evidence` summary. Seize is
      refused for `split`, and for `unknown` without an attestation (§5.2).
 4. **Attestation lifecycle.** Each surviving host stores it in
-   `/var/lib/adlab/ha/attest.json`. It is good for **one** takeover and at most
-   **60 min** from receipt, and is consumed by the first seize that uses it.
-   The host drops it **itself** when it observes inbound replication from the
-   attested host's DCs after the attestation time (proof the host is alive),
-   recorded as `contradicted`. **addition:** `ha-attest-clear {host,
-   attestation_id}` is the explicit drop that edy sends when the host answers
-   again.
+   `/var/lib/adlab/ha/attest.json`. **Single use = one takeover epoch**
+   (agreed with edy, 2026-11-11). An attestation authorises **every class-A
+   seize of one failover**: PDC, Infrastructure and both DNS masters, all
+   carrying the same new epoch. The host binds it to `(attested host,
+   takeover epoch)` on first use, refuses it for any other epoch, and marks it
+   consumed when that epoch's `ha-placement-apply` lands. It never authorises
+   a class-B seize. It expires at most **60 min** from receipt. The host drops
+   it **itself** when it observes inbound replication from the attested host's
+   DCs after the attestation time (proof the host is alive), recorded as
+   `contradicted`. `ha-attest-clear {host, attestation_id}` is the explicit
+   drop that edy sends when the host answers again. A later failover needs a
+   new attestation.
 5. **`ha-status` fields**, confirmed with units:
    - All timestamps are **unix seconds UTC**: `collected_at`,
      `replication[].last_success`, `lease.expires_at`.
