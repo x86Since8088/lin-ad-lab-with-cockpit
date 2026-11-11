@@ -1,0 +1,9 @@
+[Unit]
+Description=adl-ha testbed: update edy when a new main build is promoted
+
+[Path]
+PathChanged=@BIN@
+Unit=adl-ha-edy-update.service
+
+[Install]
+WantedBy=default.target

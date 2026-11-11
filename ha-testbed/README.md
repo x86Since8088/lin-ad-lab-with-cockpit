@@ -35,7 +35,24 @@ Scripts:
 |---|---|
 | `tb.sh net\|create\|status\|destroy` | the shared libvirt network and the VMs |
 | `tb-plugins.sh VM [plugin…]` | copy edt1's deployed cockpit plugin payloads into a VM and install them |
-| `tb-edy.sh up-a\|join-b\|reset-b\|status\|update\|stage` | the isolated edy cluster; `update` rolls B then A with a health gate and automatic rollback, logging to `edy-versions.log` |
+| `tb.sh snapshot NAME\|snapshots\|revert NAME --yes-revert` | qemu-img snapshots of BOTH VMs together (graceful agent shutdown, never forced); revert is always both, never one (USN rollback) |
+| `tb-edy.sh up-a\|join-b\|reset-b\|status\|update\|stage\|install-trigger` | the isolated edy cluster; `update` rolls B then A with a health gate and automatic rollback, skips stopped VMs and VMs already current, logs to `edy-versions.log`; `install-trigger` installs eddie's user units (path on the promoted build + daily timer) |
+| `tb-forest.sh build\|up\|status` | the test forest `HA.TEST.LAB` from this repo's DC image |
+
+**Test forest `HA.TEST.LAB`** (built 2026-11-11), never joined to `AD.EDT1.LAB`:
+
+| DC | VM | IP (shared subnet, macvlan) | AD site | roles |
+|---|---|---|---|---|
+| dc1 | adl-ha-a | 10.31.0.17 | Default-First-Site-Name (10.31.0.16/28) | all seven FSMO |
+| dc2 | adl-ha-a | 10.31.0.18 | Default-First-Site-Name | — |
+| dc3 | adl-ha-b | 10.31.0.33 | adl-ha-b (10.31.0.32/28) | — |
+| dc4 | adl-ha-b | 10.31.0.34 | adl-ha-b | — |
+
+State under `/opt/adl-forest/state/dcN` in each VM; the administrator password is root-only in
+`/opt/adl-forest/secrets/` on both VMs. DCs run with the lab's privileges (`SYS_ADMIN,NET_ADMIN,SYS_TIME`,
+seccomp unconfined: SYSVOL NT ACLs need them) and `--restart=always` (podman-restart.service). Their signed-NTP
+chrony syncs from the OTHER VM's chrony (a macvlan child cannot reach its own host); the DNS forwarder is the
+testbed edy on A (10.31.0.11), reachable from B's DCs only.
 
 Lessons (2026-11-11, folded into the scripts):
 - `POST /api/setup/cluster` is local-only, so edy also listens on 127.0.0.1 (not reachable off the VM).
@@ -45,6 +62,9 @@ Lessons (2026-11-11, folded into the scripts):
   second fleet root (B did, and re-issued its node cert from it). Unset = replica: adopts A's root via `ca_key`.
 - `bootlog.enabled=false` alone left B listening on UDP `*:514`/`*:6666`; the addresses are pinned to loopback.
 - `shred` cannot truncate on the 9p runner share; files there are removed with `rm`.
+- DCs need the lab's capabilities; without them provisioning dies at `set_nt_acl ... ACCESS_DENIED` (SYSVOL).
+- cloud-init's NTP module writes `/etc/chrony/chrony.conf` without `confdir /etc/chrony/conf.d`; added back.
+- `dc-entrypoint.sh` gained an optional `SITE` env (joins with `--site`); unset = unchanged lab behaviour.
 
 ```bash
 ./tb.sh net --dry-run               # libvirt network adl-ha: no host IP, no forward, no dnsmasq

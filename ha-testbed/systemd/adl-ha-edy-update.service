@@ -1,0 +1,12 @@
+[Unit]
+Description=adl-ha testbed: roll the promoted edy-proxy-go main build onto adl-ha-b then adl-ha-a
+Documentation=file://@HERE@/README.md
+# user unit (eddie, lingering); root work goes through the job runner inside tb-edy.sh
+
+[Service]
+Type=oneshot
+# a promote writes the binary then the stamp; let it settle before reading the version
+ExecStartPre=/usr/bin/sleep 60
+ExecStart=@HERE@/tb-edy.sh update
+TimeoutStartSec=45min
+Nice=10

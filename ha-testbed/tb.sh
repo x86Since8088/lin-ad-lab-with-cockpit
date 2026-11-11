@@ -6,6 +6,12 @@
 #                                    ssh (key only) + cockpit + podman + guest agent; runner share
 #   tb.sh status [VM]                one line per VM
 #   tb.sh destroy VM --yes-destroy-VM   undefine + remove exactly its disk and seed
+#   tb.sh snapshot NAME              shut BOTH VMs down (guest agent, never forced), qemu-img snapshot
+#                                    each OS disk as NAME, start both, wait for ssh
+#   tb.sh snapshots                  list snapshots per VM
+#   tb.sh revert NAME --yes-revert   shut both down, revert BOTH disks to NAME, start both. Always both
+#                                    together: the testbed forest and edy cluster span the two VMs, so
+#                                    reverting one alone would be a USN rollback (design §2)
 # Only names listed in testbed.env are accepted: this script cannot touch any other VM.
 set -Eeuo pipefail
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -175,7 +181,44 @@ echo "destroyed $VM (byMachine/$VM kept)"
 EOF
 }
 
+all_vms() { local l f; for l in "${TB_VMS[@]}"; do read -r -a f <<<"$l"; echo "${f[0]}"; done; }
+stop_all() {
+  local v; for v in $(all_vms); do [ "$("${V[@]}" domstate "$v")" = running ] && "${V[@]}" shutdown "$v" --mode agent >/dev/null; done
+  for v in $(all_vms); do local i; for i in $(seq 1 90); do [ "$("${V[@]}" domstate "$v")" = "shut off" ] && break; sleep 2; done
+    [ "$("${V[@]}" domstate "$v")" = "shut off" ] || die "$v did not shut down in 180 s (not forcing)"; done
+}
+start_all() {
+  local v; for v in $(all_vms); do "${V[@]}" start "$v" >/dev/null; done
+  for v in $(all_vms); do tb_vm "$v"; local i; for i in $(seq 1 60); do
+    ssh -o BatchMode=yes -o ConnectTimeout=3 "eddie@$LAB_IP" true 2>/dev/null && break; sleep 3; done; done
+  cmd_status
+}
+cmd_snapshot() {
+  local name=${1:?snapshot NAME}; [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "bad snapshot name"
+  stop_all
+  root_job "adlha-snapshot" 600 <<EOF
+set -Eeuo pipefail
+for v in $(all_vms | tr '\n' ' '); do qemu-img snapshot -c "$name" $TB_IMG_DIR/\$v.qcow2 && echo "snapshot $name: \$v"; done
+EOF
+  start_all
+}
+cmd_snapshots() { root_job "adlha-snapshots" 120 <<EOF
+for v in $(all_vms | tr '\n' ' '); do echo "== \$v"; qemu-img snapshot -l $TB_IMG_DIR/\$v.qcow2 | tail -n +3; done
+EOF
+}
+cmd_revert() {
+  local name=${1:?revert NAME}; [ "${2:-}" = --yes-revert ] || die "confirm with: tb.sh revert $name --yes-revert"
+  stop_all
+  root_job "adlha-revert" 600 <<EOF
+set -Eeuo pipefail
+for v in $(all_vms | tr '\n' ' '); do qemu-img snapshot -l $TB_IMG_DIR/\$v.qcow2 | grep -qw "$name" || { echo "\$v has no snapshot $name"; exit 3; }; done
+for v in $(all_vms | tr '\n' ' '); do qemu-img snapshot -a "$name" $TB_IMG_DIR/\$v.qcow2 && echo "reverted \$v to $name"; done
+EOF
+  start_all
+}
+
 case ${1:-} in
   net) cmd_net;; create) cmd_create "${2:-}";; status) cmd_status "${2:-}";; destroy) cmd_destroy "${2:-}" "${3:-}";;
-  *) sed -n '2,9p' "$0"; exit 2;;
+  snapshot) cmd_snapshot "${2:-}";; snapshots) cmd_snapshots;; revert) cmd_revert "${2:-}" "${3:-}";;
+  *) sed -n '2,15p' "$0"; exit 2;;
 esac
