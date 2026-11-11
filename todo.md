@@ -9,6 +9,7 @@ open work appears. Memory only points here (`samba-ad-lab-todo`; incident record
 
 ## Live state (verified 2026-10-15, after the 11:44 reboot)
 
+- `cockpit-adlab` **1.19.1** (schema-driven object picker: Search… on Members/Managed By and every DN field, verb args with a picker, Rename/Move, Add to a group; system objects hidden by default) deployed 2026-11-11 from merged main (PRs #48, #49); `deploy.sh --verify` PASS; `payload-1.19.0` kept for rollback (1.18.0 payload no longer on disk). Live read-only check: the group's member/managedBy fields carry pickers, search finds `grp-site-sdn-admin`, container picker lists 15 entries. Browser E2E against edt1 not run (needs the cockpit login); UI flows were exercised in a stubbed harness.
 - `cockpit-adlab` **1.18.0** (PKI tab: CA chain view, verbs `pki-ca-chain`/`pki-intermediate-create`, intermediates in `pki-ca-list`) deployed 2026-11-09 from branch `feat/pki-ca-chain` (PR pending merge); `payload-1.17.0` kept for rollback.
 - `cockpit-adlab` **1.17.0** (PKI tab: view CA public keys/certs, verbs `pki-ca-list`/`pki-ca-cert`) deployed 2026-11-09 from branch `feat/pki-ca-public-key-view` (PR pending merge); `payload-1.16.1` kept for rollback.
 - `cockpit-adlab` **1.16.1** deployed 2026-10-15 20:29Z from merged main (`ff73a8f`, PR #35) —
