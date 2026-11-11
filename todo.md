@@ -97,11 +97,20 @@ Owner directive 2026-11-11: edt1 is the active host, mini-srv (later) is the pas
 across hosts, and edy trusted nodes drive this through a management API. **No phase touches the live lab until the owner
 approves that phase.** Phases 0–3 run on the two-VM testbed only (design §10).
 
-- [ ] **Phase 0: testbed.** Add stack role `adhost` (rootful podman) to `epg-stack`. Create `epg-stack-adl-os1-01`/`-02`
-  with `epg-vm` (one at a time, `uptime` first; deploy at 6 vCPU/16 GB, then size down, -02 capped to mini-srv's budget).
-  Routed libvirt network `172.31.4.0/24` ↔ `172.31.5.0/24`. Build test forest `HA.TEST.LAB` from this repo (lab.env
-  override, never `AD.EDT1.LAB`); admin password generated root-only on the VM. AD sites `host-a`/`host-b`; 2 DCs per VM.
-  `epg-snap create … --kind os` once green. Exit: `30-verify.sh` green on both VMs, cross-site replication green.
+**GATE (owner 2026-11-11): "you cannot test this on edt1 until design is finalized and fully stress tested."** Nothing
+is created or run on edt1 (not even the testbed VMs) before the owner signs the design off as final and approves the
+testbed host. The stress program (design §12) must pass before any HA test on edt1.
+
+- [ ] **Owner: sign off the design as final** and choose the testbed host (edt1 after sign-off, mini-srv, or another).
+- [ ] **Phase 0: testbed** (`ha-testbed/`, written + dry-run only). Two Ubuntu 24.04 VMs `adl-ha-a`/`adl-ha-b`
+  (4 vCPU / 8 GB / 40 GB; ssh key-only, cockpit + cockpit-podman + the cockpit-adlab plugin, rootful podman). Per VM:
+  LAN `192.168.2.41`/`.42`, an isolated subnet (`172.31.4.0/24` / `172.31.5.0/24`, in-VM podman bridge), and the shared HA
+  subnet `10.31.0.0/24` (libvirt `adl-ha`, no host IP; VIPs .53 DNS anycast, .100 writer). **Isolated edy-proxy-go
+  deployment**: A runs first-run new cluster, B registers with A; nothing registers with or uses edt1's edy (script still
+  to write: port the `edy-testcluster` recipe into the VMs, listen on ha0 only, DHCP/PXE/netboot/ARP off). Then the test
+  forest `HA.TEST.LAB` (never `AD.EDT1.LAB`), 2 DCs per VM on the isolated subnets, AD site per VM; admin password
+  generated root-only on the VM; `qemu-img` snapshot once green. Exit: `30-verify.sh` green on both VMs, cross-site
+  replication green.
 - [ ] **Phase 1: lab.env multi-host.** A per-host block in lab.env (host → subnet, network, DC indexes, site,
   forwarder), `dc_ip` that follows the host, `20-up.sh --host H` that brings up only that host's DCs, a site/subnet
   bootstrap (`samba-tool sites create`, `sites subnet create`, `sites setsite` at join), and `fix_ad_resolv` with one DC
@@ -115,6 +124,9 @@ approves that phase.** Phases 0–3 run on the two-VM testbed only (design §10)
   with `epoch` + `op_id`: placement-apply, dc-deploy/remove/rebuild, fsmo-transfer/seize (class A gate), sysvol-writer,
   drain/undrain, fence/unfence, attest-host-dead. `tools/ha-sim.sh` = scripted controller. Exit: drills D1–D9 (design §9)
   pass on the testbed, each with a recorded result.
+- [ ] **Phase 3b: stress program** (design §12, S1–S9: failover soak ×50, partition flapping, lease edge cases, cross-host
+  write load, SYSVOL churn, boot storms, mini-srv-budget pressure, negative tests, controller loss). All rows pass three
+  runs in a row; results in `docs/design/HA-STRESS-RESULTS.md`; owner review. Required before ANY HA test on edt1.
 - [ ] **Phase 4: edy controller** (edy-proxy-go session, not this repo): host-cluster entity, Hosting Domain
   Authentication toggle, controller on raft leader, lease renewal, state machine, alerts; conditional forwarding for AD
   zones, DHCP DNS = one DC per site, Kerberos settings hints (`_gc._tcp`, kdc fallback list). Re-run D1–D9 with
