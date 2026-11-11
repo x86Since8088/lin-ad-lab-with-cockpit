@@ -27,7 +27,7 @@ while true; do
     t0=\$(date +%s%N)
     if timeout 5 ldbsearch -H ldap://\$ip -U "HATEST\\\\Administrator%\$PW" -b DC=ha,DC=test,DC=lab -s base dn >/dev/null 2>&1; then r=ok; else r=fail; fi
     echo "\$(date +%s) \$n ldap \$r \$(( (\$(date +%s%N)-t0)/1000000 ))" >> /log/auth.log
-    printf '[libdefaults]\n default_realm = HA.TEST.LAB\n dns_lookup_kdc = false\n rdns = false\n[realms]\n HA.TEST.LAB = { kdc = %s }\n' \$ip > /tmp/krb5-\$n.conf
+    printf '[libdefaults]\n default_realm = HA.TEST.LAB\n dns_lookup_kdc = false\n rdns = false\n[realms]\n HA.TEST.LAB = {\n  kdc = %s\n }\n' \$ip > /tmp/krb5-\$n.conf
     t0=\$(date +%s%N)
     # Kerberos end to end: AS + TGS for ldap/<dc> from THIS DC as KDC (samba client; MIT kinit needs a tty)
     if KRB5_CONFIG=/tmp/krb5-\$n.conf timeout 5 ldbsearch -H ldap://\$n.ha.test.lab --use-kerberos=required -U "Administrator@HA.TEST.LAB%\$PW" -b DC=ha,DC=test,DC=lab -s base dn >/dev/null 2>&1; then r=ok; else r=fail; fi
@@ -38,6 +38,7 @@ done
 L
 chmod 0755 /var/log/adl-load/loop.sh
 podman run -d --name loadgen --network adl-dc --ip $IP --restart=always --label adl-ha.role=load \
+  --dns 10.31.0.33 --dns 10.31.0.17 --dns-search ha.test.lab \
   --add-host dc1.ha.test.lab:10.31.0.17 --add-host dc2.ha.test.lab:10.31.0.18 \
   --add-host dc3.ha.test.lab:10.31.0.33 --add-host dc4.ha.test.lab:10.31.0.34 \
   -v /opt/adl-forest/secrets/administrator.pass:/run/adminpass:ro -v /var/log/adl-load:/log \
