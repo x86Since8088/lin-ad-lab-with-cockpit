@@ -175,6 +175,33 @@ The AD lab does not run its own quorum. It uses edy's:
   controller alerts, and an operator calls `ha-attest-host-dead edt1` (§7)
   after checking that edt1 really is down. That attestation stands in for the
   quorum vote. The rest of the flow is the same.
+- **Owner, 2026-11-11: "the other nodes that have to talk with trusted should
+  have a vote."** This supersedes L1/L4's "non-trusted nodes are an advisory
+  score, never a vote". Edges, routers, storage nodes and host agents that
+  depend on the trusted cluster become **voters**. For this to break a
+  two-host split instead of always handing the win to the host with the most
+  nodes, the design counts it like this:
+  - **One vote per failure domain, not per node.** Each failure domain (a
+    host, or an outside machine) casts one vote: the side its own nodes can
+    reach. Counting per node would give edt1, which hosts most nodes, a
+    permanent majority, and would lose those voters together with edt1.
+  - **Majority of configured failure domains** wins leadership and therefore
+    the writer lease. With edt1 and mini-srv alone that is still 1 of 2, a tie
+    and no automatic takeover. **Any node outside both hosts that talks to the
+    trusted cluster (a cloud edge, an SBC, another bare-metal host) supplies
+    the third vote.** The witness question becomes "which outside node votes",
+    and no dedicated witness build is needed.
+  - **The winning side must contain at least one trusted node.** Voters choose
+    *which* trusted side leads; they cannot make a non-trusted node leader.
+  - **Votes are signed** with the voter's node identity, and each carries the
+    voter's failure domain from the host-cluster record (not self-declared).
+    A compromised edge can flip at most its own domain's vote. Even a winning
+    vote never authorises a class-B seize (§4.2), and the host-side checks
+    still apply: lease expiry plus grace, and the holder-alive refusal (§7.3
+    v1.1 #3).
+  - Implementing the vote is edy work (relayed to the edy-proxy-go dev session
+    on 2026-11-11). The AD-lab side needs no change: it consumes edy's
+    `has_quorum` and lease exactly as before.
 
 ### 5.3 Leases and self-fencing (no power fencing needed)
 
@@ -664,7 +691,7 @@ and mini-srv. The live lab and the shared lab VMs are never touched (memory
 | 2 | DC split | edt1: dc1–dc3; mini-srv: dc6, dc7; demote dc4/dc5 afterwards |
 | 3 | Auto-seize scope | Class A only (PDC, Infrastructure, both DNS masters). RID, Schema and Naming are manual |
 | 4 | SYSVOL | Keep the single-source rsync push, gated by an edy writer lease; no bidirectional sync |
-| 5 | Witness | Manual attestation until a third-failure-domain trusted node exists |
+| 5 | Witness | Owner 2026-11-11: non-trusted nodes that talk to trusted vote, one vote per failure domain. Any voting node outside edt1 and mini-srv is the tiebreaker. Manual attestation until one exists |
 | 6 | Failback | Automatic after 30 min healthy |
 | 7 | API | `ha-*` verbs in `adlab-admin`, called through the edy host agent; controller on the raft leader |
 | 8 | Timers | Lease TTL 60 s, renewal 15 s, grace 5 min, HOLD 30 min |
@@ -674,8 +701,10 @@ and mini-srv. The live lab and the shared lab VMs are never touched (memory
 2. **Where the testbed runs**, since it cannot be edt1 before sign-off and the
    stress pass. Options: edt1 later, after sign-off, using the isolated layout
    of §10; mini-srv once it is netbooted; or another host.
-3. **The third-failure-domain witness.** This blocks only automatic failover
-   (Phase 6).
+3. **Which node outside edt1 and mini-srv votes.** With the owner's
+   2026-11-11 rule (non-trusted nodes vote, one vote per failure domain), any
+   edy node on a third machine breaks the tie; no dedicated witness build is
+   needed. This blocks only automatic failover (Phase 6).
 4. **Live DC networking:** routed per-host subnets (§3.1) or one shared DC
    subnet reachable from both hosts (the testbed model, §10).
 
