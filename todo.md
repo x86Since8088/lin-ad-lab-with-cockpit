@@ -98,11 +98,11 @@ Owner directive 2026-11-11: edt1 is the active host, mini-srv (later) is the pas
 across hosts, and edy trusted nodes drive this through a management API. **No phase touches the live lab until the owner
 approves that phase.** Phases 0–3 run on the two-VM testbed only (design §10).
 
-**GATE (owner 2026-11-11): "you cannot test this on edt1 until design is finalized and fully stress tested."** Nothing
-is created or run on edt1 (not even the testbed VMs) before the owner signs the design off as final and approves the
-testbed host. The stress program (design §12) must pass before any HA test on edt1.
+**GATE (owner 2026-11-11): "you cannot test this on edt1 until design is finalized and fully stress tested."** The design
+was signed off as final on 2026-11-11, and the isolated testbed was approved on edt1. **No HA test touches the live lab**
+until the stress program (design §12) passes and the owner reviews the results.
 
-- [ ] **Owner: sign off the design as final** and choose the testbed host (edt1 after sign-off, mini-srv, or another).
+- [x] **Owner: sign off the design as final** and choose the testbed host. Signed off 2026-11-11; testbed host = edt1 (isolated VMs).
 - [ ] **Phase 0: testbed** (`ha-testbed/`, written + dry-run only). Two Ubuntu 24.04 VMs `adl-ha-a`/`adl-ha-b`
   (4 vCPU / 8 GB / 40 GB; ssh key-only, cockpit + cockpit-podman + the cockpit-adlab plugin, rootful podman). Per VM:
   LAN `192.168.2.41`/`.42`, an isolated VM-local subnet (`172.31.4.0/24` / `172.31.5.0/24`, in-VM podman bridge, no DCs),

@@ -2,9 +2,8 @@
 
 Design: [docs/design/HA-MULTI-HOST.md](../docs/design/HA-MULTI-HOST.md) §10 and §12.
 
-> **DO NOT RUN YET.** Owner, 2026-11-11: *"you cannot test this on edt1 until design is finalized and
-> fully stress tested."* These scripts are written, syntax-checked and dry-run only. Running them
-> needs the owner's design sign-off and an approved host.
+> **Approved to run on edt1 (owner, 2026-11-11)**, after the design sign-off. Isolated from the live lab and
+> from edt1's edy deployment. HA tests against the live lab stay gated on the stress program (design §12).
 
 | VM | stands in for | lan0 (192.168.2.0/24, bridge0) | isolated subnet (in-VM podman `adl-iso`, no DCs) | sh0: shared subnet on edt1 (libvirt `adl-shared`, 10.31.0.0/24) | DC addresses (macvlan `adl-dc` on sh0) |
 |---|---|---|---|---|---|
