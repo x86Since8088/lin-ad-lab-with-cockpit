@@ -147,9 +147,10 @@ testbed host. The stress program (design §12) must pass before any HA test on e
 
 ## Owner decisions
 
-- **HA witness placement (blocks Phase 6 only).** Automatic failover to mini-srv needs a trusted voter outside both
-  edt1 and mini-srv (edy L1/L4: a flagged witness node — small VM/SBC on separate power, or a cloud node). Until then
-  failover is manual-attest (`ha-attest-host-dead`). Other HA defaults are in design §11 and stand unless overridden.
+- **HA tiebreaker (blocks Phase 6 only).** Owner 2026-11-11: "the other nodes that have to talk with trusted should have
+  a vote". Counted one vote per failure domain (design §5.2), so automatic failover to mini-srv needs any voting edy node on
+  a THIRD machine (cloud edge, SBC, another bare-metal host). Which one? Until then failover is manual-attest
+  (`ha-attest-host-dead`). Other HA defaults are in design §11 and stand unless overridden.
 
 - **Root executes lab scripts from the SMB share.** `samba-ad-lab.service` has
   `ExecStart=/srv/smb/share/sc/ai-orchestrator-group/ai-orchestrator-storage/projects/samba-ad-lab/source/21-start.sh`
