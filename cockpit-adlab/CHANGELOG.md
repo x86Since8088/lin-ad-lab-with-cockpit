@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.19.0 - 2026-11-11
+
+A schema-driven, reusable **object picker** — the ADUC "Select Users, Contacts,
+Computers, …" dialog — everywhere the console names a directory object.
+
+- **One picker catalog in the helper** (`PICKERS` in `adlab-admin`). Each entry
+  names the object types offered, the search base (`domain`, or a path under
+  `CN=Configuration` for authentication policies/silos), what is handed back
+  (`dn`, `sAMAccountName` or `name`, with an optional `trim_suffix` for machine
+  names), and `include_base` (offer the domain head, for GPO links and moves).
+  `schema` publishes it, resolved for the current domain, as `pickers`.
+- **DN attributes get a picker from the live schema.** `object-schema` attaches
+  a resolved `picker` to every writable DN-syntax attribute (`ATTR_PICKERS`:
+  member → users/groups/computers/contacts, managedBy → users/groups/contacts,
+  manager/secretary/assistant → users/contacts, assigned authN policy/silo →
+  config objects; any other DN attribute → any object). Single vs multi follows
+  the attribute's own `isSingleValued`. Read-only and back-link attributes get none.
+- **Verb arguments reference pickers by name** (`arg(..., picker="member")`):
+  user/group/member/account/computer arguments of the users, groups, SPN,
+  crypto, delegation, RBCD, Protected Users, authentication policy/silo and
+  member-server verbs, and the DN arguments of the object, OU and GPO-link verbs
+  (52 arguments). Arguments that name a NEW object never get one.
+- `object-list` gains `include_base` and a `domainDNS` class filter.
+- **UI:** one `objectPicker` component (object-type checkboxes, search field and
+  button, results table, a Selected list that persists across searches for
+  multi-valued targets, double-click to accept a single value, Accept/Cancel)
+  and `withObjectPicker` (a "Search…" button beside any field). Wired into the
+  object editor (every DN field: Members and Managed By on groups, Manager, …),
+  every generic verb form whose argument declares a picker, **Rename / Move**
+  ("Move to…" picks the destination container) and **Add to a group** (now a
+  searchable multi-select: one search adds the member to several groups, with a
+  per-group result). Help entry `object-picker`. `pickerTable` gains `onActivate`.
+- Tests: 5 new `TestObjectPickers` cases (catalog closed under reference, the
+  annotated arguments, the published catalog, DN fields from the schema,
+  `include_base`). The UI flows were exercised in a stubbed-cockpit harness.
+
 ## 1.18.0 - 2026-11-09
 
 CA chain view on the PKI tab, plus intermediate CAs.
