@@ -47,6 +47,8 @@
 !tools/**
 !cockpit-adlab
 !cockpit-adlab/**
+!ha-testbed
+!ha-testbed/**
 
 # Install-ready /etc artifacts captured from the running host.
 !.etcdefaults

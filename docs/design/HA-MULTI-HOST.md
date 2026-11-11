@@ -1,10 +1,19 @@
 # Multi-host HA for the AD lab (design)
 
-**Status:** design, nothing built. Owner directive 2026-11-11: AD-lab HA logic is
-worked out in its own session, in this repo. The phased plan is in
-[`todo.md`](../../todo.md) under "HA: multi-host DCs". **Nothing here changes the
-live lab on edt1 until the owner approves.** All building and drilling happens
-first on the two-VM testbed (§10).
+**Status:** design draft, **not final**; nothing built. Owner directive 2026-11-11:
+AD-lab HA logic is worked out in its own session, in this repo. The phased plan is
+in [`todo.md`](../../todo.md) under "HA: multi-host DCs".
+
+**Gate (owner, 2026-11-11): "you cannot test this on edt1 until design is finalized
+and fully stress tested."** Nothing is created, run or drilled on edt1 (not the
+live lab, and not the testbed VMs, network or edy cluster, which would also live on
+edt1) until two things are true:
+
+1. the owner has signed off this design as final, and
+2. the stress program (§12) has passed, with the owner approving where it runs.
+
+The testbed scripts in `ha-testbed/` are written and syntax-checked but have
+**never been run**.
 
 ## 1. Goal and inputs
 
@@ -385,32 +394,61 @@ The design is built and drilled on **two throwaway VMs** that stand in for edt1
 and mini-srv. The live lab and the shared lab VMs are never touched (memory
 `shared-lab-vm-no-touch`).
 
-- **VMs:** created with the `edy-rapid-update` tooling (`epg-vm`, `epg-snap`)
-  from the hardened noble golden image. Names follow its rule,
-  `epg-stack-adl-os1-01` (host A, "edt1") and `epg-stack-adl-os1-02`
-  (host B, "mini-srv"), deployment code `adl`. They need a new stack role
-  `adhost` (rootful podman for the DC containers, which the rapid-update
-  validator does not allow today; that is a small `epg-stack` change). Size:
-  B is capped at mini-srv's real budget (4 vCPU, 8 GB for the lab share);
-  deploy at 6 vCPU / 16 GB and size down afterwards (memory
-  `lab-vm-deploy-sizing`). Use `qemu-img` snapshots after the forest is up, so
-  every drill starts from a known point. (Snapshots are fine **here** because
-  the whole testbed forest is reverted together, all VMs at once. The
-  USN-rollback rule is about restoring one DC while its partners move on.)
+- **Where they run is not decided** (gate above). The owner must approve the host
+  before anything is created. `ha-testbed/` assumes a libvirt host with the
+  edy root job runner; on edt1 that would be the isolated layout below.
+- **VMs (owner, 2026-11-11):** two VMs running **Ubuntu** with **ssh** and the
+  **cockpit plugins**. They are `adl-ha-a` (host A, "edt1") and `adl-ha-b`
+  (host B, "mini-srv"), built by `ha-testbed/tb.sh` from the stock Ubuntu 24.04
+  cloud image. The `edy-rapid-update` golden image is the wrong base for them:
+  its hardening purges `openssh-server`, and its trap rules would flag cockpit
+  and rootful podman. The VMs still use that stack's root runner share
+  (`vm-runner-share.sh` and `rj -M`), so root work inside them goes through the
+  same audited path. ssh is key-only for `eddie`. The cockpit/sudo password is
+  generated into a 0600 file (`~/.config/adl-ha/eddie.pass`) and only its hash
+  goes into the seed. Size: 4 vCPU / 8 GB / 40 GB each (B matches mini-srv's
+  budget). Use `qemu-img` snapshots after the forest is up, so every drill
+  starts from a known point. (Snapshots are fine **here** because the whole
+  testbed forest is reverted together, all VMs at once. The USN-rollback rule
+  is about restoring one DC while its partners move on.)
+- **Isolated edy-proxy-go deployment (owner, 2026-11-11):** the testbed runs its
+  **own** edy cluster and never integrates with edt1's deployment:
+  - VM A runs the first-run "new cluster" path; VM B registers with a bundle
+    minted by **VM A's** API. This is the `edy-testcluster` recipe, run inside
+    the VMs.
+  - edy listens only on `ha0`, with DHCP, PXE, netboot and ARP disabled.
+  - Nothing points at the edt1 hub: no registration, no `172.20.10.1` DNS, no
+    edt1 CA or NTP. The VMs use public resolvers and `ntp.ubuntu.com`.
+- **Three networks per VM (owner, 2026-11-11):**
+  1. **LAN** `lan0` on `192.168.2.0/24` (edt1's `bridge0`): A `.41`, B `.42`,
+     static, below the BGW320's DHCP leases, gateway `.254`. It carries ssh,
+     cockpit and apt egress. No port forwards point at these addresses.
+  2. **An isolated subnet per VM**, local to that host: a rootful podman bridge
+     `adl-iso` inside the VM, the same model as `static-edt` on edt1. A has
+     `172.31.4.0/24` and B has `172.31.5.0/24`. That host's DCs and test
+     clients live here, pinned to the host as in §3.1. It is never stretched;
+     the other VM reaches it only through a route over the HA subnet.
+  3. **The HA subnet** `ha0`, `10.31.0.0/24`, on `adl-ha`: a libvirt network
+     with **no host address, no forward and no dnsmasq**, so it is a pure L2
+     segment between the two VMs. Each VM has a unique address (`.11` and
+     `.12`), plus reserved VIPs: `.53` for anycast DNS (health-gated, both
+     hosts, §6.2) and `.100` for the floating SYSVOL/GPO writer VIP (lease
+     holder only, §5.3). The HA subnet also carries inter-host replication and
+     the isolated-subnet routes. This is the owner's HA-subnet model at testbed
+     scale: unique IP per instance plus anycast or floating IPs, with no
+     stateful DC state on the HA subnet itself.
 - **Forest:** a separate test forest `HA.TEST.LAB` built from this repo's
-  images and scripts, never joined to `AD.EDT1.LAB`. Subnets `172.31.4.0/24`
-  (A) and `172.31.5.0/24` (B), routed between the VMs on their own libvirt
-  network.
+  images and scripts, never joined to `AD.EDT1.LAB`. Its DCs sit on each VM's
+  isolated subnet, with one AD site per VM.
 - **Secrets:** the test forest's administrator password is generated on the
   VM into a root-only `.secrets/administrator.pass` (0600), the same layout as
   the lab. edy API keys for the controller are minted with `edy-root-ops`
   `edy-token` into 0600 files. Nothing goes into the repo, argv or logs.
 - **Controller and witness:** first a script-driven controller
   (`tools/ha-sim.sh`, it plays edy's role and calls the `ha-*` verbs through
-  the VM runners), then a throwaway edy cluster from `edy-root-ops`
-  `edy-testcluster` (trusted + witness) once the edy controller exists.
-  Registering test nodes with the **live** edy fleet is a live change and
-  needs the owner's go-ahead (per the `edy-rapid-update` rules).
+  the VM runners), then the testbed's own isolated edy cluster once the edy
+  controller exists. The witness for drill D4 is a third edy node in that same
+  isolated deployment, never a node of edt1's fleet.
 - **Load:** one VM build at a time, `uptime` first (edt1 was hard-reset by
   agent overload on 2026-10-04).
 
@@ -427,5 +465,32 @@ and mini-srv. The live lab and the shared lab VMs are never touched (memory
 | 7 | API | `ha-*` verbs in `adlab-admin`, called through the edy host agent; controller on the raft leader |
 | 8 | Timers | Lease TTL 60 s, renewal 15 s, grace 5 min, HOLD 30 min |
 
-**The one owner decision that blocks automatic failover** (not the build): where
-the third-failure-domain witness lives. Phases 0–3 in `todo.md` do not need it.
+**Owner decisions still open:**
+1. **Design sign-off** (the gate at the top). Nothing runs before it.
+2. **Where the testbed runs**, since it cannot be edt1 before sign-off and the
+   stress pass. Options: edt1 later, after sign-off, using the isolated layout
+   of §10; mini-srv once it is netbooted; or another host.
+3. **The third-failure-domain witness.** This blocks only automatic failover
+   (Phase 6).
+
+## 12. Stress program (must pass before any test on edt1)
+
+"Fully stress tested" means every row below passes on the testbed, **repeatedly**,
+with numbers recorded (rates and latencies, not just "it worked"; same style as
+`stress/60-stress.sh`). Each run starts from the post-forest snapshot.
+
+| # | Stress | Load while it runs | Pass criteria |
+|---|---|---|---|
+| S1 | **Failover soak:** D2 (hard power-off of A, then failback), 50 cycles | constant `kinit` + LDAP bind load from clients on both sides (`60-stress.sh` auth loop) | every cycle ends healthy; failover ≤ lease + grace + 2 min; failback only after HOLD; 0 duplicate SIDs (scan); 0 lost GPO edits (§6.1); auth errors only on A's side while A is down |
+| S2 | **Partition flapping:** cut and heal `ha0` at random intervals (5 s – 10 min), 2 h, with and without the witness | user/group create on both sides, GPO edits on the writer | never two SYSVOL writers (lease log + rsync log); no seize while both sides are alive; all NCs converge after the final heal; `dbcheck` clean |
+| S3 | **Lease edge cases:** heal exactly at expiry, at expiry + grace − 1 s and + 1 s; clock skew of ±2 s injected on one VM; watchdog killed or stalled | — | self-fence always happens before any takeover; stale-epoch calls rejected (D8) |
+| S4 | **Replication under write load across hosts** | 10k users / 2k groups / 500 computers created on both hosts, password changes, deletes | inter-site convergence time recorded; 0 replication failures after the load; RID pools never exhausted |
+| S5 | **SYSVOL churn:** 200 GPO edit/delete cycles on the writer, plus a failover in the middle | `70-smb.sh` SMB load on SYSVOL | hash identical on all DCs after each cycle; `sysvolcheck` clean; no NTACL loss |
+| S6 | **Boot storms:** both VMs rebooted together, A first, B first, 20 times | — | boot fencing holds (SYSVOL frozen until a lease exists); no DC flagged for rebuild without cause |
+| S7 | **Resource pressure on B** (mini-srv budget): B at 4 vCPU / 8 GB with the failover profile plus `stress-ng` at 80 % CPU and memory | S1 auth load | auth p99 latency recorded and below the agreed threshold (proposed: 500 ms); no OOM kill of samba |
+| S8 | **Negative tests:** D7 (class-B seize then return) and D9 (snapshot-restored DC) | — | detected, quarantined, rebuilt; never silently rejoined |
+| S9 | **Controller loss:** kill the edy leader during a failover, repeatedly | S1 auth load | the new leader resumes from the stored placement and epoch; no double seize; op_id replays are no-ops |
+
+Exit for the program: all rows pass three runs in a row, results are written to
+`docs/design/HA-STRESS-RESULTS.md`, and the owner reviews them. Only then is any
+HA test proposed for edt1.
