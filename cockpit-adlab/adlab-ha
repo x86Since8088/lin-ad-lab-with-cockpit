@@ -41,7 +41,7 @@ DEFAULT_TIMERS = {"ttl_s": 60, "renew_s": 15, "grace_s": 300, "hold_s": 1800,
 BOOT_T = None   # set by the agent at start
 MUTATING = {"ha-placement-apply", "ha-fsmo-transfer", "ha-fsmo-seize", "ha-sysvol-writer",
             "ha-fence", "ha-unfence", "ha-drain", "ha-undrain", "ha-attest-host-dead",
-            "ha-attest-clear", "ha-dc-remove-dead", "ha-dc-rejoin"}
+            "ha-attest-clear", "ha-dc-remove-dead", "ha-dc-rejoin", "ha-dc-restart"}
 READ_NONROOT = {"ha-status", "ha-rejoin-check"}
 
 
@@ -790,6 +790,9 @@ def v_dc_remove_dead(a, env):
     dead, via = a["dc"], a["via"]
     need_local_dc(via)
     rc, out, err = dc_auth_exec(via, "samba-tool domain demote --remove-other-dead-server=%s" % dead, timeout=300)
+    if rc != 0 and "is not an AD DC" in (err or out):
+        audit("dc_remove_dead", dc=dead, via=via, already=True)
+        return {"removed": dead, "already": True}          # idempotent: a retry after success
     if rc != 0:
         raise Refused("refused", "remove-other-dead-server %s failed: %s" % (dead, (err or out).strip()[-300:]), True)
     audit("dc_remove_dead", dc=dead, via=via)
@@ -832,7 +835,20 @@ def v_dc_rejoin(a, env):
     return {"rejoining": dc}
 
 
-VERBS = {"ha-status": v_status, "ha-health": v_health, "ha-lease-renew": v_lease_renew,
+def v_dc_restart(a, env):
+    """Restart one local DC (samba). Used after a partner was rebuilt under the same name:
+    samba's replication service keeps Kerberos tickets for the OLD incarnation and fails
+    DsReplicaSync (WERR_GEN_FAILURE) until they expire or samba restarts (drill D9)."""
+    dc = a["dc"]
+    need_local_dc(dc)
+    rc, out, err = run(["podman", "restart", "-t", "10", dc], timeout=120)
+    if rc != 0:
+        raise Refused("internal", "restart %s failed: %s" % (dc, (err or out).strip()[-200:]), True)
+    audit("dc_restart", dc=dc, reason=a.get("reason", ""))
+    return {"restarted": dc}
+
+
+VERBS = {"ha-status": v_status, "ha-dc-restart": v_dc_restart, "ha-health": v_health, "ha-lease-renew": v_lease_renew,
          "ha-placement-apply": v_placement_apply, "ha-fsmo-transfer": v_fsmo_transfer,
          "ha-fsmo-seize": v_fsmo_seize, "ha-sysvol-writer": v_sysvol_writer, "ha-fence": v_fence,
          "ha-unfence": v_unfence, "ha-drain": v_drain, "ha-undrain": v_undrain,

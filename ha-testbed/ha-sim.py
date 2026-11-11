@@ -381,6 +381,16 @@ class Sim:
                 log("rebuild_rejoin", dc=dc, ok=r2.get("ok"), err=r2.get("error"))
                 if r2.get("ok"):
                     rb.pop(dc)
+                    # refresh partners: their samba caches tickets for the OLD incarnation (drill D9).
+                    # Rolling, one DC at a time, role holders last; give the new DC time to join first.
+                    time.sleep(60)
+                    order = sorted([(d, h) for h, v in HOSTS.items() for d in v["dcs"] if d != dc],
+                                   key=lambda x: x[0] in ("dc1", "dc3"))
+                    for d, h in order:
+                        r3 = call(h, "ha-dc-restart", {"dc": d, "reason": "refresh after %s rebuild" % dc},
+                                  epoch=self.st["epoch"], timeout=180)
+                        log("rebuild_refresh_partner", dc=d, ok=r3.get("ok"), err=r3.get("error"))
+                        time.sleep(30)
             if rb != (self.st["placement"].get("rebuild") or {}):
                 self.apply_placement(self.st["holder"], self.st["placement"]["sysvol_writer"]["dc"],
                                      hosts=[h for h in HOSTS if statuses.get(h)], rebuild=rb)
