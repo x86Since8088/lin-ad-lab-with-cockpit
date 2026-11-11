@@ -664,8 +664,13 @@ and mini-srv. The live lab and the shared lab VMs are never touched (memory
 - **Second trusted node join (confirmed by edy-proxy-go dev, from its PR #515
   two-trusted-node test).** B joins as a **trusted** node with a registration
   bundle, the same way an edge does. Caveats for `tb-edy.sh up`:
-  - Both nodes must start with the **same fleet master password**, otherwise B
-    mints its own CA and distrusts A. It is generated once into a 0600 file
+  - Both nodes must use the **same fleet master password**, otherwise B
+    mints its own CA and distrusts A.
+  - **Correction from the testbed build (2026-11-11):** B must leave
+    `pki.enabled` **unset**. An explicit `true` makes it a CA origin that mints
+    its own root, even with the right password. Unset, it runs as a replica and
+    adopts A's root through `ca_key` replication. Registration names must be in
+    the issued certificates (the VM hostnames). It is generated once into a 0600 file
     in `~/.config/adl-ha/` and handed over through the root-only runner share
     `secrets/`, deleted on use.
   - Set `EDY_VAULT_PASSPHRASE` on B, otherwise B has no vault passphrase.

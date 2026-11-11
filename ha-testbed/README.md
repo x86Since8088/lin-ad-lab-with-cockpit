@@ -20,9 +20,31 @@ Design: [docs/design/HA-MULTI-HOST.md](../docs/design/HA-MULTI-HOST.md) §10 and
 - Ubuntu 24.04 (stock cloud image), ssh (key-only, `eddie`), cockpit + cockpit-podman, rootful podman, chrony.
 - The cockpit/sudo password is generated into `~/.config/adl-ha/eddie.pass` (0600). The seed holds its hash only.
 - Root work inside a VM goes through the edt1 job runner share (`rj -M adl-ha-a …`).
-- **Isolated edy-proxy-go:** its own cluster (A = first-run new cluster, B registers with A). It never
-  registers with or uses edt1's edy deployment (DNS, DHCP, CA, NTP). Kept current with edy main: `tb-edy.sh update`
-  rolls B then A with health gates and rollback (design §10). Not scripted yet (next step after sign-off).
+- **Isolated edy-proxy-go** (built 2026-11-11): its own cluster. A (`adl-edy-a`) ran first-run "new cluster";
+  B (`adl-edy-b`) joined as a second TRUSTED node via a bundle minted by A. Nothing registers with or uses
+  edt1's edy deployment (verified: edt1's fleet lists no adl peers or registrations; the VMs use public DNS and
+  the BGW320 route, and run no edy agent). edy listens only on sh0 + loopback (TCP 53/8080/8444).
+  Replication verified both ways (A->B and B->A DNS records, 0 failures).
+- **Cockpit plugins:** both VMs run the six plugins edt1 runs, at edt1's deployed versions (adlab 1.19.1,
+  guac-rdp 1.11.1, headscale 1.1.1, secrets 0.5.2, tuner 1.0.1, wireguard 1.1.2). Payloads only: each `.env`
+  is fresh from `.envdefault`, and no plugin unit is enabled.
+
+Scripts:
+
+| Script | What |
+|---|---|
+| `tb.sh net\|create\|status\|destroy` | the shared libvirt network and the VMs |
+| `tb-plugins.sh VM [plugin…]` | copy edt1's deployed cockpit plugin payloads into a VM and install them |
+| `tb-edy.sh up-a\|join-b\|reset-b\|status\|update\|stage` | the isolated edy cluster; `update` rolls B then A with a health gate and automatic rollback, logging to `edy-versions.log` |
+
+Lessons (2026-11-11, folded into the scripts):
+- `POST /api/setup/cluster` is local-only, so edy also listens on 127.0.0.1 (not reachable off the VM).
+- Registration names must be in the certificates edy issues: use the VM hostnames (`adl-ha-a`/`adl-ha-b`, sh0 in
+  `/etc/hosts`), not `edy-*.adlha.test`.
+- **A joining trusted node must leave `pki.enabled` UNSET.** An explicit `true` makes it a CA origin that mints a
+  second fleet root (B did, and re-issued its node cert from it). Unset = replica: adopts A's root via `ca_key`.
+- `bootlog.enabled=false` alone left B listening on UDP `*:514`/`*:6666`; the addresses are pinned to loopback.
+- `shred` cannot truncate on the 9p runner share; files there are removed with `rm`.
 
 ```bash
 ./tb.sh net --dry-run               # libvirt network adl-ha: no host IP, no forward, no dnsmasq
