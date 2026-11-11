@@ -211,7 +211,7 @@ The AD lab does not run its own quorum. It uses edy's:
   |---|---|---|
   | **down** | No domain reaches the lost side's trusted node or host agent, and its own host's nodes report nothing | Full failover (§5.4): seize class A, move the writer lease |
   | **isolated** | The lost side is alive (its own host's nodes still reach it) but no other domain reaches it | Full failover: the isolated host self-fenced at lease expiry, and its roles are useless to everyone else. Its DCs keep serving local clients; flagged for normal rejoin |
-  | **split** | Both trusted sides are still reached, each by a different set of domains | **Lease-only failover:** the writer lease (SYSVOL/GPO) moves to the majority side, and the minority self-fences. **No FSMO seize.** Both PDCs would be alive, so roles move only by a graceful `ha-fsmo-transfer` after the split heals |
+  | **split** | Both trusted sides are still reached, each by a different set of domains | **Lease-only failover:** the lease moves to the majority side, and the minority self-fences. **No FSMO seize.** Both PDCs would be alive, so roles move only by a graceful `ha-fsmo-transfer` after the split heals. **GPO/SYSVOL writes are frozen on both sides until the heal** (found while building the testbed). The PDC, and so the SYSVOL source, stays on the minority side, and the replicator refuses a writer that disagrees with the directory's PDC owner (§6.1). Authentication continues everywhere |
   | **unknown** | Too few reports to tell (for example, no third domain) | Nothing automatic. Alert; operator attestation (§5.2) can upgrade it to down |
 
   - The classification and a summary of its evidence (which domains reached
