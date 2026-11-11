@@ -12,6 +12,9 @@ DOMAIN_NB="${DOMAIN_NB:?DOMAIN_NB required}"
 FORWARDER="${FORWARDER:-8.8.8.8}"
 DC_IP="${DC_IP:?DC_IP required}"
 PEER_IP="${PEER_IP:-}"
+# Optional AD site for a JOINING DC (multi-host HA: one site per host). Unset =
+# samba's default placement (unchanged behaviour for the single-host lab).
+SITE="${SITE:-}"
 # Read the password from a mounted file, never from the environment:
 # /proc/<pid>/environ exposes env vars to anything that can read the process.
 ADMIN_PASS_FILE="${ADMIN_PASS_FILE:-/run/adminpass}"
@@ -55,9 +58,10 @@ if [ ! -f /var/lib/samba/private/sam.ldb ]; then
             sleep 2
         done
         log "joining $REALM as an additional DC (replication partner)"
+        site_arg=(); [ -n "$SITE" ] && site_arg=(--site="$SITE")
         printf '%s' "$ADMIN_PASS" | samba-tool domain join "${REALM,,}" DC \
             -U "${DOMAIN_NB}\\Administrator" --password="$ADMIN_PASS" \
-            --dns-backend=SAMBA_INTERNAL
+            --dns-backend=SAMBA_INTERNAL "${site_arg[@]}"
         log "join complete"
         ;;
       *)

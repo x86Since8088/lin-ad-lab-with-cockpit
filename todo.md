@@ -109,8 +109,12 @@ until the stress program (design §12) passes and the owner reviews the results.
   1.0.0.202611110517, replicating both ways. edt1's fleet has no record of them. Autostart is OFF, so after an edt1 reboot
   start them with `virsh start`. Secrets (cockpit/sudo password, edy API keys) are in `~/.config/adl-ha/` (0600); the edy
   admin/master/safe passwords stay root-only in the VMs.
-- [ ] **Phase 0b: keep edy current** — install the trigger for `tb-edy.sh update` (new promoted main build + daily).
-- [ ] **Phase 0: testbed** (remaining: test forest, snapshot). Two Ubuntu 24.04 VMs `adl-ha-a`/`adl-ha-b`
+- [x] **Phase 0b: keep edy current.** `tb-edy.sh install-trigger`: eddie user units `adl-ha-edy-update.{path,timer}`
+  (promoted main build changes + daily) run `tb-edy.sh update` (B then A, health gate, rollback; skips stopped/current VMs).
+- [x] **Phase 0c: test forest `HA.TEST.LAB` (2026-11-11).** dc1+dc2 on A (Default-First-Site-Name, all FSMO on dc1),
+  dc3+dc4 on B (site adl-ha-b), all `[ALL GOOD]`, site SRV records resolve. Baseline snapshot `forest-baseline` of
+  both VMs (`tb.sh revert forest-baseline --yes-revert` resets both together). `dc-entrypoint.sh` takes an optional
+  `SITE` (live DCs unaffected until an image rebuild, and then only when SITE is set). Two Ubuntu 24.04 VMs `adl-ha-a`/`adl-ha-b`
   (4 vCPU / 8 GB / 40 GB; ssh key-only, cockpit + cockpit-podman + the cockpit-adlab plugin, rootful podman). Per VM:
   LAN `192.168.2.41`/`.42`, an isolated VM-local subnet (`172.31.4.0/24` / `172.31.5.0/24`, in-VM podman bridge, no DCs),
   and a shared subnet on edt1 `10.31.0.0/24` (libvirt `adl-shared`, edt1 .1, no forward/DHCP/DNS) where the DCs of BOTH
@@ -124,7 +128,8 @@ until the stress program (design §12) passes and the owner reviews the results.
   `ha-testbed/edy-versions.log`, and runs on every new main build plus daily. Both VMs must be current before each
   stress run. Exit: `30-verify.sh` green on both VMs, cross-site
   replication green.
-- [ ] **Phase 1: lab.env multi-host.** A per-host block in lab.env (host → subnet, network, DC indexes, site,
+- [ ] **Phase 1: lab.env multi-host.** (The testbed's `tb-forest.sh` is the working reference for per-host DCs, sites
+  and the macvlan shared subnet.) A per-host block in lab.env (host → subnet, network, DC indexes, site,
   forwarder), `dc_ip` that follows the host, `20-up.sh --host H` that brings up only that host's DCs, a site/subnet
   bootstrap (`samba-tool sites create`, `sites subnet create`, `sites setsite` at join), and `fix_ad_resolv` with one DC
   per host. No behavior change for a single-host lab.env (the live lab file stays valid). Exit: testbed rebuilt from these

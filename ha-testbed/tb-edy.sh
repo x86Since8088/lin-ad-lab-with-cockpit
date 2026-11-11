@@ -11,6 +11,8 @@
 #                                 then A's fleet master password as a file + pki on; own vault passphrase)
 #   tb-edy.sh reset-b             retire adl-edy-b on A and wipe B's edy data (container, volume,
 #                                 join marker); keeps B's vault passphrase. For re-joins and drills.
+#   tb-edy.sh install-trigger     user units (eddie): run `update` when a new main build is promoted
+#                                 (path unit on EDY_BIN) and daily (timer); sources in ./systemd/
 #   tb-edy.sh status              per node: version, /up, peers
 #   tb-edy.sh update              rolling update B then A: stage, swap binary, restart, health
 #                                 gate (/up 200 + new version), automatic rollback on failure;
@@ -228,6 +230,18 @@ EOF
   printf '%s reset-b\n' "$(date -u +%FT%TZ)" >> "$VLOG"
 }
 
+cmd_install_trigger() {
+  local U=$HOME/.config/systemd/user f
+  mkdir -p "$U"
+  for f in adl-ha-edy-update.service adl-ha-edy-update.path adl-ha-edy-update.timer; do
+    sed -e "s#@HERE@#$HERE#g" -e "s#@BIN@#$EDY_BIN#g" "$HERE/systemd/$f" > "$U/$f"
+  done
+  systemctl --user daemon-reload
+  systemctl --user enable --now adl-ha-edy-update.path adl-ha-edy-update.timer
+  systemctl --user list-timers adl-ha-edy-update.timer --no-pager | sed -n 2p
+  systemctl --user is-active adl-ha-edy-update.path
+}
+
 api() { # NODE(a|b) METHOD PATH
   local t="$TB_SECRETS/edy-$1.token" u; u=$(cat "$TB_SECRETS/edy-$1.url")
   [ -s "$t" ] || die "no token for $1"
@@ -248,8 +262,15 @@ cmd_update() {
   local vm ip
   for vm in adl-ha-b adl-ha-a; do                       # B first, A (the founder) last
     tb_vm "$vm"; ip=$HA_IP
-    "$RJ" -M "$vm" "adlha-edy-has-$vm" <<<'podman container exists adl-edy && echo yes || echo no' | grep -q '^yes' \
-      || { echo "$vm: no edy node yet, skipped"; continue; }
+    # a stopped VM (autostart is off) is skipped, not waited for; same version = nothing to do
+    [ "$(virsh -q -c qemu:///system domstate "$vm" 2>/dev/null)" = running ] || { echo "$vm: not running, skipped"; continue; }
+    local cur
+    cur=$("$RJ" -t 120 -M "$vm" "adlha-edy-ver-$vm" <<<'podman container exists adl-edy && cat /opt/adl-edy/VERSION || echo none' | grep -m1 -E '^(none|[0-9.]+)$' || true)
+    case $cur in
+      none|"") echo "$vm: no edy node yet, skipped"; continue;;
+      "$new") echo "$vm: already on $new"; continue;;
+    esac
+    echo "$vm: $cur -> $new"
     cmd_stage "$vm"
     if "$RJ" -t 600 -M "$vm" "adlha-edy-update-$vm" <<EOF
 set -Eeuo pipefail
@@ -273,6 +294,6 @@ EOF
 }
 
 case ${1:-} in
-  stage) cmd_stage "${2:-}";; up-a) cmd_up_a;; join-b) cmd_join_b;; reset-b) cmd_reset_b;; status) cmd_status;; update) cmd_update;;
+  stage) cmd_stage "${2:-}";; up-a) cmd_up_a;; join-b) cmd_join_b;; reset-b) cmd_reset_b;; install-trigger) cmd_install_trigger;; status) cmd_status;; update) cmd_update;;
   *) sed -n '2,15p' "$0"; exit 2;;
 esac
