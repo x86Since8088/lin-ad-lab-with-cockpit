@@ -224,6 +224,11 @@ def gpo_folder_everywhere(name):
     return all(seen.values()), {"guid": guid, "on": seen}
 
 
+def user_names(vm, dc):
+    rc, out, err = rootjob("adlha-users", "podman exec %s samba-tool user list 2>/dev/null\n" % dc, vm=vm)
+    return {l.strip().lower() for l in out.splitlines() if l.strip() and not l.startswith("[")}
+
+
 def sid_dupes(vm, dc):
     rc, out, err = rootjob("adlha-sid-scan",
                            "podman exec %s ldbsearch -H /var/lib/samba/private/sam.ldb '(objectSid=*)' objectSid 2>/dev/null "
@@ -317,6 +322,81 @@ def drill(name):
         s, took = wait_healthy(600)
         record("D5", ok=bool(s) and "seize" not in ev and pdc_owner(snap) == "dc1", events=sorted(set(ev)),
                recovered_s=took)
+    elif name == "D3":
+        # link cut where the NON-holder (B) is the one cut off: the holder keeps the lease and
+        # the roles, nobody seizes, A's clients keep authenticating, B self-fences nothing
+        fault("split", "adl-ha-b")
+        time.sleep(120)
+        ev = [e["event"] for e in events_since(t0)]
+        mid = snapshot()
+        fault("heal", "adl-ha-b")
+        s, took = wait_healthy(600)
+        record("D3", ok=bool(s) and "seize" not in ev and "failover_lease_only" not in ev and mid["holder"] == "adl-ha-a"
+               and pdc_owner(mid) == "dc1", events=sorted(set(ev)), holder_during=mid["holder"], recovered_s=took)
+    elif name == "D7":
+        # class-B seize while A is down, then A returns: dc1 must be HELD and REBUILT, never serve
+        # with stale class-B roles; no duplicate SIDs; every role home afterwards
+        if not healthy(snapshot()):
+            wait_healthy(600)
+        fault("poweroff", "adl-ha-a")
+        _, t_to = wait_for(lambda: [e for e in events_since(t0) if e["event"] == "seize" and e.get("ok")], 300)
+        made = []
+        for i in range(5):                       # users created on the survivor during the outage
+            n = "d7-out-%d-%d" % (int(now()), i)
+            rc, out, err = dc_auth("adl-ha-b", "dc3", "samba-tool user add %s 'Pw-%s-x9!' -H ldap://127.0.0.1" % (n, uuid.uuid4().hex[:8]))
+            made.append("[exit 0]" in out)
+        sh([sys.executable, os.path.join(HERE, "ha-sim.py"), "seize-class-b", "class-b", "drill-D7", "home host gone for good (drill)"])
+        cb, _ = wait_for(lambda: [e for e in events_since(t0) if e["event"] == "seize_class_b"], 300)
+        cb_ok = bool(cb) and cb[-1].get("ok")
+        fault("poweron", "adl-ha-a")
+        # dc1 must come up HELD (rebuild flag), then be rebuilt by the controller
+        held, t_held = wait_for(lambda: (lambda st: st if st and any(d["name"] == "dc1" and d["state"] in ("held", "rebuild")
+                                                                      for d in st["dcs"]) else None)(
+            (ha("adl-ha-a", "ha-status") or {}).get("result")), 300, step=5)
+        rb, t_rb = wait_for(lambda: [e for e in events_since(t0) if e["event"] == "rebuild_rejoin" and e.get("ok")], 900, step=10)
+        s, t_back = wait_healthy(1500)
+        fin = snapshot()
+        all_home = sorted(fin["dcs"].get("dc1", {}).get("roles", [])) == sorted(
+            ["pdc", "rid", "schema", "naming", "infrastructure", "domaindns", "forestdns"])
+        after = []
+        for i in range(5):                       # users created on the rebuilt RID master
+            n = "d7-after-%d-%d" % (int(now()), i)
+            rc, out, err = dc_auth("adl-ha-a", "dc1", "samba-tool user add %s 'Pw-%s-x9!' -H ldap://127.0.0.1" % (n, uuid.uuid4().hex[:8]))
+            after.append("[exit 0]" in out)
+        time.sleep(30)
+        dupes = {"dc1": sid_dupes("adl-ha-a", "dc1"), "dc3": sid_dupes("adl-ha-b", "dc3")}
+        record("D7", ok=cb_ok and bool(held) and bool(rb) and bool(s) and all_home and all(made) and all(after)
+               and dupes == {"dc1": 0, "dc3": 0}, class_b_seized=cb_ok, dc1_held=bool(held), held_after_s=t_held,
+               rebuilt=bool(rb), rebuild_after_s=t_rb, healthy_after=bool(s), healthy_after_s=t_back,
+               roles_home=all_home, users_during=sum(made), users_after=sum(after), duplicate_sids=dupes)
+    elif name == "D9":
+        # snapshot-restore of ONE DC (dc4) = USN rollback: detect, quarantine, rebuild, lose nothing
+        if not healthy(snapshot()):
+            wait_healthy(600)
+        S = "/opt/adl-forest/state/dc4"
+        rootjob("adlha-d9-snap", "set -e\npodman stop -t 10 dc4 >/dev/null\nrm -rf /opt/adl-forest/d9-snap && mkdir -p /opt/adl-forest/d9-snap\n"
+                "tar --xattrs --xattrs-include='*' --acls -C %s -cpf /opt/adl-forest/d9-snap/state.tar var-lib-samba etc-samba\n"
+                "podman start dc4 >/dev/null\necho snap-taken\n" % S, vm="adl-ha-b")
+        time.sleep(40)
+        users = []
+        for i in range(10):
+            n = "d9-%d-%d" % (int(now()), i)
+            rc, out, err = dc_auth("adl-ha-b", "dc4", "samba-tool user add %s 'Pw-%s-x9!' -H ldap://127.0.0.1" % (n, uuid.uuid4().hex[:8]))
+            users.append((n, "[exit 0]" in out))
+        # let dc3 pull dc4's new changes (its high-water mark for dc4 moves past the snapshot)
+        time.sleep(90)
+        t_restore = now()
+        rootjob("adlha-d9-restore", "set -e\npodman stop -t 10 dc4 >/dev/null\nrm -rf %s/var-lib-samba %s/etc-samba\n"
+                "tar --xattrs --xattrs-include='*' --acls -C %s -xpf /opt/adl-forest/d9-snap/state.tar\n"
+                "podman start dc4 >/dev/null\necho restored-old-state\n" % (S, S, S), vm="adl-ha-b")
+        det, t_det = wait_for(lambda: [e for e in events_since(t_restore) if e["event"] == "usn_rollback_flagged"], 600, step=5)
+        rb, t_rb = wait_for(lambda: [e for e in events_since(t_restore) if e["event"] == "rebuild_rejoin" and e.get("ok")], 900, step=10)
+        s, t_back = wait_healthy(1200)
+        present = sum(1 for n, ok in users if ok and n.lower() in user_names("adl-ha-a", "dc1"))
+        dupes = {"dc1": sid_dupes("adl-ha-a", "dc1"), "dc4": sid_dupes("adl-ha-b", "dc4")}
+        record("D9", ok=bool(det) and bool(rb) and bool(s) and present == sum(ok for _, ok in users) and dupes == {"dc1": 0, "dc4": 0},
+               detected=bool(det), detect_after_s=t_det, rebuilt=bool(rb), rebuild_after_s=t_rb, healthy_after=bool(s),
+               users_created=sum(ok for _, ok in users), users_present_after=present, duplicate_sids=dupes)
     elif name == "D8":
         r = ha("adl-ha-b", "ha-placement-apply", {"placement": {"stale": True}})
         st = sim()

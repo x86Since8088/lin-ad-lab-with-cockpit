@@ -15,6 +15,8 @@ controller and the peer while its clients may still reach it (split).
   ha-sim.py run [--timers stress|prod]   controller loop (events -> state/ha-sim/events.jsonl)
   ha-sim.py state                        one-screen state
   ha-sim.py attest HOST ACTOR REASON     operator attestation (upgrades unknown -> down)
+  ha-sim.py seize-class-b ROLE ACTOR REASON   operator class-B seize onto the standby (flags the
+                                              home PDC DC for rebuild before it may return)
 """
 import json
 import os
@@ -29,10 +31,10 @@ HOSTS = {"adl-ha-a": {"sh0": "10.31.0.11", "lan": "192.168.2.41", "dcs": ["dc1",
          "adl-ha-b": {"sh0": "10.31.0.12", "lan": "192.168.2.42", "dcs": ["dc3", "dc4"], "pdc_home": "dc3"}}
 HOME, STANDBY = "adl-ha-a", "adl-ha-b"
 TIMERS = {"prod": {"ttl_s": 60, "renew_s": 15, "grace_s": 300, "hold_s": 1800, "sysvol_s": 300, "collect_s": 15,
-                   "attest_max_s": 3600},
+                   "attest_max_s": 3600, "hold_boot_s": 600},
           # same ratios, scaled so stress cycles take minutes (design §12)
           "stress": {"ttl_s": 20, "renew_s": 5, "grace_s": 30, "hold_s": 90, "sysvol_s": 60, "collect_s": 5,
-                     "attest_max_s": 600}}
+                     "attest_max_s": 600, "hold_boot_s": 90}}
 
 
 def now():
@@ -233,7 +235,7 @@ class Sim:
         home_dc = HOSTS[home]["pdc_home"]
         steps = [("prepare", home, "ha-sysvol-writer", {"dc": home_dc, "phase": "prepare"}),
                  ("fence", away, "ha-fence", {"reason": "failback"}),
-                 ("transfer", home, "ha-fsmo-transfer", {"role": "class-a", "to": home_dc}),
+                 ("transfer", home, "ha-fsmo-transfer", {"role": "all", "to": home_dc}),
                  ("commit", home, "ha-sysvol-writer", {"dc": home_dc, "phase": "commit"})]
         if self.st["mode"] == "degraded-split":
             steps = [s for s in steps if s[0] not in ("transfer",)]
@@ -267,9 +269,46 @@ class Sim:
         self.st.pop("failed_from", None)
         return True
 
+    # -- operator requests (written by the CLI, consumed here: the loop owns the state)
+    def requests(self):
+        d = os.path.join(STATE, "requests")
+        if not os.path.isdir(d):
+            return
+        for fn in sorted(os.listdir(d)):
+            p = os.path.join(d, fn)
+            try:
+                req = json.load(open(p))
+            except (OSError, ValueError):
+                continue
+            os.unlink(p)
+            if req["kind"] == "attest":
+                self.st.setdefault("attest", {})[req["id"]] = {"host": req["host"], "actor": req["actor"],
+                                                                "reason": req["reason"],
+                                                                "expires": now() + self.T["attest_max_s"]}
+                log("attestation_recorded", id=req["id"], host=req["host"], actor=req["actor"])
+            elif req["kind"] == "seize-class-b":
+                lost, surv = self.st.get("failed_from"), self.st["holder"]
+                if not lost:
+                    log("seize_class_b_refused", why="no failover in progress")
+                    continue
+                e = self.st["epoch"] + 1
+                old = {"host": lost, "epoch": self.st.get("lease_epoch") or (self.st["epoch"] - 1), "expires_at": 0}
+                r = call(surv, "ha-fsmo-seize", {"role": req["role"], "to": HOSTS[surv]["pdc_home"], "class_b": True,
+                                                 "i_understand": True, "actor": req["actor"], "reason": req["reason"],
+                                                 "lease_proof": {"lease": old, "takeover": "quorum", "classification": "down"}},
+                         epoch=e, timeout=600)
+                log("seize_class_b", role=req["role"], ok=r.get("ok"), err=r.get("error"),
+                    seized=(r.get("result") or {}).get("seized"))
+                if r.get("ok"):
+                    rb = dict((self.st.get("placement") or {}).get("rebuild") or {})
+                    rb[HOSTS[lost]["pdc_home"]] = "class-B %s seized onto %s at epoch %d" % (req["role"], HOSTS[surv]["pdc_home"], e)
+                    self.apply_placement(surv, self.st["placement"]["sysvol_writer"]["dc"], hosts=[surv], rebuild=rb)
+        save(self.st)
+
     # -- loop
     def tick(self):
         T = self.T
+        self.requests()
         statuses = self.poll()
         reach = [h for h, s in statuses.items() if s]
         mode = self.st["mode"]
@@ -311,6 +350,42 @@ class Sim:
                     if self.failover(holder, survivor, cls, ev, attestation=att):
                         self.st["attest"][att]["used"] = True
             # NO renewals while the holder is lost: the survivors' own lease record must lapse
+        # USN rollback reported by a host -> flag that DC for rebuild (design §9 D9)
+        if self.st.get("placement"):
+            rb0 = dict(self.st["placement"].get("rebuild") or {})
+            for h, s in statuses.items():
+                for d in (s or {}).get("dcs", []):
+                    if d.get("usn_rollback") and d["name"] not in rb0:
+                        rb0[d["name"]] = "USN rollback detected by %s" % h
+                        log("usn_rollback_flagged", dc=d["name"], host=h, usn=d.get("usn"))
+            if rb0 != (self.st["placement"].get("rebuild") or {}):
+                self.apply_placement(self.st["holder"], self.st["placement"]["sysvol_writer"]["dc"],
+                                     hosts=[h for h in HOSTS if statuses.get(h)], rebuild=rb0)
+        # rebuild flagged DCs (class-B seize, USN rollback) before anything else (design §4.2)
+        rb = dict((self.st.get("placement") or {}).get("rebuild") or {})
+        dc_host = {d: h for h, v in HOSTS.items() for d in v["dcs"]}
+        todo = [dc for dc in rb if statuses.get(dc_host[dc])]
+        if todo:
+            for dc in todo:
+                home = dc_host[dc]
+                other = [h for h in HOSTS if h != home and statuses.get(h)]
+                if not other:
+                    continue
+                via = HOSTS[other[0]]["pdc_home"]
+                peer_ip = {"dc1": "10.31.0.17", "dc3": "10.31.0.33"}[via]
+                r1 = call(other[0], "ha-dc-remove-dead", {"dc": dc, "via": via}, epoch=self.st["epoch"], timeout=600)
+                log("rebuild_remove_dead", dc=dc, via=via, ok=r1.get("ok"), err=r1.get("error"))
+                if not r1.get("ok") and "not found" not in str(r1.get("error")).lower():
+                    continue
+                r2 = call(home, "ha-dc-rejoin", {"dc": dc, "peer_ip": peer_ip}, epoch=self.st["epoch"], timeout=600)
+                log("rebuild_rejoin", dc=dc, ok=r2.get("ok"), err=r2.get("error"))
+                if r2.get("ok"):
+                    rb.pop(dc)
+            if rb != (self.st["placement"].get("rebuild") or {}):
+                self.apply_placement(self.st["holder"], self.st["placement"]["sysvol_writer"]["dc"],
+                                     hosts=[h for h in HOSTS if statuses.get(h)], rebuild=rb)
+            save(self.st)
+            return
         # failback with hysteresis
         if self.st["mode"] in ("degraded", "degraded-split"):
             home = self.st["failed_from"]
@@ -351,15 +426,16 @@ def main():
         Sim(TIMERS[prof]).run()
     elif cmd == "state":
         print(json.dumps(load(), indent=1, sort_keys=True))
-    elif cmd == "attest":
-        host, actor, reason = sys.argv[2], sys.argv[3], " ".join(sys.argv[4:])
-        st = load()
-        aid = "att-" + uuid.uuid4().hex[:12]
-        st.setdefault("attest", {})[aid] = {"host": host, "actor": actor, "reason": reason,
-                                            "expires": now() + st["timers"]["attest_max_s"]}
-        save(st)
-        log("attestation_recorded", id=aid, host=host, actor=actor)
-        print(aid)
+    elif cmd in ("seize-class-b", "attest"):
+        os.makedirs(os.path.join(STATE, "requests"), exist_ok=True)
+        rid = uuid.uuid4().hex[:12]
+        if cmd == "attest":
+            req = {"kind": "attest", "id": "att-" + rid, "host": sys.argv[2], "actor": sys.argv[3], "reason": " ".join(sys.argv[4:])}
+        else:
+            req = {"kind": "seize-class-b", "role": sys.argv[2], "actor": sys.argv[3], "reason": " ".join(sys.argv[4:])}
+        with open(os.path.join(STATE, "requests", rid + ".json"), "w") as f:
+            json.dump(req, f)
+        print(req.get("id", rid))
     else:
         print(__doc__)
         return 2

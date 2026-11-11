@@ -83,7 +83,9 @@ CH
 env=(-e ROLE=\$ROLE -e REALM=$REALM -e DOMAIN_NB=$DOMAIN_NB -e DC_IP=\$IP -e FORWARDER=$FORWARDER -e ADMIN_PASS_FILE=/run/adminpass)
 [ "\$ROLE" = join ] && env+=(-e PEER_IP=\$PEER -e "SITE=\$SITE")
 # same privileges as the lab's DCs (20-up.sh): SYSVOL NT ACLs are security.* xattrs (SYS_ADMIN)
-podman run -d --init --name \$N --hostname \$N --network adl-dc --ip \$IP --restart=always \
+# --restart=no: the adlab-ha agent supervises DCs (boot fencing: a DC that held class-B roles
+# is held until the controller speaks; design §5.3). Before adlab-ha is installed, start by hand.
+podman run -d --init --name \$N --hostname \$N --network adl-dc --ip \$IP --restart=no --label adl-ha.supervised=1 \
   --cap-add SYS_ADMIN,NET_ADMIN,SYS_TIME --security-opt seccomp=unconfined \
   --label adl-ha.role=dc --label adl-ha.forest=$REALM \
   -v /opt/adl-forest/secrets/administrator.pass:/run/adminpass:ro \

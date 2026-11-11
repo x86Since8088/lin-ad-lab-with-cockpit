@@ -176,6 +176,24 @@ class TestSeize(Base):
         self.assertIn("bound to epoch", r["error"]["message"])
 
 
+class TestClassBAfterTakeover(Base):
+    def test_class_b_seize_after_lease_moved_uses_history(self):
+        self.place(2, holder="adl-ha-a", expires=time.time() - 1000)        # A's lease, lapsed
+        self.place(3, writer="dc3", holder="adl-ha-b")                     # takeover: lease now B's
+        proof = {"lease": {"host": "adl-ha-a", "epoch": 2}, "takeover": "quorum", "classification": "down"}
+        r = self.env("ha-fsmo-seize", {"role": "rid", "to": "dc3", "class_b": True, "i_understand": True,
+                                       "actor": "op", "reason": "gone for good", "lease_proof": proof}, epoch=4)
+        self.assertTrue(r["ok"], r)
+
+    def test_forged_history_epoch_refused(self):
+        self.place(2, holder="adl-ha-a", expires=time.time() - 1000)
+        self.place(3, writer="dc3", holder="adl-ha-b")
+        proof = {"lease": {"host": "adl-ha-a", "epoch": 7}, "takeover": "quorum", "classification": "down"}
+        r = self.env("ha-fsmo-seize", {"role": "rid", "to": "dc3", "class_b": True, "i_understand": True,
+                                       "actor": "op", "reason": "x", "lease_proof": proof}, epoch=4)
+        self.assertIn("history", r["error"]["message"])
+
+
 class TestWriterAndFence(Base):
     def test_sysvol_writer_refuses_when_placement_behind(self):
         self.place(3)
