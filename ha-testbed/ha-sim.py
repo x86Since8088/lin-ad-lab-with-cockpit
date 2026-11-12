@@ -364,7 +364,15 @@ class Sim:
         # rebuild flagged DCs (class-B seize, USN rollback) before anything else (design §4.2)
         rb = dict((self.st.get("placement") or {}).get("rebuild") or {})
         dc_host = {d: h for h, v in HOSTS.items() for d in v["dcs"]}
-        todo = [dc for dc in rb if statuses.get(dc_host[dc])]
+        # rebuild only in calm conditions: every host reachable, each reaching the other, the
+        # controller not mid-failover; one DC at a time (stress S2: a rebuild during partition
+        # flapping left a half-joined DC in a crash loop)
+        calm = all(statuses.get(h) for h in HOSTS) and all(
+            all(v.get("sh0_tcp_8444") for v in (statuses[h].get("peer_reach") or {}).values()) for h in HOSTS) \
+            and self.st["mode"] in ("healthy", "degraded")
+        todo = [dc for dc in rb if statuses.get(dc_host[dc])][:1] if calm else []
+        if rb and not calm:
+            log("rebuild_deferred", pending=sorted(rb), why="not calm (host unreachable or partition)")
         if todo:
             for dc in todo:
                 home = dc_host[dc]

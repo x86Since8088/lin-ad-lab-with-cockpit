@@ -194,11 +194,10 @@ import ldb
 lp = param.LoadParm(); lp.load_default()
 local = SamDB(url="/var/lib/samba/private/sam.ldb", lp=lp, session_info=system_session())
 inv = str(local.get_invocation_id())
-usn = int(local.search(base="", scope=ldb.SCOPE_BASE, attrs=["highestCommittedUSN"])[0]["highestCommittedUSN"][0])
 nc = str(local.get_default_basedn())
 c = credentials.Credentials(); c.guess(lp)
 c.set_username("Administrator"); c.set_password(open("/run/adminpass").read().strip()); c.set_domain(sys.argv[1])
-out = {"invocation_id": inv, "local_usn": usn, "partners": {}}
+out = {"invocation_id": inv, "partners": {}}
 for ip in sys.argv[2:]:
     try:
         p = SamDB(url="ldap://" + ip, credentials=c, lp=lp)
@@ -210,6 +209,9 @@ for ip in sys.argv[2:]:
         out["partners"][ip] = hw
     except Exception as ex:
         out["partners"][ip] = "error: %s" % str(ex)[:80]
+# the local USN is read AFTER the partners: a healthy DC's counter only grows, so a partner can
+# never look ahead of it (stress S2, 2026-11-11: reading it first gave false positives)
+out["local_usn"] = int(local.search(base="", scope=ldb.SCOPE_BASE, attrs=["highestCommittedUSN"])[0]["highestCommittedUSN"][0])
 print(json.dumps(out))
 """
 
@@ -466,13 +468,16 @@ def collect():
             cache = jread("usn_check.json", {}) or {}
             ent = cache.get(dc) or {}
             if t - ent.get("t", 0) > 60:
-                ent = {"t": t, "r": usn_rollback_check(dc)}
+                r = usn_rollback_check(dc)
+                # confirmed = this check AND the previous one (>= 60 s earlier) both saw a partner ahead
+                r["confirmed"] = bool(r.get("rollback") and (ent.get("r") or {}).get("rollback"))
+                ent = {"t": t, "r": r}
                 cache[dc] = ent
                 jwrite("usn_check.json", cache)
-                if ent["r"].get("rollback"):
-                    audit("usn_rollback_detected", dc=dc, detail=ent["r"])
-            row["usn"] = {k: ent["r"].get(k) for k in ("local_usn", "rollback", "partners_ahead")}
-        if (jread("usn_check.json", {}) or {}).get(dc, {}).get("r", {}).get("rollback"):
+                if r.get("rollback"):
+                    audit("usn_rollback_suspected" if not r["confirmed"] else "usn_rollback_detected", dc=dc, detail=r)
+            row["usn"] = {k: ent["r"].get(k) for k in ("local_usn", "rollback", "confirmed", "partners_ahead")}
+        if (jread("usn_check.json", {}) or {}).get(dc, {}).get("r", {}).get("confirmed"):
             row["usn_rollback"] = True
         dcs.append(row)
     # peer reachability, as this host sees it (feeds the controller's classifier)
@@ -967,8 +972,9 @@ def supervise(boot_t):
         why = None
         if dc in rebuild:
             why = "rebuild: %s" % rebuild[dc]
-        elif (jread("usn_check.json", {}) or {}).get(dc, {}).get("r", {}).get("rollback"):
-            why = "USN rollback detected: held for rebuild"
+        elif (jread("usn_check.json", {}) or {}).get(dc, {}).get("r", {}).get("confirmed") and \
+                dc in (jread("held.json", {}) or {}):
+            why = "USN rollback confirmed: held for rebuild"
         elif any(r in CLASS_B for r in last_roles.get(dc, [])) and not heard:
             peers_up = any(tcp_alive(ip, 389) for d, ip in c.get("all_dcs", {}).items() if d not in c["dcs"])
             if peers_up or now() - boot_t < float(T["hold_boot_s"]):
@@ -976,7 +982,16 @@ def supervise(boot_t):
         if why:
             held[dc] = why
             continue
+        starts = jread("starts.json", {}) or {}
+        recent = [x for x in starts.get(dc, []) if now() - x < 600]
+        if len(recent) >= 5:
+            held[dc] = "crash loop: %d starts in 10 min; held for an operator" % len(recent)
+            if dc not in (jread("held.json", {}) or {}):
+                audit("dc_crash_loop", dc=dc, starts=len(recent))
+            continue
         rc, out, err = run(["podman", "start", dc], timeout=60)
+        starts[dc] = recent + [now()]
+        jwrite("starts.json", starts)
         audit("dc_start", dc=dc, ok=rc == 0, err=(err or "")[:200])
     old = jread("held.json", {}) or {}
     if held != old:
@@ -985,13 +1000,37 @@ def supervise(boot_t):
             audit("dc_held", held=held)
 
 
+def quarantine_allowed(dc):
+    """Blast-radius limits for AUTOMATIC quarantine (stress S2, 2026-11-11: a false positive took
+    both of a host's DCs down). Never the host's last running DC, never more than one DC of
+    this host at once, never a DC holding an FSMO role: those raise an alert for an operator."""
+    c = conf()
+    running = [d for d in c["dcs"] if container_state(d) == "running"]
+    held = jread("held.json", {}) or {}
+    if len([d for d in running if d != dc]) < 1:
+        return False, "last running DC on this host"
+    if any(d != dc for d in held):
+        return False, "another DC of this host is already held (%s)" % ",".join(held)
+    if (jread("last_roles.json", {}) or {}).get(dc):
+        return False, "holds FSMO roles %s" % (jread("last_roles.json", {}) or {}).get(dc)
+    return True, ""
+
+
 def hold_flagged_running():
-    """A running DC that the placement flags for rebuild, or that this host detected as USN-
-    rolled-back, is stopped (it must not serve)."""
+    """A running DC that the placement flags for rebuild, or that this host CONFIRMED as USN-
+    rolled-back (within the blast-radius limits), is stopped (it must not serve)."""
     P = jread("placement.json", {}) or {}
     cache = jread("usn_check.json", {}) or {}
     for dc, ent in cache.items():
-        if ent.get("r", {}).get("rollback") and dc in conf()["dcs"] and container_state(dc) == "running":
+        if ent.get("r", {}).get("confirmed") and dc in conf()["dcs"] and container_state(dc) == "running":
+            ok, why = quarantine_allowed(dc)
+            if not ok:
+                if not ent.get("alerted"):
+                    audit("usn_rollback_needs_operator", dc=dc, why=why)
+                    ent["alerted"] = True
+                    cache[dc] = ent
+                    jwrite("usn_check.json", cache)
+                continue
             run(["podman", "stop", "-t", "10", dc], timeout=60)
             held = jread("held.json", {}) or {}
             held[dc] = "USN rollback detected: partners ahead %s" % ent["r"].get("partners_ahead")
