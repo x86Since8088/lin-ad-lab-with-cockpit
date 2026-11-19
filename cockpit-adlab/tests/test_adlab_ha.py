@@ -194,6 +194,43 @@ class TestClassBAfterTakeover(Base):
         self.assertIn("history", r["error"]["message"])
 
 
+class TestGuardrails(Base):
+    def setUp(self):
+        super().setUp()
+        with open(os.environ["ADLAB_HA_CONF"]) as f:
+            self.conf0 = json.load(f)
+        c = dict(self.conf0)
+        c["dcs"] = {"dc3": {"ip": "10.31.0.33", "state_dir": _tmp + "/dc3"},
+                    "dc4": {"ip": "10.31.0.34", "state_dir": _tmp + "/dc4"}}
+        with open(os.environ["ADLAB_HA_CONF"], "w") as f:
+            json.dump(c, f)
+
+    def tearDown(self):
+        with open(os.environ["ADLAB_HA_CONF"], "w") as f:
+            json.dump(self.conf0, f)
+        super().tearDown()
+
+    def test_never_quarantine_last_running_dc(self):
+        ha.container_state = lambda dc: "running" if dc == "dc4" else "exited"
+        ok, why = ha.quarantine_allowed("dc4")
+        self.assertFalse(ok)
+        self.assertIn("last running DC", why)
+
+    def test_never_two_held_on_one_host(self):
+        ha.jwrite("held.json", {"dc3": "x"})
+        ok, why = ha.quarantine_allowed("dc4")
+        self.assertFalse(ok)
+
+    def test_never_quarantine_a_role_holder(self):
+        ha.jwrite("last_roles.json", {"dc4": ["pdc"]})
+        ok, why = ha.quarantine_allowed("dc4")
+        self.assertFalse(ok)
+        self.assertIn("FSMO", why)
+
+    def test_allowed_otherwise(self):
+        self.assertTrue(ha.quarantine_allowed("dc4")[0])
+
+
 class TestWriterAndFence(Base):
     def test_sysvol_writer_refuses_when_placement_behind(self):
         self.place(3)
