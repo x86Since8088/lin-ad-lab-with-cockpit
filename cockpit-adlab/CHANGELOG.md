@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.21.0 - 2026-11-20
+
+AD Objects: **the selection is in the URL**, so a reload or a shared link lands
+on the same container and object.
+
+- `#/objects?ou=<container DN>&sel=<object DN>` (`ou=gpos` = the Group Policy
+  Objects folder, where `sel` is the GPO GUID). Updated with
+  `cockpit.location.replace`, so clicking around adds no Back/Forward entries.
+- Opening/closing a modal keeps it (the view state rides along in `domOpts()`);
+  a tab or forest change drops it.
+- An `ou` that no longer exists falls back to the domain root and the URL is
+  corrected.
+
 ## 1.20.0 - 2026-11-20
 
 AD Objects: **drag a row onto a tree container to move it.**
