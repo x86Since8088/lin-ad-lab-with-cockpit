@@ -271,6 +271,8 @@ input.al-el-ctl[type="checkbox"] { width: auto; }
     padding: 0.35rem 0.5rem; border: 1px solid var(--al-border); border-radius: 4px;
     background: var(--al-bg); color: var(--al-ink); font-size: 0.82rem; }
 .al-obj-chips { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.al-obj-recursive { display: inline-flex; align-items: center; gap: 0.2rem;
+    font-size: 0.8rem; white-space: nowrap; cursor: pointer; }
 .al-objtable-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; }
 table.al-objtable { border-collapse: collapse; width: max-content; min-width: 100%; }
 table.al-objtable th { position: sticky; top: 0; background: var(--al-card); z-index: 1;

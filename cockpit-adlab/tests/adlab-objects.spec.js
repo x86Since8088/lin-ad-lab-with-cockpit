@@ -92,6 +92,19 @@ test('type toggles and Advanced Features change the object set', async ({ page }
     await f.locator('.al-tree-row', { hasText: 'Users' }).first().click();
     await expect(f.locator('.al-objtable-summary')).toContainText(/object/i, { timeout: 30000 });
 
+    // a type chip toggles off and back on (1.19.2: it used to stay on)
+    const users = f.locator('.al-obj-chips button', { hasText: /^Users$/ });
+    await users.click();
+    await expect(users).toHaveAttribute('aria-pressed', 'false');
+    await users.click();
+    await expect(users).toHaveAttribute('aria-pressed', 'true');
+
+    // recursive lists the subtree with an "in" column
+    await f.locator('.al-obj-recursive input').check();
+    await expect(f.locator('table.al-objtable th', { hasText: /^in$/ })).toBeVisible({ timeout: 30000 });
+    await expect(f.locator('.al-objtable-summary')).toContainText(/and below/, { timeout: 30000 });
+    await f.locator('.al-obj-recursive input').uncheck();
+
     // Advanced Features reveals extra type chips (Containers, Printers, …)
     await f.locator('.al-obj-chips button', { hasText: 'Advanced Features' }).click();
     await expect(f.locator('.al-obj-chips button', { hasText: 'Containers' })).toBeVisible({ timeout: 15000 });

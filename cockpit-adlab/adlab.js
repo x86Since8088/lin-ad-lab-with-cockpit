@@ -180,8 +180,45 @@
         return msg;
     }
 
+    /* Console tracing. Helper FAILURES are always logged (console.warn).
+     * Every call — verb, args, time, result size — is logged at debug level
+     * when tracing is on:  localStorage "adlab.debug" = "1", or run
+     * adlabDebug(true) in this page's console (the adlab frame). Never logs
+     * stdin or result bodies; arg values whose name looks secret are masked. */
+    var DEBUG = (function () { try { return localStorage.getItem("adlab.debug") === "1"; } catch (e) { return false; } })();
+    window.adlabDebug = function (on) {
+        DEBUG = !!on;
+        try { if (on) localStorage.setItem("adlab.debug", "1"); else localStorage.removeItem("adlab.debug"); } catch (e) { /* storage blocked */ }
+        return "adlab tracing " + (DEBUG ? "on" : "off");
+    };
+    function dbg() { if (DEBUG) console.debug.apply(console, ["[adlab]"].concat([].slice.call(arguments))); }
+    function traceArgs(args) {
+        var o = {};
+        Object.keys(args || {}).forEach(function (k) {
+            o[k] = /pass|secret|token|key|pin|cred/i.test(k) ? "***" : args[k];
+        });
+        return o;
+    }
+    function resultSize(obj) {   // "count=12", "objects=40" … — shape, not content
+        if (!obj || typeof obj !== "object") return typeof obj;
+        if (typeof obj.count === "number") return "count=" + obj.count + (obj.truncated ? " (truncated)" : "");
+        var k = Object.keys(obj).filter(function (x) { return Array.isArray(obj[x]); })[0];
+        return k ? k + "=" + obj[k].length : "keys=" + Object.keys(obj).length;
+    }
+
     /* One verb call. args = {name: value}; stdinData travels on stdin. */
     function run(verb, args, stdinData) {
+        var t0 = Date.now(), targs = traceArgs(args);
+        dbg("→", verb, targs);
+        return runRaw(verb, args, stdinData).then(function (obj) {
+            dbg("←", verb, (Date.now() - t0) + "ms", resultSize(obj));
+            return obj;
+        }, function (err) {
+            console.warn("[adlab] " + verb + " failed after " + (Date.now() - t0) + "ms:", String(err), targs);
+            throw err;
+        });
+    }
+    function runRaw(verb, args, stdinData) {
         var argv = [HELPER];
         // The domain selector scopes every non-global verb onto the chosen
         // forest via the helper's global --domain option (valid before the verb).
@@ -840,7 +877,7 @@
     // AD Objects console. The \0 prefix guarantees it never collides with a DN.
     var GPO_NODE = " GPOs";
     var aduc = {
-        base: null, classes: null, advanced: false, search: "",
+        base: null, classes: null, advanced: false, search: "", recursive: false,
         extraCols: ["description"], selected: null, previewMode: "tabs",
         treeFilter: "", expanded: {}, treeWidth: 300, nodes: [], schemaCache: {},
         gpoSel: null, gpoList: null,   // GPO folder: selected GUID + cached gpo-list
@@ -972,19 +1009,34 @@
         // ---- middle: toolbar + object table ----------------------------
         var toolbar = el("div", "al-obj-toolbar");
         var searchIn = el("input", "al-obj-search"); searchIn.type = "search";
-        searchIn.placeholder = "search this container…"; searchIn.value = aduc.search;
+        function searchHint() {
+            searchIn.placeholder = aduc.recursive ? "search this container and below…" : "search this container…";
+        }
+        searchHint(); searchIn.value = aduc.search;
         var searchT;
         searchIn.addEventListener("input", function () {
             aduc.search = searchIn.value; clearTimeout(searchT); searchT = setTimeout(loadList, 250);
         });
         toolbar.appendChild(searchIn);
+        // Recursive: list/search the whole subtree under the selected container
+        // (scope=sub) instead of its direct children, with an "in" column.
+        var recLbl = el("label", "al-obj-recursive");
+        recLbl.title = "include objects in sub-containers";
+        var recCb = el("input"); recCb.type = "checkbox"; recCb.checked = aduc.recursive;
+        recCb.addEventListener("change", function () { aduc.recursive = recCb.checked; searchHint(); loadList(); });
+        recLbl.appendChild(recCb); recLbl.appendChild(document.createTextNode(" recursive"));
+        toolbar.appendChild(recLbl);
         var chipRow = el("div", "al-obj-chips");
         function drawChips() {
             clear(chipRow);
             OBJ_TOGGLES.concat(aduc.advanced ? OBJ_TOGGLES_ADV : []).forEach(function (t) {
                 var on = !!aduc.classes[t[0]];
                 var b = el("button", "al-chip" + (on ? " on" : ""), t[1]); b.type = "button";
-                b.addEventListener("click", function () { aduc.classes[t[0]] = !on; loadList(); });
+                b.setAttribute("aria-pressed", on ? "true" : "false");
+                b.title = (on ? "hide " : "show ") + t[1].toLowerCase();
+                b.addEventListener("click", function () {
+                    aduc.classes[t[0]] = !aduc.classes[t[0]]; drawChips(); loadList();
+                });
                 chipRow.appendChild(b);
             });
             var adv = el("button", "al-chip" + (aduc.advanced ? " on" : ""), "Advanced Features"); adv.type = "button";
@@ -1008,16 +1060,41 @@
         var summary = el("div", "al-objtable-summary", "");
         objPane.appendChild(tableWrap); objPane.appendChild(summary);
 
-        function columns() { return ["name", "class"].concat(aduc.extraCols); }
+        // Only the newest listing may draw: tree clicks, chips and search all
+        // start a list, and an older (slower) reply landing last used to paint
+        // the previous container's objects — or its empty list — under the
+        // newly selected one.
+        var listSeq = 0;
+        function columns() {
+            return ["name", "class"].concat(aduc.recursive ? ["in"] : [], aduc.extraCols);
+        }
+        // Where an object sits below the listed container: its parent's RDN
+        // path relative to the base ("Sales/East"), or "." for a direct child.
+        function relPath(dn) {
+            var p = dnParent(dn), base = aduc.base || "";
+            if (p.toLowerCase() === base.toLowerCase()) return ".";
+            var rel = p.toLowerCase().slice(-base.length - 1) === ("," + base).toLowerCase()
+                ? p.slice(0, p.length - base.length - 1) : p;
+            return rel.split(/,(?=[A-Za-z]+=)/).map(dnRdn).reverse().join("/");
+        }
         function loadList() {
-            if (aduc.base === GPO_NODE) { loadGpoList(); return; }
+            var seq = ++listSeq;
+            if (aduc.base === GPO_NODE) { loadGpoList(seq); return; }
             if (!aduc.base) { clear(tableWrap); tableWrap.appendChild(el("div", "hint", "select a container in the tree")); summary.textContent = ""; return; }
             clear(tableWrap); tableWrap.appendChild(el("div", "al-loading", "listing objects…"));
             var classes = aducActiveClasses();
-            run("object-list", {
-                base: aduc.base, scope: "one", classes: classes.join(","),
+            if (!classes.length) {   // every type chip toggled off: nothing to show
+                clear(tableWrap);
+                tableWrap.appendChild(el("div", "hint", "no object types selected — turn on a type chip above"));
+                summary.textContent = "0 objects · " + dnRdn(aduc.base); return;
+            }
+            var listArgs = {
+                base: aduc.base, scope: aduc.recursive ? "sub" : "one", classes: classes.join(","),
                 search: aduc.search, attrs: aduc.extraCols.join(","),
-            }).then(function (r) {
+            };
+            if (aduc.recursive && !aduc.advanced) listArgs.hide_advanced = "yes";
+            run("object-list", listArgs).then(function (r) {
+                if (seq !== listSeq) { dbg("object-list: dropped stale reply", seq, "<", listSeq, listArgs.base); return; }
                 clear(tableWrap);
                 var t = el("table", "al al-objtable");
                 var hr = el("tr");
@@ -1027,7 +1104,8 @@
                 (r.objects || []).forEach(function (o) {
                     var tr = el("tr", aduc.selected === o.dn ? "sel" : "");
                     columns().forEach(function (c) {
-                        var v = c === "name" ? o.name : c === "class" ? o.class : (o.attrs[c] || "");
+                        var v = c === "name" ? o.name : c === "class" ? o.class
+                            : c === "in" ? relPath(o.dn) : (o.attrs[c] || "");
                         tr.appendChild(el("td", null, v));
                     });
                     tr.addEventListener("click", function () {
@@ -1052,8 +1130,9 @@
                 });
                 tableWrap.appendChild(t);
                 summary.textContent = r.count + " object" + (r.count === 1 ? "" : "s") +
-                    (r.truncated ? " (truncated)" : "") + " · " + dnRdn(aduc.base);
-            }).catch(function (e) { clear(tableWrap); tableWrap.appendChild(el("div", "al-alert err", String(e))); });
+                    (r.truncated ? " (truncated)" : "") + " · " + dnRdn(aduc.base) +
+                    (aduc.recursive ? " and below" : "");
+            }).catch(function (e) { if (seq !== listSeq) return; clear(tableWrap); tableWrap.appendChild(el("div", "al-alert err", String(e))); });
         }
         aducReload = function () { loadList(); drawPreview(); };
         aducSelect = function (dn) {   // jump the preview to a referenced object
@@ -1104,10 +1183,12 @@
                 { label: "Refresh", onClick: function () { loadGpoList(); } },
             ]);
         }
-        function loadGpoList() {
+        function loadGpoList(seq) {
+            if (seq === undefined) seq = ++listSeq;
             clear(tableWrap); tableWrap.appendChild(el("div", "al-loading", "listing GPOs…"));
             summary.textContent = "";
             run("gpo-list").then(function (r) {
+                if (seq !== listSeq) return;
                 aduc.gpoList = r.gpos || [];
                 clear(tableWrap);
                 var t = el("table", "al al-objtable");
@@ -1137,7 +1218,7 @@
                 tableWrap.appendChild(t);
                 summary.textContent = aduc.gpoList.length + " GPO" + (aduc.gpoList.length === 1 ? "" : "s") +
                     (r.pdc_emulator ? " · " + r.pdc_emulator : "");
-            }).catch(function (e) { clear(tableWrap); tableWrap.appendChild(el("div", "al-alert err", String(e))); });
+            }).catch(function (e) { if (seq !== listSeq) return; clear(tableWrap); tableWrap.appendChild(el("div", "al-alert err", String(e))); });
         }
         function drawGpoPreview() {
             clear(prevPane);
