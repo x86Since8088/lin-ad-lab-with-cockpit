@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.19.2 - 2026-11-19
+
+AD Objects console: filter chips, recursive search, stale lists, console tracing.
+
+- **Type chips toggle.** A chip click changed the filter but never redrew the
+  chips, and the handler kept the stale state, so a chip could not be turned
+  back on and never looked off. Chips now redraw on each click (`aria-pressed`
+  set). With every chip off the list is empty, not the helper's default classes.
+- **recursive** checkbox next to the search box: `scope=sub` under the selected
+  container, with an **in** column (path below it); hides advanced-view-only
+  objects unless Advanced Features is on.
+- **Fixed: the object table went empty or wrong after a few tree clicks.**
+  Every click starts a listing, and an older, slower reply landing last painted
+  the previous container's objects (often an empty list) under the newly
+  selected one. Only the newest listing may draw now (`listSeq`); the GPO
+  folder listing has the same guard. Reproduced and verified in a stub harness
+  with random reply latency.
+- **Console tracing:** helper failures always log `[adlab] <verb> failed …`;
+  `adlabDebug(true)` (or `localStorage["adlab.debug"]="1"`) traces every call:
+  verb, masked args, time and result size, plus dropped stale replies.
+
 ## 1.19.1 - 2026-11-11
 
 Object picker: hide system objects by default, as ADUC does.

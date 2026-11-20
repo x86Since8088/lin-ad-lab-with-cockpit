@@ -31,6 +31,27 @@ single `route()` renders from the URL; tabs and modals are deep-linkable and the
 browser Back/Forward buttons move through them. The tab body re-renders only
 when the path tab changes, so opening or closing a modal never tears it down.
 
+## AD Objects console filters
+
+The object list under the tree has an **object-type chip** per class (Users,
+Groups, Computers, Contacts, OUs; Containers, Printers and Shared folders with
+Advanced Features). A chip toggles on and off, and only the classes that are on
+are listed; with every chip off the list is empty. **recursive** (next to the
+search box) lists and searches the whole subtree under the selected container
+(`object-list --scope sub`) and adds an **in** column, the object's path below
+that container. Without Advanced Features a recursive listing hides
+`showInAdvancedViewOnly` objects, as ADUC does.
+
+## Console tracing
+
+Helper failures are always logged to the browser console as
+`[adlab] <verb> failed after <n>ms`. For a trace of every call (verb, args, time,
+result size) run `adlabDebug(true)` in the console with the **adlab frame**
+selected (Firefox: the iframe picker; Chrome: the context drop-down), or set
+`localStorage["adlab.debug"] = "1"`; `adlabDebug(false)` turns it off. The trace
+never includes stdin or result bodies, and masks argument values whose name looks
+secret (pass, secret, token, key, pin, cred).
+
 ## Object pickers (schema-driven)
 
 Every place that names a directory object (a member, a manager, an account, a
