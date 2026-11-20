@@ -250,5 +250,67 @@ class TestWriterAndFence(Base):
         self.assertLessEqual(rec["expires_local"], time.time() + 61)   # skew can only shorten a lease
 
 
+class TestCollectorNeverBlocks(Base):
+    """Stress pass 1: failover classification median ~130 s (floor ~50 s) because the
+    survivor's collector waited on LDAP to the dead host's DCs inside the USN probe."""
+
+    def setUp(self):
+        super().setUp()
+        self.saved = {k: getattr(ha, k) for k in ("tcp_alive", "run", "repl_summary", "chrony_state",
+                                                  "sysvol_hash", "capacity", "usn_rollback_check")}
+        self.probed = []
+        ha.repl_summary = lambda dc: []
+        ha.chrony_state = lambda dc: (0, 0.0)
+        ha.sysvol_hash = lambda p: "h"
+        ha.capacity = lambda: {}
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(ha, k, v)
+        super().tearDown()
+
+    def test_usn_probe_skips_unreachable_partners(self):
+        ha.tcp_alive = lambda ip, port, timeout=1.0: False      # dc1's host is dead
+
+        def no_run(argv, timeout=60, inp=None):
+            self.probed.append(argv)
+            return 0, "", ""
+        ha.run = no_run
+        r = ha.usn_rollback_check("dc3")
+        self.assertEqual(self.probed, [])                       # no probe at all, so no wait
+        self.assertFalse(r["rollback"])
+        self.assertEqual(r["unreachable"], ["10.31.0.17"])
+
+    def test_usn_probe_only_live_partners(self):
+        ha.tcp_alive = lambda ip, port, timeout=1.0: True
+
+        def fake_run(argv, timeout=60, inp=None):
+            self.probed.append(argv)
+            return 0, json.dumps({"invocation_id": "x", "partners": {"10.31.0.17": 5}, "local_usn": 9}), ""
+        ha.run = fake_run
+        r = ha.usn_rollback_check("dc3")
+        self.assertEqual(self.probed[0][-1], "10.31.0.17")
+        self.assertFalse(r["rollback"])
+
+    def test_collect_never_runs_the_usn_probe(self):
+        ha.tcp_alive = lambda ip, port, timeout=1.0: False
+
+        def boom(dc):
+            raise AssertionError("collect() must only read the USN cache")
+        ha.usn_rollback_check = boom
+        t0 = time.time()
+        st = ha.collect()
+        self.assertLess(time.time() - t0, 5)
+        self.assertIn("collect_ms", st)
+
+    def test_usn_cycle_needs_two_checks_to_confirm(self):
+        ha.usn_rollback_check = lambda dc: {"rollback": True, "partners_ahead": {"10.31.0.17": 99}, "local_usn": 1}
+        c1 = ha.usn_cycle(min_gap_s=0)
+        self.assertFalse(c1["dc3"]["r"]["confirmed"])
+        time.sleep(0.01)
+        ha.usn_cycle(min_gap_s=0)
+        self.assertTrue(ha.jread("usn_check.json")["dc3"]["r"]["confirmed"])
+
+
 if __name__ == "__main__":
     unittest.main()
