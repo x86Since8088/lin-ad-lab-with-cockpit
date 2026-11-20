@@ -257,13 +257,32 @@
     /* The selected forest lives in the URL (?domain=<realm>) so it is
      * deep-linkable and survives Back/Forward/reload. domOpts() carries it onto
      * every navigation; the primary forest is the absence of the param. */
+    /* Per-tab VIEW state that belongs in the URL too (AD Objects: ?ou=<container
+     * DN>&sel=<object DN>), so a reload or a shared link lands on the same
+     * selection. Carried on every navigation within the tab (opening/closing a
+     * modal keeps it); dropped on a tab or forest change. */
+    var viewOpts = {};
     function domOpts(extra) {
         var o = {};
+        Object.keys(viewOpts).forEach(function (k) { o[k] = viewOpts[k]; });
         if (extra) Object.keys(extra).forEach(function (k) { o[k] = extra[k]; });
         if (currentDomain) o.domain = currentDomain;
         return o;
     }
-    function goTab(tab) { nav([tab], domOpts()); }
+    function goTab(tab) { viewOpts = {}; nav([tab], domOpts()); }
+    /* Replace (no new history entry) the view state of the current tab, keeping
+     * the forest and any open modal stack. */
+    function setViewOpts(o) {
+        var same = Object.keys(o).length === Object.keys(viewOpts).length &&
+            Object.keys(o).every(function (k) { return viewOpts[k] === o[k]; });
+        viewOpts = o;
+        if (same) return;
+        var cur = (cockpit.location && cockpit.location.options) || {}, keep = {};
+        if (cur.modal !== undefined) { keep.modal = cur.modal; keep.target = cur.target; }
+        var opts = domOpts(keep);
+        if (cockpit.location.replace) cockpit.location.replace([currentTab], opts);
+        else nav([currentTab], opts);
+    }
 
     /* The modal STACK lives in the URL as parallel arrays: each open modal is
      * a (modal, target) pair, so the URL reads
@@ -755,6 +774,7 @@
             // Update the URL (deep-linkable, Back/Forward-aware); route() re-renders
             // and drops any open modal, whose target may reference the old forest.
             currentDomain = sel.value || null;
+            viewOpts = {};   // DNs of the old forest mean nothing in the new one
             nav([currentTab], domOpts());
         });
         host.appendChild(sel);
@@ -912,6 +932,15 @@
     }
 
     function renderObjects() {
+        // A deep link / reload names the container (?ou=) and selection (?sel=):
+        // it wins over the in-memory state. "gpos" = the Group Policy Objects folder.
+        var lo = (cockpit.location && cockpit.location.options) || {};
+        if (lo.ou) {
+            aduc.base = lo.ou === "gpos" ? GPO_NODE : String(lo.ou);
+            aduc.selected = null; aduc.gpoSel = null;
+            if (lo.sel && aduc.base === GPO_NODE) aduc.gpoSel = String(lo.sel);
+            else if (lo.sel) { aduc.selected = String(lo.sel); aduc.selectedName = dnRdn(aduc.selected); aduc.selectedSam = null; }
+        }
         if (!aduc.classes) {
             aduc.classes = {};
             OBJ_TOGGLES.forEach(function (t) { aduc.classes[t[0]] = true; });
@@ -976,7 +1005,6 @@
                 drawTree(); loadList(); drawPreview();
             });
             if (!node.synthetic) {   // real directory objects get the object context menu
-                wireDrop(row, dn);
                 row.addEventListener("contextmenu", function (ev) { ev.preventDefault(); treeNodeMenu(node, ev.clientX, ev.clientY); });
                 var tkeb = el("button", "al-kebab", "⋯"); tkeb.type = "button"; tkeb.title = "actions";
                 tkeb.addEventListener("click", function (ev) { ev.stopPropagation(); var b = tkeb.getBoundingClientRect(); treeNodeMenu(node, b.right, b.bottom); });
@@ -984,80 +1012,6 @@
             }
             treeHost.appendChild(row);
             if (kids.length && open) kids.forEach(function (c) { drawNode(c.dn, depth + 1); });
-        }
-        // ---- drag a table row onto a tree container -> move confirmation ----
-        // The drag payload lives here (dragover cannot read dataTransfer data).
-        var dragObj = null;
-        function dnLower(x) { return String(x || "").toLowerCase(); }
-        function canDropOn(target) {
-            if (!dragObj || !target) return false;
-            var src = dnLower(dragObj.dn), t = dnLower(target);
-            if (t === src) return false;                                    // onto itself
-            if (t.slice(-src.length - 1) === "," + src) return false;       // into its own subtree
-            return dnLower(dnParts(dragObj.dn).slice(1).join(",")) !== t;  // already there
-        }
-        function wireDrop(row, dn) {
-            row.addEventListener("dragover", function (ev) {
-                if (!canDropOn(dn)) return;
-                ev.preventDefault(); ev.dataTransfer.dropEffect = "move";
-                row.classList.add("al-drop-ok");
-            });
-            row.addEventListener("dragleave", function () { row.classList.remove("al-drop-ok"); });
-            row.addEventListener("drop", function (ev) {
-                row.classList.remove("al-drop-ok");
-                if (!canDropOn(dn)) return;
-                ev.preventDefault();
-                var o = dragObj; dragObj = null;
-                movePrompt(o, dn);
-            });
-        }
-        function wireDrag(tr, o) {
-            tr.draggable = true;
-            tr.addEventListener("dragstart", function (ev) {
-                dragObj = { dn: o.dn, name: o.name, class: o.class };
-                ev.dataTransfer.effectAllowed = "move";
-                try { ev.dataTransfer.setData("text/plain", o.dn); } catch (e) { /* some browsers */ }
-                tr.classList.add("al-dragging");
-                treeHost.classList.add("al-drop-zone");
-            });
-            tr.addEventListener("dragend", function () {
-                tr.classList.remove("al-dragging"); treeHost.classList.remove("al-drop-zone");
-                [].forEach.call(treeHost.querySelectorAll(".al-drop-ok"), function (x) { x.classList.remove("al-drop-ok"); });
-                setTimeout(function () { dragObj = null; }, 0);
-            });
-        }
-        function movePrompt(o, target) {
-            var rdn = dnParts(o.dn)[0], nd = rdn + "," + target;
-            var tnode = aduc.byDn[target];
-            transientModal("Move object", function (box, close) {
-                box.appendChild(el("div", null, "Move " + (o.class || "object") + " "))
-                    .appendChild(el("strong", null, o.name || dnRdn(o.dn)));
-                var tbl = el("table", "al");
-                [["from", dnParts(o.dn).slice(1).join(",")], ["to", target], ["new DN", nd]].forEach(function (r) {
-                    var tr = el("tr"); tr.appendChild(el("th", null, r[0]));
-                    var td = el("td"); td.appendChild(el("kbd", "al", r[1])); tr.appendChild(td); tbl.appendChild(tr);
-                });
-                box.appendChild(tbl);
-                if (o.class === "organizationalUnit" || o.class === "container")
-                    box.appendChild(el("div", "al-alert warn", "Everything inside it moves too."));
-                var msg = el("span", "hint", "");
-                var bar = el("div", "row al-modal-actions");
-                var ok = el("button", "al-btn", "Move to " + (tnode ? tnode.name : dnRdn(target)));
-                var cancel = el("button", "al-btn secondary", "Cancel");
-                cancel.addEventListener("click", close);
-                ok.addEventListener("click", function () {
-                    ok.disabled = true; msg.textContent = " moving…";
-                    run("object-rename", { dn: o.dn, new_dn: nd }).then(function () {
-                        if (aduc.selected === o.dn) { aduc.selected = nd; }
-                        close();
-                        // a moved container changes the tree; a leaf only the lists
-                        if (o.class === "organizationalUnit" || o.class === "container") loadTree();
-                        else { loadList(); drawPreview(); }
-                    }).catch(function (e) { ok.disabled = false; msg.textContent = " " + e; });
-                });
-                bar.appendChild(ok); bar.appendChild(cancel); bar.appendChild(msg); box.appendChild(bar);
-                setTimeout(function () { ok.focus(); }, 0);
-            });
         }
         function drawTree() {
             clear(treeHost);
@@ -1076,8 +1030,10 @@
                                   name: "Group Policy Objects", class: "gpoFolder", synthetic: true });
                 aduc.byDn = {}; aduc.nodes.forEach(function (n) { aduc.byDn[n.dn] = n; });
                 aduc.rootBase = r.base;   // the domain root DN (its children are the tree roots)
-                if (!aduc.base || !aduc.byDn[aduc.base]) aduc.base = r.base;
-                drawTree(); loadList();
+                if (!aduc.base || (!aduc.byDn[aduc.base] && aduc.base !== GPO_NODE)) {
+                    aduc.base = r.base; aduc.selected = null;   // a stale/foreign ?ou= falls back to the root
+                }
+                drawTree(); loadList(); drawPreview();
             }).catch(function (e) { clear(treeHost); treeHost.appendChild(el("div", "al-alert err", String(e))); });
         }
 
@@ -1190,7 +1146,6 @@
                         tr.className = "sel"; drawPreview();
                     });
                     tr.addEventListener("dblclick", function () { openModal("object-edit", { target: o.dn }); });
-                    wireDrag(tr, o);
                     function selectRow() {
                         aduc.selected = o.dn; aduc.selectedName = o.name; aduc.selectedClass = o.class;
                         aduc.selectedSam = (o.attrs && o.attrs.sAMAccountName) || o.name;
@@ -1440,7 +1395,15 @@
         }
 
         // ---- right: docked preview + actions ---------------------------
+        function syncObjectsUrl() {   // every selection change ends in drawPreview()
+            if (currentTab !== "objects" || !aduc.base) return;
+            var o = { ou: aduc.base === GPO_NODE ? "gpos" : aduc.base };
+            var sel = aduc.base === GPO_NODE ? aduc.gpoSel : aduc.selected;
+            if (sel) o.sel = sel;
+            setViewOpts(o);
+        }
         function drawPreview() {
+            syncObjectsUrl();
             if (aduc.base === GPO_NODE) { drawGpoPreview(); return; }
             clear(prevPane);
             var hdr = el("div", "al-prev-hdr");

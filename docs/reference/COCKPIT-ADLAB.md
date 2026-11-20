@@ -42,6 +42,10 @@ search box) lists and searches the whole subtree under the selected container
 that container. Without Advanced Features a recursive listing hides
 `showInAdvancedViewOnly` objects, as ADUC does.
 
+**Selection in the URL:** `#/objects?ou=<container DN>&sel=<object DN>`
+(`ou=gpos` for the Group Policy Objects folder) — reload and deep links keep the
+selected container and object; it is replaced in place, not pushed to history.
+
 **Drag to move:** drag a row from the object list onto a container in the tree
 to move it. A confirmation shows the old and new DN before anything changes;
 the object's current parent, the object itself and its own subtree are not
