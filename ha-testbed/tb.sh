@@ -203,7 +203,7 @@ EOF
   start_all
 }
 cmd_snapshots() { root_job "adlha-snapshots" 120 <<EOF
-for v in $(all_vms | tr '\n' ' '); do echo "== \$v"; qemu-img snapshot -l $TB_IMG_DIR/\$v.qcow2 | tail -n +3; done
+for v in $(all_vms | tr '\n' ' '); do echo "== \$v"; qemu-img snapshot -l -U $TB_IMG_DIR/\$v.qcow2 | tail -n +3; done
 EOF
 }
 cmd_revert() {
@@ -211,7 +211,7 @@ cmd_revert() {
   stop_all
   root_job "adlha-revert" 600 <<EOF
 set -Eeuo pipefail
-for v in $(all_vms | tr '\n' ' '); do qemu-img snapshot -l $TB_IMG_DIR/\$v.qcow2 | grep -qw "$name" || { echo "\$v has no snapshot $name"; exit 3; }; done
+for v in $(all_vms | tr '\n' ' '); do qemu-img snapshot -l -U $TB_IMG_DIR/\$v.qcow2 | grep -qw "$name" || { echo "\$v has no snapshot $name"; exit 3; }; done
 for v in $(all_vms | tr '\n' ' '); do qemu-img snapshot -a "$name" $TB_IMG_DIR/\$v.qcow2 && echo "reverted \$v to $name"; done
 EOF
   start_all
