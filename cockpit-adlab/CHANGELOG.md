@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.21.1 - 2026-11-20
+
+**Fix: 1.21.0 dropped the 1.20.0 drag-to-move feature.** Its `adlab.js` was
+edited from a 1.19.2 copy and replaced the 1.20.0 file wholesale. This release
+is a three-way merge of both changes (drag to move + selection in the URL); the
+only lines removed relative to 1.20.0 are the three the URL change replaces.
+
 ## 1.21.0 - 2026-11-20
 
 AD Objects: **the selection is in the URL**, so a reload or a shared link lands
