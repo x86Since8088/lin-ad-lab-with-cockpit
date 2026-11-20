@@ -213,6 +213,10 @@ kbd.al { background: var(--al-code-bg); border: 1px solid var(--al-border);
     font-size: 0.85rem; cursor: pointer; white-space: nowrap; }
 .al-tree-row:hover { background: var(--al-code-bg); }
 .al-tree-row.sel { background: var(--al-accent-soft); }
+.al-drop-zone .al-tree-row:not(.al-drop-ok) { opacity: .85; }
+.al-tree-row.al-drop-ok { background: var(--al-accent-soft); outline: 2px dashed var(--al-accent); outline-offset: -2px; }
+table.al-objtable tr[draggable="true"] { cursor: grab; }
+table.al-objtable tr.al-dragging { opacity: .5; }
 .al-tree-tog { display: inline-block; width: 1rem; text-align: center; color: var(--al-sub); }
 .al-tree-label { overflow: hidden; text-overflow: ellipsis; }
 

@@ -42,6 +42,11 @@ search box) lists and searches the whole subtree under the selected container
 that container. Without Advanced Features a recursive listing hides
 `showInAdvancedViewOnly` objects, as ADUC does.
 
+**Drag to move:** drag a row from the object list onto a container in the tree
+to move it. A confirmation shows the old and new DN before anything changes;
+the object's current parent, the object itself and its own subtree are not
+drop targets.
+
 ## Console tracing
 
 Helper failures are always logged to the browser console as

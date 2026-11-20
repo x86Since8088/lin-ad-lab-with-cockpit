@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.20.0 - 2026-11-20
+
+AD Objects: **drag a row onto a tree container to move it.**
+
+- Rows in the object table are draggable; a tree container (OU, container or
+  the domain) highlights as a drop target. Refused targets: the object's
+  current parent, the object itself, anything inside it, and the Group Policy
+  Objects folder.
+- A drop opens a **Move object** confirmation (from, to, new DN; a warning that
+  an OU's or container's contents move with it). Nothing moves until you
+  confirm; it runs the same `object-rename` as Rename / move.
+- After a move a container reloads the tree, a leaf the list and preview.
+
 ## 1.19.2 - 2026-11-19
 
 AD Objects console: filter chips, recursive search, stale lists, console tracing.

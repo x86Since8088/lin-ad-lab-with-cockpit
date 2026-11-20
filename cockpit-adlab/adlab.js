@@ -976,6 +976,7 @@
                 drawTree(); loadList(); drawPreview();
             });
             if (!node.synthetic) {   // real directory objects get the object context menu
+                wireDrop(row, dn);
                 row.addEventListener("contextmenu", function (ev) { ev.preventDefault(); treeNodeMenu(node, ev.clientX, ev.clientY); });
                 var tkeb = el("button", "al-kebab", "⋯"); tkeb.type = "button"; tkeb.title = "actions";
                 tkeb.addEventListener("click", function (ev) { ev.stopPropagation(); var b = tkeb.getBoundingClientRect(); treeNodeMenu(node, b.right, b.bottom); });
@@ -983,6 +984,80 @@
             }
             treeHost.appendChild(row);
             if (kids.length && open) kids.forEach(function (c) { drawNode(c.dn, depth + 1); });
+        }
+        // ---- drag a table row onto a tree container -> move confirmation ----
+        // The drag payload lives here (dragover cannot read dataTransfer data).
+        var dragObj = null;
+        function dnLower(x) { return String(x || "").toLowerCase(); }
+        function canDropOn(target) {
+            if (!dragObj || !target) return false;
+            var src = dnLower(dragObj.dn), t = dnLower(target);
+            if (t === src) return false;                                    // onto itself
+            if (t.slice(-src.length - 1) === "," + src) return false;       // into its own subtree
+            return dnLower(dnParts(dragObj.dn).slice(1).join(",")) !== t;  // already there
+        }
+        function wireDrop(row, dn) {
+            row.addEventListener("dragover", function (ev) {
+                if (!canDropOn(dn)) return;
+                ev.preventDefault(); ev.dataTransfer.dropEffect = "move";
+                row.classList.add("al-drop-ok");
+            });
+            row.addEventListener("dragleave", function () { row.classList.remove("al-drop-ok"); });
+            row.addEventListener("drop", function (ev) {
+                row.classList.remove("al-drop-ok");
+                if (!canDropOn(dn)) return;
+                ev.preventDefault();
+                var o = dragObj; dragObj = null;
+                movePrompt(o, dn);
+            });
+        }
+        function wireDrag(tr, o) {
+            tr.draggable = true;
+            tr.addEventListener("dragstart", function (ev) {
+                dragObj = { dn: o.dn, name: o.name, class: o.class };
+                ev.dataTransfer.effectAllowed = "move";
+                try { ev.dataTransfer.setData("text/plain", o.dn); } catch (e) { /* some browsers */ }
+                tr.classList.add("al-dragging");
+                treeHost.classList.add("al-drop-zone");
+            });
+            tr.addEventListener("dragend", function () {
+                tr.classList.remove("al-dragging"); treeHost.classList.remove("al-drop-zone");
+                [].forEach.call(treeHost.querySelectorAll(".al-drop-ok"), function (x) { x.classList.remove("al-drop-ok"); });
+                setTimeout(function () { dragObj = null; }, 0);
+            });
+        }
+        function movePrompt(o, target) {
+            var rdn = dnParts(o.dn)[0], nd = rdn + "," + target;
+            var tnode = aduc.byDn[target];
+            transientModal("Move object", function (box, close) {
+                box.appendChild(el("div", null, "Move " + (o.class || "object") + " "))
+                    .appendChild(el("strong", null, o.name || dnRdn(o.dn)));
+                var tbl = el("table", "al");
+                [["from", dnParts(o.dn).slice(1).join(",")], ["to", target], ["new DN", nd]].forEach(function (r) {
+                    var tr = el("tr"); tr.appendChild(el("th", null, r[0]));
+                    var td = el("td"); td.appendChild(el("kbd", "al", r[1])); tr.appendChild(td); tbl.appendChild(tr);
+                });
+                box.appendChild(tbl);
+                if (o.class === "organizationalUnit" || o.class === "container")
+                    box.appendChild(el("div", "al-alert warn", "Everything inside it moves too."));
+                var msg = el("span", "hint", "");
+                var bar = el("div", "row al-modal-actions");
+                var ok = el("button", "al-btn", "Move to " + (tnode ? tnode.name : dnRdn(target)));
+                var cancel = el("button", "al-btn secondary", "Cancel");
+                cancel.addEventListener("click", close);
+                ok.addEventListener("click", function () {
+                    ok.disabled = true; msg.textContent = " moving…";
+                    run("object-rename", { dn: o.dn, new_dn: nd }).then(function () {
+                        if (aduc.selected === o.dn) { aduc.selected = nd; }
+                        close();
+                        // a moved container changes the tree; a leaf only the lists
+                        if (o.class === "organizationalUnit" || o.class === "container") loadTree();
+                        else { loadList(); drawPreview(); }
+                    }).catch(function (e) { ok.disabled = false; msg.textContent = " " + e; });
+                });
+                bar.appendChild(ok); bar.appendChild(cancel); bar.appendChild(msg); box.appendChild(bar);
+                setTimeout(function () { ok.focus(); }, 0);
+            });
         }
         function drawTree() {
             clear(treeHost);
@@ -1115,6 +1190,7 @@
                         tr.className = "sel"; drawPreview();
                     });
                     tr.addEventListener("dblclick", function () { openModal("object-edit", { target: o.dn }); });
+                    wireDrag(tr, o);
                     function selectRow() {
                         aduc.selected = o.dn; aduc.selectedName = o.name; aduc.selectedClass = o.class;
                         aduc.selectedSam = (o.attrs && o.attrs.sAMAccountName) || o.name;
