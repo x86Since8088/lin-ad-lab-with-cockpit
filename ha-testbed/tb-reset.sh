@@ -49,7 +49,10 @@ echo "== auth load"
 "$HERE/tb-load.sh" start >/dev/null 2>&1 && echo loadgen started
 echo "== controller: fresh state, detached"
 rm -rf "$SIM_STATE"; mkdir -p "$SIM_STATE"
-( cd "$HERE" && setsid python3 -u ha-sim.py run --timers stress >>"$SIM_STATE/controller.log" 2>&1 < /dev/null & )
+# the WHOLE subshell gets the log as stdout/stderr and execs the controller: with only the python
+# command redirected, the backgrounded `cd && setsid …` list kept this script's stdout open, so a
+# caller piping tb-reset.sh (… | grep) never saw EOF (2026-11-19: the S1 sample after it never ran)
+( cd "$HERE" && exec setsid python3 -u ha-sim.py run --timers stress ) >>"$SIM_STATE/controller.log" 2>&1 < /dev/null &
 for i in $(seq 1 60); do
   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["mode"]=="healthy" else 1)' "$SIM_STATE/state.json" 2>/dev/null && break
   sleep 5
