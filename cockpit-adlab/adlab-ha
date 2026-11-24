@@ -163,25 +163,47 @@ def fsmo_owners_remote(via_dc):
     return None, None
 
 
+# repsFrom read straight from the local sam.ldb (no DRS RPC): `samba-tool drs showrepl` is an
+# RPC to the local samba, which stalls for its whole 40 s timeout while samba is busy failing
+# replication to a dead partner — the survivor's collector took 30-85 s per pass during S1
+# faults (2026-11-23). Same rows as showrepl (checked on dc1: identical NC/partner/failures).
+REPL_PROBE = r"""
+import json
+from samba import param
+from samba.samdb import SamDB
+from samba.auth import system_session
+from samba.ndr import ndr_unpack
+from samba.dcerpc import drsblobs
+import ldb
+lp = param.LoadParm(); lp.load_default()
+db = SamDB(url="/var/lib/samba/private/sam.ldb", lp=lp, session_info=system_session())
+dsa = db.get_dsServiceName()
+m = db.search(base=dsa, scope=ldb.SCOPE_BASE, attrs=["msDS-hasMasterNCs", "hasMasterNCs"])[0]
+ncs = sorted(set(str(x) for a in ("msDS-hasMasterNCs", "hasMasterNCs") for x in m.get(a, [])))
+names = {}
+for r in db.search(base=str(db.get_config_basedn()), scope=ldb.SCOPE_SUBTREE,
+                   expression="(objectClass=nTDSDSA)", attrs=["objectGUID"]):
+    guid = str(ndr_unpack(__import__("samba.dcerpc.misc", fromlist=["GUID"]).GUID, r["objectGUID"][0]))
+    names[guid] = str(r.dn.parent().get_rdn_value()).lower()
+rows = []
+for nc in ncs:
+    for v in db.search(base=nc, scope=ldb.SCOPE_BASE, attrs=["repsFrom"])[0].get("repsFrom", []):
+        c = ndr_unpack(drsblobs.repsFromToBlob, v).ctr
+        ls = c.last_success / 1e7 - 11644473600 if c.last_success else None
+        rows.append({"nc": nc, "from": names.get(str(c.source_dsa_obj_guid), str(c.source_dsa_obj_guid)),
+                     "last_success": ls, "failures": int(c.consecutive_sync_failures)})
+print(json.dumps(rows))
+"""
+
+
 def repl_summary(dc):
-    rc, out, _ = dc_exec(dc, "samba-tool drs showrepl --json", timeout=40)
+    rc, out, _ = run(["podman", "exec", "-i", dc, "python3", "-"], timeout=20, inp=REPL_PROBE)
     if rc != 0:
         return None
     try:
-        d = json.loads(out)
-    except ValueError:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
         return None
-    rows = []
-    for r in d.get("repsFrom", []):
-        ts = r.get("last success") or r.get("last success time") or ""
-        try:
-            last = datetime.datetime.strptime(ts, "%a %b %d %H:%M:%S %Y %Z").replace(
-                tzinfo=datetime.timezone.utc).timestamp()
-        except ValueError:
-            last = None
-        rows.append({"nc": r.get("NC dn"), "from": (r.get("DSA") or "").split("\\")[-1].lower(),
-                     "last_success": last, "failures": int(r.get("consecutive failures") or 0)})
-    return rows
 
 
 USN_PROBE = r"""
@@ -447,11 +469,19 @@ def collect():
     P = jread("placement.json", {}) or {}
     rebuild = (P.get("doc", {}).get("rebuild") or {})
     dcs = []
+    steps = {}
+
+    def timed(key, fn, *args):
+        t0 = now()
+        try:
+            return fn(*args)
+        finally:
+            steps[key] = steps.get(key, 0) + int((now() - t0) * 1000)
     for dc, meta in sorted(c["dcs"].items()):
-        st = container_state(dc)
+        st = timed("podman_state", container_state, dc)
         row = {"name": dc, "ip": meta["ip"], "state": "running" if st == "running" else "down",
                "roles": [], "replication": [], "time_offset_s": None, "chrony_li": None,
-               "sysvol_hash": sysvol_hash(sysvol_dir(dc)), "rid_pool_pct": None,
+               "sysvol_hash": timed("sysvol_hash", sysvol_hash, sysvol_dir(dc)), "rid_pool_pct": None,
                "last_inbound_age_days": None}
         if dc in rebuild:
             row["state"] = "rebuild"
@@ -461,7 +491,7 @@ def collect():
             row["held_reason"] = held[dc]
         if st == "running":
             try:
-                owners = fsmo_owners(dc)
+                owners = timed("fsmo", fsmo_owners, dc)
                 row["roles"] = sorted(r for r, o in owners.items() if o == dc.lower())
                 lr = jread("last_roles.json", {}) or {}
                 if lr.get(dc) != row["roles"]:
@@ -469,12 +499,12 @@ def collect():
                     jwrite("last_roles.json", lr)
             except Refused:
                 pass
-            reps = repl_summary(dc) or []
+            reps = timed("repl", repl_summary, dc) or []
             row["replication"] = reps
             okt = [r["last_success"] for r in reps if r["last_success"]]
             if okt:
                 row["last_inbound_age_days"] = round((t - max(okt)) / 86400.0, 4)
-            row["chrony_li"], row["time_offset_s"] = chrony_state(dc)
+            row["chrony_li"], row["time_offset_s"] = timed("chrony", chrony_state, dc)
             # the USN check runs on its own thread (usn_cycle); the collector only reads its cache
             ent = (jread("usn_check.json", {}) or {}).get(dc) or {}
             if ent:
@@ -487,8 +517,8 @@ def collect():
     reach = {}
     for h, ip in sorted(c.get("peer_hosts", {}).items()):
         dc_ips = [ip2 for d, ip2 in c.get("all_dcs", {}).items() if c.get("dc_host", {}).get(d) == h]
-        reach[h] = {"sh0_tcp_8444": tcp_alive(ip, 8444) or tcp_alive(ip, 22),
-                    "dc_ldap": any(tcp_alive(x, 389) for x in dc_ips)}
+        reach[h] = timed("reach", lambda: {"sh0_tcp_8444": tcp_alive(ip, 8444) or tcp_alive(ip, 22),
+                                           "dc_ldap": any(tcp_alive(x, 389) for x in dc_ips)})
     W = (P.get("doc", {}).get("sysvol_writer") or {})
     whash = None
     if W.get("dc") in c["dcs"]:
@@ -501,6 +531,7 @@ def collect():
           "sysvol_last": jread("sysvol_last.json"), "peer_reach": reach,
           "placement_hash": P.get("hash"), "capacity": capacity()}
     st["collect_ms"] = int((now() - t) * 1000)
+    st["collect_steps_ms"] = steps
     jwrite("status.json", st, mode=0o644)
     return st
 
@@ -1095,7 +1126,8 @@ def agent():
                 audit(name + "_error", err=str(ex)[:200])
             took = now() - t0
             if took > max(every(), 10):
-                audit(name + "_slow", seconds=round(took, 1))
+                steps = (jread("status.json", {}) or {}).get("collect_steps_ms") if name == "collect" else None
+                audit(name + "_slow", seconds=round(took, 1), steps=steps)
             time.sleep(max(0.5, every() - took))
     def collect_once():
         contradict_attestations(collect())
