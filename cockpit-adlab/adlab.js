@@ -392,6 +392,7 @@
             case "object-attrs":  objectAttrsModal(target); break;
             case "pki-ca-view":   pkiCaViewModal(target); break;
             case "pki-chain-view": pkiChainViewModal(target); break;
+            case "dns-server-settings": dnsSettingsModal(target); break;
             default: /* unknown — leave nothing */ break;
         }
     }
@@ -432,7 +433,7 @@
         var host = document.getElementById("al-modal-host");
         var back = el("div", "al-backdrop");
         back.style.zIndex = String(50 + host.children.length * 2);
-        var box = el("div", "al-modal" + (wide ? " wide" : ""));
+        var box = el("div", "al-modal" + (wide === "full" ? " full" : wide ? " wide" : ""));
         var h2 = el("h2", null, title);
         var head = el("div", "al-modal-head");
         head.appendChild(h2);
@@ -2971,6 +2972,10 @@
     function renderDns() {
         var m = content();
         var acts = el("div", "al-actions");
+        var setb = el("button", "al-btn secondary", "⚙ Settings");
+        setb.title = "DNS server settings: upstream forwarders, updates, zone transfers; config files";
+        setb.addEventListener("click", function () { openModal("dns-server-settings", { target: "settings" }); });
+        acts.appendChild(setb);
         acts.appendChild(actionButton("Add record", "dns-add", {}, ""));
         acts.appendChild(actionButton("Delete record", "dns-delete", {}));
         m.appendChild(acts);
@@ -2991,6 +2996,209 @@
             }
             sel.addEventListener("change", loadZone); loadZone();
         }).catch(function (e) { holder.appendChild(failCard("DNS", e)); });
+    }
+
+    /* DNS server settings — a fullscreen modal with three views:
+     *   Settings  a form rendered from the helper's DNS_SETTINGS schema
+     *             (dns-settings), one field per smb.conf [global] key, with the
+     *             value on every DC; Apply = dns-settings-set (rolling restart).
+     *   Advanced  the DNS-related config files of one DC, read-only, plus the
+     *             smb.conf diff the pending change would make on each DC.
+     *   Test      resolve a name through every DC and at each forwarder.
+     * The view is the modal's URL target, so it survives a reload. */
+    function dnsSettingsModal(view) {
+        view = view === "advanced" || view === "test" ? view : "settings";
+        modal("DNS server settings", function (box) {
+            var tabs = el("div", "al-vmode"), body = el("div", "al-dns-body");
+            [["settings", "Settings"], ["advanced", "Advanced: config files"], ["test", "Test resolution"]].forEach(function (t) {
+                var b = el("button", "al-btn " + (t[0] === view ? "" : "secondary"), t[1]); b.type = "button";
+                b.addEventListener("click", function () {   // replace the top modal's target = the view
+                    var st = readStack(); st[st.length - 1].target = t[0]; writeStack(st);
+                });
+                tabs.appendChild(b);
+            });
+            box.appendChild(tabs); box.appendChild(body);
+            if (view === "settings") dnsSettingsForm(body);
+            else if (view === "advanced") dnsConfigFiles(body);
+            else dnsResolveTest(body);
+            var bar = el("div", "row al-modal-actions");
+            var close = el("button", "al-btn secondary", "Close"); close.addEventListener("click", closeModal);
+            bar.appendChild(close); box.appendChild(bar);
+        }, "full", "dns-server-settings");
+    }
+    var dnsPendingDiff = null;    // last dry-run result, shown in the Advanced view
+    function fmtSetting(v) {
+        if (v === null || v === undefined) return "—";
+        if (Array.isArray(v)) return v.length ? v.join(" ") : "(none)";
+        if (typeof v === "boolean") return v ? "yes" : "no";
+        return String(v);
+    }
+    function dnsSettingsForm(host) {
+        host.appendChild(el("div", "al-loading", "reading every DC's smb.conf…"));
+        run("dns-settings").then(function (r) {
+            clear(host);
+            host.appendChild(el("div", "hint",
+                "These live in each DC's smb.conf [global]. Samba reads them only at start, so Apply "
+                + "rewrites every running DC and restarts them one at a time; each must answer its zone "
+                + "before the next goes. Lab default forwarder (lab.env): " + r.lab_default_forwarder + "."));
+            var grid = el("div", "al-dns-form");
+            var ctl = {};
+            r.schema.forEach(function (f) {
+                var cur = r.settings[f.key] || {}, row = el("div", "al-dns-field");
+                var lab = el("label", null, f.label); lab.appendChild(el("span", "al-sub", "  " + f.key));
+                row.appendChild(lab);
+                var input;
+                if (f.type === "enum") {
+                    input = el("select", "al-in");
+                    f.choices.forEach(function (c) { var o = el("option", null, c); o.value = c; input.appendChild(o); });
+                    input.value = cur.value || f.choices[0];
+                } else if (f.type === "bool") {
+                    var w = el("label", "al-check"); input = el("input"); input.type = "checkbox";
+                    input.checked = !!cur.value; w.appendChild(input); w.appendChild(el("span", null, " enabled"));
+                    row.appendChild(w);
+                } else {
+                    input = el("input", "al-in"); input.type = "text";
+                    input.placeholder = f.type === "ip-list" ? "e.g. 172.16.4.1 10.31.0.12" : "addresses, CIDRs or names";
+                    input.value = Array.isArray(cur.value) ? cur.value.join(" ") : (cur.value || "");
+                }
+                input.setAttribute("aria-label", f.label);
+                if (f.type !== "bool") row.appendChild(input);
+                row.appendChild(el("div", "hint", f.help));
+                if (cur.consistent === false) {
+                    var per = r.dcs.filter(function (d) { return d.values; })
+                        .map(function (d) { return d.dc + ": " + fmtSetting(d.values[f.key]); }).join(" · ");
+                    row.appendChild(el("div", "al-alert warn", "DCs disagree — " + per + ". Apply sets them all."));
+                }
+                ctl[f.key] = { spec: f, input: input, orig: cur.value, consistent: cur.consistent };
+                grid.appendChild(row);
+            });
+            host.appendChild(grid);
+            function current(c) {
+                var f = c.spec;
+                if (f.type === "bool") return c.input.checked;
+                if (f.type === "enum") return c.input.value;
+                return c.input.value.split(/[\s,]+/).filter(Boolean);
+            }
+            function changed() {   // only fields that differ (or that DCs disagree on)
+                var out = {};
+                Object.keys(ctl).forEach(function (k) {
+                    var c = ctl[k], v = current(c);
+                    if (c.consistent === false || JSON.stringify(v) !== JSON.stringify(
+                        c.spec.type === "bool" ? !!c.orig : (c.orig === null || c.orig === undefined ? (c.spec.type === "enum" ? "" : []) : c.orig)))
+                        out[k] = v;
+                });
+                return out;
+            }
+            host.appendChild(el("h3", null, "Per DC"));
+            host.appendChild(tableOf(["DC", "state", "forwarders", "updates", "restart"],
+                r.dcs.map(function (d) {
+                    if (!d.values) return [d.dc, badge(d.state || "?", d.state === "running" ? "ok" : "dim"), d.error || "", "", ""];
+                    return [d.dc, badge("running", "ok"), fmtSetting(d.values["dns forwarder"]),
+                            fmtSetting(d.values["allow dns updates"]),
+                            d.restart_pending ? badge("pending", "warn") : badge("current", "dim")];
+                })));
+            host.appendChild(el("div", "hint", "Delegation: " + r.delegation + "."));
+            var msg = el("div", "al-dns-msg");
+            var bar = el("div", "row");
+            var prev = el("button", "al-btn secondary", "Preview changes");
+            var apply = el("button", "al-btn danger", "Apply (rolling restart)…");
+            prev.addEventListener("click", function () {
+                var ch = changed();
+                if (!Object.keys(ch).length) { msg.textContent = "nothing changed"; return; }
+                prev.disabled = true; msg.textContent = "computing the smb.conf diff on every DC…";
+                run("dns-settings-set", { settings: JSON.stringify(ch), dry_run: "yes" }).then(function (res) {
+                    dnsPendingDiff = res; prev.disabled = false;
+                    var st = readStack(); st[st.length - 1].target = "advanced"; writeStack(st);
+                }).catch(function (e) { prev.disabled = false; msg.textContent = String(e); });
+            });
+            apply.addEventListener("click", function () {
+                var ch = changed();
+                if (!Object.keys(ch).length) { msg.textContent = "nothing changed"; return; }
+                transientModal("Apply DNS settings", function (b, closeT) {
+                    b.appendChild(el("div", "al-alert warn", "Every running DC's smb.conf is rewritten, then the DCs "
+                        + "restart ONE AT A TIME. Each must answer its zone again before the next restarts; the "
+                        + "rollout stops at the first DC that does not."));
+                    b.appendChild(el("pre", "al-log", JSON.stringify(ch, null, 2)));
+                    var pl = el("label", null, "resolve this name through each DC after its restart (optional)");
+                    var probe = el("input", "al-in"); probe.type = "text"; probe.value = "example.com";
+                    b.appendChild(pl); b.appendChild(probe);
+                    var out = el("div"), row = el("div", "row");
+                    var go = el("button", "al-btn danger", "Apply"), no = el("button", "al-btn secondary", "Cancel");
+                    no.addEventListener("click", closeT);
+                    go.addEventListener("click", function () {
+                        go.disabled = true; no.disabled = true;
+                        out.textContent = "writing smb.conf, then restarting DCs one at a time — a few minutes…";
+                        run("dns-settings-set", { settings: JSON.stringify(ch), probe: probe.value.trim() }).then(function (res) {
+                            clear(out); no.disabled = false; no.textContent = "Close";
+                            if (res.stopped_at) out.appendChild(el("div", "al-alert err", "Stopped at " + res.stopped_at + " — later DCs were edited but NOT restarted."));
+                            out.appendChild(tableOf(["DC", "changed", "restart", "probe"], res.dcs.map(function (d) {
+                                return [d.dc, d.changed ? "yes" : "no", d.restart || "", d.probe ? (d.probe.ok ? "✓ " : "✗ ") + d.probe.answer : ""];
+                            })));
+                            dnsSettingsForm((clear(host), host));
+                        }).catch(function (e) { out.textContent = String(e); no.disabled = false; });
+                    });
+                    row.appendChild(go); row.appendChild(no); b.appendChild(row); b.appendChild(out);
+                });
+            });
+            bar.appendChild(prev); bar.appendChild(apply); host.appendChild(bar); host.appendChild(msg);
+        }).catch(function (e) { clear(host); host.appendChild(el("div", "al-alert err", String(e))); });
+    }
+    function dnsConfigFiles(host, dc) {
+        clear(host);
+        if (dnsPendingDiff) {
+            var c = card("Pending change (preview — nothing written yet)", true);
+            dnsPendingDiff.dcs.forEach(function (d) {
+                c.appendChild(el("h4", null, d.dc + (d.changed ? "" : " — no change")));
+                if (d.diff) c.appendChild(el("pre", "al-log al-diff", d.diff));
+            });
+            var discard = el("button", "al-btn secondary", "Discard preview");
+            discard.addEventListener("click", function () { dnsPendingDiff = null; dnsConfigFiles(host, dc); });
+            c.appendChild(discard); host.appendChild(c);
+        }
+        var files = el("div"); host.appendChild(files);
+        files.appendChild(el("div", "al-loading", "reading config files…"));
+        run("dns-config-files", dc ? { dc: dc } : {}).then(function (r) {
+            clear(files);
+            var sel = el("select", "al-in"); sel.style.maxWidth = "220px";
+            r.dcs.forEach(function (d) { var o = el("option", null, d); o.value = d; sel.appendChild(o); });
+            sel.value = r.dc;
+            sel.addEventListener("change", function () { dnsConfigFiles(host, sel.value); });
+            var top = el("div", "row"); top.appendChild(el("span", null, "DC ")); top.appendChild(sel);
+            top.appendChild(el("span", "hint", "  read-only — edit DNS settings with the form"));
+            files.appendChild(top);
+            r.files.forEach(function (f) {
+                var d = el("details", "al-file"); d.open = f.path === "/etc/samba/smb.conf";
+                d.appendChild(el("summary", null, f.path + (f.ok ? "" : " (unreadable)")));
+                if (r.notes[f.path]) d.appendChild(el("div", "hint", r.notes[f.path]));
+                var pre = el("pre", "al-log");
+                // highlight DNS lines in smb.conf
+                String(f.content).split("\n").forEach(function (line) {
+                    var span = el("span", /^\s*(dns|allow dns)\b/i.test(line) ? "al-hl" : null, line + "\n");
+                    pre.appendChild(span);
+                });
+                d.appendChild(pre); files.appendChild(d);
+            });
+        }).catch(function (e) { clear(files); files.appendChild(el("div", "al-alert err", String(e))); });
+    }
+    function dnsResolveTest(host) {
+        var row = el("div", "row");
+        var inp = el("input", "al-in"); inp.type = "text"; inp.value = "example.com"; inp.style.maxWidth = "320px";
+        var go = el("button", "al-btn", "Resolve");
+        row.appendChild(inp); row.appendChild(go); host.appendChild(row);
+        host.appendChild(el("div", "hint", "Through each DC (as a client would ask it), and directly at each of that DC's forwarders."));
+        var out = el("div"); host.appendChild(out);
+        go.addEventListener("click", function () {
+            clear(out); out.appendChild(el("div", "al-loading", "resolving…")); go.disabled = true;
+            run("dns-forwarder-test", { name: inp.value.trim() }).then(function (r) {
+                go.disabled = false; clear(out);
+                var rows = [];
+                r.dcs.forEach(function (d) {
+                    rows.push([d.dc, "via DC", (d.via_dc.ok ? "✓ " : "✗ ") + d.via_dc.answer]);
+                    d.forwarders.forEach(function (f) { rows.push(["", "→ " + f.server, (f.ok ? "✓ " : "✗ ") + f.answer]); });
+                });
+                out.appendChild(tableOf(["DC", "asked", "answer"], rows));
+            }).catch(function (e) { go.disabled = false; clear(out); out.appendChild(el("div", "al-alert err", String(e))); });
+        });
     }
 
     // ------------------------------------------------------------- domains

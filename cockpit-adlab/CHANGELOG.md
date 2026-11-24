@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.22.0 - 2026-11-23
+
+DNS: **⚙ Settings** opens a fullscreen **DNS server settings** modal.
+
+- **Settings** — a form rendered from the helper's schema (`DNS_SETTINGS`,
+  published by `dns-settings`): upstream forwarders (edy-proxy-go DNS, up to
+  three, tried in order), dynamic updates, zone scavenging, zone-transfer
+  allow/deny. Each field shows its smb.conf key and warns when DCs disagree;
+  a per-DC table shows the values and whether a restart is still pending.
+- **Apply** (`dns-settings-set`) validates every value (addresses with
+  `ipaddress`, no free text reaches smb.conf), rewrites `[global]` on every
+  running DC (testparm-checked; restored if rejected), then restarts DCs ONE AT
+  A TIME — samba reads these only at start — and stops at the first DC that
+  does not answer its zone again. **Preview changes** = the same call as a dry
+  run, showing each DC's smb.conf diff.
+- **Advanced: config files** — `dns-config-files`: smb.conf (DNS lines
+  highlighted), resolv.conf, krb5.conf and hosts of any DC of the forest,
+  read-only, plus the pending preview diff.
+- **Test resolution** — `dns-forwarder-test`: a name through every DC and
+  directly at each DC's forwarders.
+- **No delegation form, on purpose:** SAMBA_INTERNAL (4.23.6) stores a child
+  NS delegation but answers names under it with an authoritative NXDOMAIN from
+  the parent zone (tested on the HA testbed). Names AD does not host already go
+  to the forwarders, i.e. edy-proxy-go.
+- `dc-entrypoint.sh`: a JOINED DC now gets lab.env's forwarder (join writes
+  none; it answered non-AD names NXDOMAIN). Takes effect for DCs created from a
+  rebuilt image; existing DCs are set with the form.
+- Live read-only check (edt1): dc1-dc5 all forward to 172.16.4.1, every DC
+  resolves example.com through itself and at edy; a dry run reports no change.
+
 ## 1.21.1 - 2026-11-20
 
 **Fix: 1.21.0 dropped the 1.20.0 drag-to-move feature.** Its `adlab.js` was
