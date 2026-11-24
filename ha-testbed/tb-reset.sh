@@ -11,7 +11,9 @@ HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 RJ=/home/eddie/.claude/skills/root-job-runner/scripts/rj
 SNAP=${1:?usage: tb-reset.sh SNAPSHOT}
 SIM_STATE=$HOME/.local/state/adl-ha/ha-sim
-if pgrep -f "python3 -u .*ha-s[i]m.py" >/dev/null || pgrep -f "run-stres[s].sh" >/dev/null; then
+# anchored to the processes' own argv: an unanchored pattern also matched any shell whose command
+# line merely MENTIONS run-stress.sh (e.g. `tb-reset.sh … && run-stress.sh …`), i.e. its own caller
+if pgrep -f '^python3 -u (.*/)?ha-sim\.py run' >/dev/null || pgrep -f '^(/usr/bin/|/bin/)?bash (.*/)?run-stress\.sh' >/dev/null; then
   echo "stop the controller and any stress run first" >&2; exit 1
 fi
 
