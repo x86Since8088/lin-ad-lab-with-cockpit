@@ -53,6 +53,9 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/sbin/adlab-ha agent
+# KillMode=process: the DCs the agent (re)starts keep their conmon in this unit's cgroup; the
+# default (control-group) killed every DC on the host at each agent restart/upgrade (2026-11-23)
+KillMode=process
 Restart=always
 RestartSec=3
 

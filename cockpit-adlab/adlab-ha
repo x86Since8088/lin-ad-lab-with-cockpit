@@ -22,6 +22,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 SCHEMA = "adlab-ha/1"
@@ -162,25 +163,47 @@ def fsmo_owners_remote(via_dc):
     return None, None
 
 
+# repsFrom read straight from the local sam.ldb (no DRS RPC): `samba-tool drs showrepl` is an
+# RPC to the local samba, which stalls for its whole 40 s timeout while samba is busy failing
+# replication to a dead partner — the survivor's collector took 30-85 s per pass during S1
+# faults (2026-11-23). Same rows as showrepl (checked on dc1: identical NC/partner/failures).
+REPL_PROBE = r"""
+import json
+from samba import param
+from samba.samdb import SamDB
+from samba.auth import system_session
+from samba.ndr import ndr_unpack
+from samba.dcerpc import drsblobs
+import ldb
+lp = param.LoadParm(); lp.load_default()
+db = SamDB(url="/var/lib/samba/private/sam.ldb", lp=lp, session_info=system_session())
+dsa = db.get_dsServiceName()
+m = db.search(base=dsa, scope=ldb.SCOPE_BASE, attrs=["msDS-hasMasterNCs", "hasMasterNCs"])[0]
+ncs = sorted(set(str(x) for a in ("msDS-hasMasterNCs", "hasMasterNCs") for x in m.get(a, [])))
+names = {}
+for r in db.search(base=str(db.get_config_basedn()), scope=ldb.SCOPE_SUBTREE,
+                   expression="(objectClass=nTDSDSA)", attrs=["objectGUID"]):
+    guid = str(ndr_unpack(__import__("samba.dcerpc.misc", fromlist=["GUID"]).GUID, r["objectGUID"][0]))
+    names[guid] = str(r.dn.parent().get_rdn_value()).lower()
+rows = []
+for nc in ncs:
+    for v in db.search(base=nc, scope=ldb.SCOPE_BASE, attrs=["repsFrom"])[0].get("repsFrom", []):
+        c = ndr_unpack(drsblobs.repsFromToBlob, v).ctr
+        ls = c.last_success / 1e7 - 11644473600 if c.last_success else None
+        rows.append({"nc": nc, "from": names.get(str(c.source_dsa_obj_guid), str(c.source_dsa_obj_guid)),
+                     "last_success": ls, "failures": int(c.consecutive_sync_failures)})
+print(json.dumps(rows))
+"""
+
+
 def repl_summary(dc):
-    rc, out, _ = dc_exec(dc, "samba-tool drs showrepl --json", timeout=40)
+    rc, out, _ = run(["podman", "exec", "-i", dc, "python3", "-"], timeout=20, inp=REPL_PROBE)
     if rc != 0:
         return None
     try:
-        d = json.loads(out)
-    except ValueError:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
         return None
-    rows = []
-    for r in d.get("repsFrom", []):
-        ts = r.get("last success") or r.get("last success time") or ""
-        try:
-            last = datetime.datetime.strptime(ts, "%a %b %d %H:%M:%S %Y %Z").replace(
-                tzinfo=datetime.timezone.utc).timestamp()
-        except ValueError:
-            last = None
-        rows.append({"nc": r.get("NC dn"), "from": (r.get("DSA") or "").split("\\")[-1].lower(),
-                     "last_success": last, "failures": int(r.get("consecutive failures") or 0)})
-    return rows
 
 
 USN_PROBE = r"""
@@ -221,12 +244,21 @@ def usn_rollback_check(dc):
     already pulled MORE from this DC's invocationId than this DC now says it has committed."""
     c = conf()
     partners = [ip for d, ip in sorted(c.get("all_dcs", {}).items()) if d != dc]
-    rc, out, err = run(["podman", "exec", "-i", dc, "python3", "-", c["domain_nb"]] + partners,
-                       timeout=90, inp=USN_PROBE)
+    # only partners whose LDAP port answers now: an unreachable partner is no evidence
+    # either way, and connecting to a dead host's DC blocked the probe for up to 90 s
+    # (stress pass 1: failover classification median ~130 s against a ~50 s floor)
+    live = [ip for ip in partners if tcp_alive(ip, 389)]
+    unreachable = [ip for ip in partners if ip not in live]
+    if not live:
+        return {"rollback": False, "partners_ahead": {}, "local_usn": None,
+                "partners": {}, "unreachable": unreachable}
+    rc, out, err = run(["podman", "exec", "-i", dc, "python3", "-", c["domain_nb"]] + live,
+                       timeout=60, inp=USN_PROBE)
     try:
         r = json.loads(out.strip().splitlines()[-1])
     except (ValueError, IndexError):
-        return {"error": (err or out).strip()[-200:]}
+        return {"error": (err or out).strip()[-200:], "unreachable": unreachable}
+    r["unreachable"] = unreachable
     ahead = {ip: hw for ip, hw in r["partners"].items() if isinstance(hw, int) and hw > r["local_usn"]}
     r["rollback"] = bool(ahead)
     r["partners_ahead"] = ahead
@@ -277,7 +309,7 @@ def ldap_alive(from_dc, ip, timeout=5):
     return rc == 0 and "dnsHostName" in out
 
 
-def tcp_alive(ip, port, timeout=2.0):
+def tcp_alive(ip, port, timeout=1.0):
     try:
         with socket.create_connection((ip, port), timeout=timeout):
             return True
@@ -375,7 +407,7 @@ def sysvol_pull(dc, src):
     else:
         source = src
     rc, out, err = run(["rsync", "-rlptD", "-X", "-H", "--delete-after", "--exclude=DfsrPrivate",
-                        "--timeout=60", source, dst], timeout=300)
+                        "--timeout=30", "--contimeout=5", source, dst], timeout=240)
     if rc != 0:
         return False, (err or out).strip()[:300]
     rc2, out2, err2 = dc_exec(dc, "samba-tool ntacl sysvolreset", timeout=180)
@@ -437,11 +469,19 @@ def collect():
     P = jread("placement.json", {}) or {}
     rebuild = (P.get("doc", {}).get("rebuild") or {})
     dcs = []
+    steps = {}
+
+    def timed(key, fn, *args):
+        t0 = now()
+        try:
+            return fn(*args)
+        finally:
+            steps[key] = steps.get(key, 0) + int((now() - t0) * 1000)
     for dc, meta in sorted(c["dcs"].items()):
-        st = container_state(dc)
+        st = timed("podman_state", container_state, dc)
         row = {"name": dc, "ip": meta["ip"], "state": "running" if st == "running" else "down",
                "roles": [], "replication": [], "time_offset_s": None, "chrony_li": None,
-               "sysvol_hash": sysvol_hash(sysvol_dir(dc)), "rid_pool_pct": None,
+               "sysvol_hash": timed("sysvol_hash", sysvol_hash, sysvol_dir(dc)), "rid_pool_pct": None,
                "last_inbound_age_days": None}
         if dc in rebuild:
             row["state"] = "rebuild"
@@ -451,7 +491,7 @@ def collect():
             row["held_reason"] = held[dc]
         if st == "running":
             try:
-                owners = fsmo_owners(dc)
+                owners = timed("fsmo", fsmo_owners, dc)
                 row["roles"] = sorted(r for r, o in owners.items() if o == dc.lower())
                 lr = jread("last_roles.json", {}) or {}
                 if lr.get(dc) != row["roles"]:
@@ -459,24 +499,17 @@ def collect():
                     jwrite("last_roles.json", lr)
             except Refused:
                 pass
-            reps = repl_summary(dc) or []
+            reps = timed("repl", repl_summary, dc) or []
             row["replication"] = reps
             okt = [r["last_success"] for r in reps if r["last_success"]]
             if okt:
                 row["last_inbound_age_days"] = round((t - max(okt)) / 86400.0, 4)
-            row["chrony_li"], row["time_offset_s"] = chrony_state(dc)
-            cache = jread("usn_check.json", {}) or {}
-            ent = cache.get(dc) or {}
-            if t - ent.get("t", 0) > 60:
-                r = usn_rollback_check(dc)
-                # confirmed = this check AND the previous one (>= 60 s earlier) both saw a partner ahead
-                r["confirmed"] = bool(r.get("rollback") and (ent.get("r") or {}).get("rollback"))
-                ent = {"t": t, "r": r}
-                cache[dc] = ent
-                jwrite("usn_check.json", cache)
-                if r.get("rollback"):
-                    audit("usn_rollback_suspected" if not r["confirmed"] else "usn_rollback_detected", dc=dc, detail=r)
-            row["usn"] = {k: ent["r"].get(k) for k in ("local_usn", "rollback", "confirmed", "partners_ahead")}
+            row["chrony_li"], row["time_offset_s"] = timed("chrony", chrony_state, dc)
+            # the USN check runs on its own thread (usn_cycle); the collector only reads its cache
+            ent = (jread("usn_check.json", {}) or {}).get(dc) or {}
+            if ent:
+                row["usn"] = {k: ent["r"].get(k) for k in ("local_usn", "rollback", "confirmed", "partners_ahead")}
+                row["usn"]["checked_at"] = ent.get("t")
         if (jread("usn_check.json", {}) or {}).get(dc, {}).get("r", {}).get("confirmed"):
             row["usn_rollback"] = True
         dcs.append(row)
@@ -484,8 +517,8 @@ def collect():
     reach = {}
     for h, ip in sorted(c.get("peer_hosts", {}).items()):
         dc_ips = [ip2 for d, ip2 in c.get("all_dcs", {}).items() if c.get("dc_host", {}).get(d) == h]
-        reach[h] = {"sh0_tcp_8444": tcp_alive(ip, 8444) or tcp_alive(ip, 22),
-                    "dc_ldap": any(tcp_alive(x, 389) for x in dc_ips)}
+        reach[h] = timed("reach", lambda: {"sh0_tcp_8444": tcp_alive(ip, 8444) or tcp_alive(ip, 22),
+                                           "dc_ldap": any(tcp_alive(x, 389) for x in dc_ips)})
     W = (P.get("doc", {}).get("sysvol_writer") or {})
     whash = None
     if W.get("dc") in c["dcs"]:
@@ -497,8 +530,34 @@ def collect():
           "drained": lv["drained"], "dcs": dcs, "sysvol_writer_hash": whash,
           "sysvol_last": jread("sysvol_last.json"), "peer_reach": reach,
           "placement_hash": P.get("hash"), "capacity": capacity()}
+    st["collect_ms"] = int((now() - t) * 1000)
+    st["collect_steps_ms"] = steps
     jwrite("status.json", st, mode=0o644)
     return st
+
+
+USN_LOCK = threading.Lock()   # usn_check.json: written by the USN thread and the watchdog loop
+
+
+def usn_cycle(min_gap_s=60):
+    """USN rollback check of every running local DC, at most once per min_gap_s each.
+    Its own thread: it talks to partner DCs, so it must never delay the collector."""
+    t = now()
+    cache = jread("usn_check.json", {}) or {}
+    for dc in sorted(conf()["dcs"]):
+        ent = cache.get(dc) or {}
+        if t - ent.get("t", 0) <= min_gap_s or container_state(dc) != "running":
+            continue
+        r = usn_rollback_check(dc)
+        # confirmed = this check AND the previous one (>= 60 s earlier) both saw a partner ahead
+        r["confirmed"] = bool(r.get("rollback") and (ent.get("r") or {}).get("rollback"))
+        with USN_LOCK:   # re-read: the watchdog may have marked an entry alerted meanwhile
+            cache = jread("usn_check.json", {}) or {}
+            cache[dc] = {"t": now(), "r": r}
+            jwrite("usn_check.json", cache)
+        if r.get("rollback"):
+            audit("usn_rollback_suspected" if not r["confirmed"] else "usn_rollback_detected", dc=dc, detail=r)
+    return cache
 
 
 def capacity():
@@ -1027,9 +1086,11 @@ def hold_flagged_running():
             if not ok:
                 if not ent.get("alerted"):
                     audit("usn_rollback_needs_operator", dc=dc, why=why)
-                    ent["alerted"] = True
-                    cache[dc] = ent
-                    jwrite("usn_check.json", cache)
+                    with USN_LOCK:
+                        cur = jread("usn_check.json", {}) or {}
+                        if dc in cur:
+                            cur[dc]["alerted"] = True
+                            jwrite("usn_check.json", cur)
                 continue
             run(["podman", "stop", "-t", "10", dc], timeout=60)
             held = jread("held.json", {}) or {}
@@ -1046,13 +1107,33 @@ def agent():
     """Collector + watchdog + SYSVOL timer. The watchdog needs no network: it fences
     by the local clock the moment the lease lapses (rsyncd stopped, may_write false)."""
     os.makedirs(STATE, exist_ok=True)
-    last_collect = last_sysvol = 0
+    last_sysvol = 0
     was_writer = None
     # boot fence: nothing is served until a lease arrives (lease.json from before the
     # boot is honoured only if still unexpired by the local clock)
     rsyncd_stop()
     boot_t = now()
     audit("agent_start")
+    # the collector and the USN check talk to other hosts' DCs, so each gets its own
+    # thread: a dead peer must never stall status (the controller waits for a status
+    # collected after the loss) nor the watchdog below
+    def loop(name, fn, every):
+        while True:
+            t0 = now()
+            try:
+                fn()
+            except Exception as ex:   # keep the thread alive whatever the probe does
+                audit(name + "_error", err=str(ex)[:200])
+            took = now() - t0
+            if took > max(every(), 10):
+                steps = (jread("status.json", {}) or {}).get("collect_steps_ms") if name == "collect" else None
+                audit(name + "_slow", seconds=round(took, 1), steps=steps)
+            time.sleep(max(0.5, every() - took))
+    def collect_once():
+        contradict_attestations(collect())
+    threading.Thread(target=loop, args=("collect", collect_once, lambda: timers()["collect_s"]),
+                     name="collect", daemon=True).start()
+    threading.Thread(target=loop, args=("usn", usn_cycle, lambda: 15), name="usn", daemon=True).start()
     last_sup = 0
     while True:
         t = now()
@@ -1070,13 +1151,6 @@ def agent():
             except Exception as ex:
                 audit("supervise_error", err=str(ex)[:200])
             last_sup = t
-        if t - last_collect >= T["collect_s"]:
-            try:
-                st = collect()
-                contradict_attestations(st)
-            except Exception as ex:  # keep the watchdog alive whatever the collector does
-                audit("collect_error", err=str(ex)[:200])
-            last_collect = t
         if t - last_sysvol >= T["sysvol_s"]:
             try:
                 sysvol_cycle()
