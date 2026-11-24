@@ -63,6 +63,13 @@ if [ ! -f /var/lib/samba/private/sam.ldb ]; then
             -U "${DOMAIN_NB}\\Administrator" --password="$ADMIN_PASS" \
             --dns-backend=SAMBA_INTERNAL "${site_arg[@]}"
         log "join complete"
+        # join (unlike provision) writes no `dns forwarder`, so a joined DC answered every
+        # non-AD name with NXDOMAIN (testbed dc2, 2026-11-23). Seed the lab's forwarder (space-separated list allowed);
+        # never overwrite one already set (the DNS settings form owns it after this).
+        if [ -n "$FORWARDER" ] && ! grep -qiE '^[[:space:]]*dns[[:space:]]+forwarder[[:space:]]*=' /etc/samba/smb.conf; then
+            sed -i "/^\[global\]/a\\tdns forwarder = $FORWARDER" /etc/samba/smb.conf
+            log "dns forwarder = $FORWARDER"
+        fi
         ;;
       *)
         log "no directory present and ROLE=$ROLE; nothing to start"; exit 3 ;;

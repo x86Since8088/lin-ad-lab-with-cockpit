@@ -179,6 +179,19 @@ kbd.al { background: var(--al-code-bg); border: 1px solid var(--al-border);
 
 /* wide modal (two-pane GPO editor) */
 .al-modal.wide { width: min(1120px, 95vw); }
+/* fullscreen modal (DNS settings) */
+.al-modal.full { width: calc(100vw - 2rem); height: calc(100vh - 2rem); max-height: none;
+    margin-top: 1rem; box-sizing: border-box; display: flex; flex-direction: column; }
+.al-modal.full .al-dns-body { flex: 1 1 auto; overflow: auto; }
+.al-dns-form { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 0.8rem 1.2rem; margin: 0.6rem 0; }
+.al-dns-field label { font-weight: 600; display: block; }
+.al-dns-field .al-sub { font-weight: 400; font-family: monospace; font-size: 0.75rem; }
+.al-dns-msg { margin-top: 0.4rem; }
+.al-dns-field .al-check { display: flex; align-items: center; gap: 0.3rem; font-weight: 400; margin: 0.3rem 0; }
+.al-dns-field .al-check input { width: auto; margin: 0; }
+details.al-file { margin: 0.4rem 0; }
+details.al-file summary { cursor: pointer; font-family: monospace; }
+.al-hl { background: var(--al-accent-soft); }
 
 /* GPO edit modal — tree (left, default 500px, resizable) + value list (right) */
 .al-edit-panes { display: flex; align-items: stretch; gap: 0; height: 60vh;

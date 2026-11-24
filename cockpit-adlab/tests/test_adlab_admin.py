@@ -4140,5 +4140,83 @@ class TestContainers(Base):
         self.assertIn("not a lab-managed", out["error"])
 
 
+class TestDnsSettings(Base):
+    """DNS server settings: schema-validated, written to every running DC, rolling restart."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.lab_up()
+        self._sleep = mod.SLEEP
+        mod.SLEEP = lambda s: None
+
+    def tearDown(self):
+        mod.SLEEP = self._sleep
+        super().tearDown()
+
+    def _edit_ok(self, changed=True):
+        self.fake.on(lambda a: "python3" in a and "-c" in a,
+                     out=json.dumps({"changed": changed, "diff": "-x\n+y\n"}))
+
+    def test_rejects_unknown_setting_and_bad_ip(self):
+        with self.assertRaises(mod.Fail):
+            mod.v_dns_settings_set({"settings": json.dumps({"netbios name": "x"})})
+        with self.assertRaises(mod.Fail):
+            mod.v_dns_settings_set({"settings": json.dumps({"dns forwarder": "8.8.8.8; rm -rf /"})})
+        with self.assertRaises(mod.Fail):
+            mod.v_dns_settings_set({"settings": json.dumps({"dns forwarder": ["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"]})})
+        self.assertEqual(self.fake.argv_containing("podman", "restart"), [])
+
+    def test_dry_run_edits_nothing_and_restarts_nothing(self):
+        self._edit_ok()
+        r = mod.v_dns_settings_set({"settings": json.dumps({"dns forwarder": ["172.16.4.1"]}), "dry_run": "yes"})
+        self.assertTrue(r["dry_run"])
+        stdins = [json.loads(sin) for argv, sin in self.fake.calls if "python3" in argv and sin]
+        self.assertTrue(stdins and all(x["dry"] for x in stdins))
+        self.assertEqual(self.fake.argv_containing("podman", "restart"), [])
+
+    def test_rolling_restart_one_at_a_time_and_stops_on_unhealthy_dc(self):
+        self._edit_ok()
+        self.fake.on(lambda a: a[:2] == ["podman", "restart"], out="ok")
+        answers = {"n": 0}
+
+        def soa(argv):
+            if "SOA" in argv and argv[3] == "dc2":
+                return False      # dc2 never answers after its restart
+            return "SOA" in argv
+        self.fake.on(soa, out="ad.edt1.lab has SOA record dc1.ad.edt1.lab.")
+        self.fake.on(lambda a: "SOA" in a, rc=1, out="")
+        orig = mod._dc_answers_zone
+        mod._dc_answers_zone = lambda dc, wait_s=150: dc != "dc2"
+        try:
+            r = mod.v_dns_settings_set({"settings": json.dumps({"dns forwarder": "172.16.4.1 10.0.0.1"})})
+        finally:
+            mod._dc_answers_zone = orig
+        restarted = [a[-1] for a in self.fake.argv_containing("podman", "restart")]
+        self.assertEqual(restarted, ["dc1", "dc2"])          # stopped after dc2
+        self.assertEqual(r["stopped_at"], "dc2")
+        sent = [json.loads(sin)["set"] for argv, sin in self.fake.calls if "python3" in argv and sin]
+        self.assertEqual(sent[0], {"dns forwarder": "172.16.4.1 10.0.0.1"})
+
+    def test_testparm_rejection_raises_before_any_restart(self):
+        self.fake.on(lambda a: "python3" in a and "-c" in a,
+                     out=json.dumps({"changed": False, "error": "testparm rejected the new smb.conf; restored"}))
+        with self.assertRaises(mod.Fail):
+            mod.v_dns_settings_set({"settings": json.dumps({"allow dns updates": "nonsecure"})})
+        self.assertEqual(self.fake.argv_containing("podman", "restart"), [])
+
+    def test_config_files_only_for_this_forests_dcs(self):
+        with self.assertRaises(mod.Fail):
+            mod.v_dns_config_files({"dc": "edy-rproxy-prod"})
+
+    def test_settings_schema_published(self):
+        self.fake.on(lambda a: "python3" in a and "-c" in a, out=json.dumps(
+            {"values": {"dns forwarder": ["172.16.4.1"]}, "explicit": {"dns forwarder": True},
+             "conf_mtime": 100, "started": 200}))
+        r = mod.v_dns_settings({})
+        self.assertEqual([x["key"] for x in r["schema"]], mod.DNS_SETTING_KEYS)
+        self.assertTrue(r["settings"]["dns forwarder"]["consistent"])
+        self.assertFalse(r["dcs"][0]["restart_pending"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

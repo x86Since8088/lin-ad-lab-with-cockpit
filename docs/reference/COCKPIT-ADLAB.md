@@ -51,6 +51,24 @@ to move it. A confirmation shows the old and new DN before anything changes;
 the object's current parent, the object itself and its own subtree are not
 drop targets.
 
+## DNS server settings
+
+DNS → **⚙ Settings** opens a fullscreen modal (deep-linkable:
+`#/dns?modal=dns-server-settings&target=settings|advanced|test`):
+
+- **Settings** is rendered from the helper's `DNS_SETTINGS` schema: forwarders,
+  dynamic updates, scavenging, zone-transfer allow/deny — all smb.conf
+  `[global]` keys on each DC. Samba reads them only at start, so **Apply** is a
+  rolling restart, one DC at a time, each gated on answering its own zone.
+  **Preview changes** shows each DC's smb.conf diff without writing.
+- **Advanced: config files** shows a DC's smb.conf, resolv.conf, krb5.conf and
+  hosts, read-only.
+- **Test resolution** resolves a name through every DC and at its forwarders.
+
+Names outside the AD zones go to the forwarders — edy-proxy-go's DNS
+(lab.env `FORWARDER`, 172.16.4.1 on edt1). In-zone delegation is not offered:
+SAMBA_INTERNAL answers names under a delegated child zone with NXDOMAIN.
+
 ## Console tracing
 
 Helper failures are always logged to the browser console as

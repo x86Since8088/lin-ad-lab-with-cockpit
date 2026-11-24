@@ -37,6 +37,7 @@ import base64
 import contextlib
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -126,7 +127,7 @@ SYSVOL_REPL = _ENV.get("ADLAB_SYSVOL_REPLICATE", "")
 SECRET_DIR = _ENV.get("ADLAB_SECRET_DIR", "")
 GPO_TEMPLATE_DIR = _ENV.get("ADLAB_GPO_TEMPLATE_DIR", GPO_TEMPLATE_DEFAULT)
 AUDIT_LOG = "/var/log/adlab-admin.log"
-VERSION = "1.21.1"
+VERSION = "1.22.0"
 
 
 def _require_config():
@@ -4234,6 +4235,266 @@ def v_dns_delete(a):
     return {"deleted": "%s %s %s" % (a["name"], a["type"], a["data"]),
             "zone": a["zone"]}
 
+# ---- DNS server settings (smb.conf [global], per DC) ----------------------
+#
+# The DCs run SAMBA_INTERNAL DNS. Its server settings live in each DC's
+# smb.conf [global] (persistent: /etc/samba is bind-mounted), and samba reads
+# them ONLY AT START — `smbcontrol reload-config` does not reach the DNS server
+# (docs/reference/SERVICES-PLACEMENT.md) — so an apply is a ROLLING restart:
+# one DC at a time, each must answer its own zone again before the next goes.
+#
+# DNS_SETTINGS is the schema the UI renders its form from (dns-settings
+# publishes it). Delegation is deliberately absent: SAMBA_INTERNAL (4.23.6)
+# stores a child NS delegation but answers names under it with an
+# authoritative NXDOMAIN from the parent zone — no referral, no forwarding
+# (tested on the HA testbed 2026-11-23). Undefined names go to the forwarder.
+DNS_SETTINGS = [
+    {"key": "dns forwarder", "label": "Upstream DNS servers (forwarders)", "type": "ip-list", "max": 3,
+     "help": "Where a DC sends every query for a name outside the AD zones — the lab's edy-proxy-go "
+             "DNS. Tried in order. List more than one when a DC cannot reach the first (a macvlan "
+             "DC cannot reach its own host's address)."},
+    {"key": "allow dns updates", "label": "Dynamic updates", "type": "enum",
+     "choices": ["secure only", "nonsecure", "disabled"],
+     "help": "Who may register records dynamically: Kerberos-signed clients only (secure only, the "
+             "AD default), anyone (nonsecure), or nobody (disabled)."},
+    {"key": "dns zone scavenging", "label": "Zone scavenging", "type": "bool",
+     "help": "Age out and remove stale dynamically-registered records."},
+    {"key": "dns zone transfer clients allow", "label": "Zone transfer: allow", "type": "host-list",
+     "help": "Hosts or networks (address, CIDR or name) allowed AXFR of the AD zones. Empty = none."},
+    {"key": "dns zone transfer clients deny", "label": "Zone transfer: deny", "type": "host-list",
+     "help": "Hosts or networks refused zone transfers (checked before allow)."},
+]
+DNS_SETTING_KEYS = [x["key"] for x in DNS_SETTINGS]
+# Files shown read-only in the settings modal's advanced view.
+DNS_CONFIG_FILES = ["/etc/samba/smb.conf", "/etc/resolv.conf", "/etc/krb5.conf", "/etc/hosts"]
+SLEEP = time.sleep            # tests replace it
+
+# Runs INSIDE a DC (python3 from samba's own image). stdin: {"keys": [...]} to
+# read, or {"set": {key: value-or-null}, "dry": bool} to edit [global].
+DNS_CONF_PY = r"""
+import difflib, json, os, re, sys
+req = json.load(sys.stdin)
+P = "/etc/samba/smb.conf"
+def kx(k):
+    return re.compile(r"^\s*" + r"\s+".join(map(re.escape, k.split())) + r"\s*=", re.I)
+src = open(P).read()
+lines = src.split("\n")
+if "keys" in req:
+    from samba import param
+    lp = param.LoadParm(); lp.load_default()
+    st = os.stat(P).st_mtime
+    started = os.stat("/proc/1").st_mtime
+    out = {"values": {}, "explicit": {}, "conf_mtime": st, "started": started}
+    for k in req["keys"]:
+        try:
+            out["values"][k] = lp.get(k)
+        except Exception as ex:
+            out["values"][k] = None
+        out["explicit"][k] = any(kx(k).match(l) for l in lines)
+    print(json.dumps(out)); sys.exit(0)
+g = next(i for i, l in enumerate(lines) if l.strip().lower() == "[global]")
+def end():
+    return next((i for i in range(g + 1, len(lines)) if lines[i].strip().startswith("[")), len(lines))
+for k, v in req["set"].items():
+    idx = [i for i in range(g + 1, end()) if kx(k).match(lines[i])]
+    if v is None:
+        for i in reversed(idx):
+            del lines[i]
+    elif idx:
+        lines[idx[0]] = "\t%s = %s" % (k, v)
+        for i in reversed(idx[1:]):
+            del lines[i]
+    else:
+        lines.insert(g + 1, "\t%s = %s" % (k, v))
+new = "\n".join(lines)
+diff = "".join(difflib.unified_diff(src.splitlines(True), new.splitlines(True), P, P + " (new)"))
+res = {"changed": new != src, "diff": diff}
+if new != src and not req.get("dry"):
+    open(P + ".adlab-bak", "w").write(src)
+    tmp = P + ".adlab-new"
+    open(tmp, "w").write(new)
+    os.chmod(tmp, os.stat(P).st_mode & 0o7777)
+    os.replace(tmp, P)
+    rc = os.system("testparm -s >/dev/null 2>&1")
+    if rc != 0:
+        os.replace(P + ".adlab-bak", P)
+        res = {"changed": False, "error": "testparm rejected the new smb.conf; restored", "diff": diff}
+print(json.dumps(res))
+"""
+
+_HOSTTOK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
+
+def _dns_setting_value(spec, v):
+    """Validate one setting from the UI and render its smb.conf value; None = unset (default)."""
+    if v is None or v == "" or v == []:
+        return None
+    t = spec["type"]
+    if t in ("ip-list", "host-list"):
+        toks = v if isinstance(v, list) else re.split(r"[\s,]+", str(v).strip())
+        toks = [str(x).strip() for x in toks if str(x).strip()]
+        out = []
+        for x in toks:
+            try:
+                out.append(str(ipaddress.ip_address(x)))
+                continue
+            except ValueError:
+                pass
+            if t == "host-list":
+                try:
+                    out.append(str(ipaddress.ip_network(x, strict=False)))
+                    continue
+                except ValueError:
+                    if _HOSTTOK.match(x):
+                        out.append(x)
+                        continue
+            raise Fail("%s: %r is not %s" % (spec["key"], x, "an IP address" if t == "ip-list"
+                                                else "an address, network or host name"))
+        if t == "ip-list" and len(out) > spec.get("max", 3):
+            raise Fail("%s: at most %d servers" % (spec["key"], spec.get("max", 3)))
+        return " ".join(out) if out else None
+    if t == "enum":
+        if v not in spec["choices"]:
+            raise Fail("%s: must be one of %s" % (spec["key"], ", ".join(spec["choices"])))
+        return v
+    if t == "bool":
+        if isinstance(v, bool):
+            return "yes" if v else "no"
+        if str(v).lower() in ("yes", "true", "1", "on"):
+            return "yes"
+        if str(v).lower() in ("no", "false", "0", "off"):
+            return "no"
+        raise Fail("%s: must be yes or no" % spec["key"])
+    raise Fail("unknown setting type %s" % t)
+
+def _dns_conf(dc, req, timeout=60):
+    rc, out, err = podman(dc, ["python3", "-c", DNS_CONF_PY], stdin=json.dumps(req), timeout=timeout)
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise Fail("%s: %s" % (dc, (err or out).strip()[-300:] or "no output"))
+
+def _dns_dcs():
+    return [d for d in all_dcs() if ctr_state(d) == "running"], all_dcs()
+
+def v_dns_settings(a):
+    running, every = _dns_dcs()
+    rows = []
+    for d in every:
+        if d not in running:
+            rows.append({"dc": d, "state": ctr_state(d)})
+            continue
+        try:
+            r = _dns_conf(d, {"keys": DNS_SETTING_KEYS})
+            rows.append({"dc": d, "state": "running", "values": r["values"], "explicit": r["explicit"],
+                         "restart_pending": r["conf_mtime"] > r["started"] + 1})
+        except Fail as ex:
+            rows.append({"dc": d, "state": "running", "error": str(ex)})
+    vals = {}
+    for k in DNS_SETTING_KEYS:
+        seen = set(json.dumps(r["values"].get(k), sort_keys=True) for r in rows if "values" in r)
+        vals[k] = {"consistent": len(seen) <= 1,
+                   "value": next((r["values"].get(k) for r in rows if "values" in r), None)}
+    return {"schema": DNS_SETTINGS, "dcs": rows, "settings": vals,
+            "lab_default_forwarder": _cur().get("FORWARDER", PRIMARY_LAB["FORWARDER"]),
+            "applies": "rolling restart (samba reads these only at start)",
+            "delegation": "not offered: SAMBA_INTERNAL answers names under a delegated child "
+                          "zone with NXDOMAIN; undefined names go to the forwarders instead"}
+
+def _dc_answers_zone(dc, wait_s=150):
+    zone = _cur()["DOMAIN_DNS"]
+    t_end = time.time() + wait_s
+    while True:
+        rc, out, _ = podman(dc, ["host", "-W", "2", "-t", "SOA", zone, "127.0.0.1"], timeout=15)
+        if rc == 0 and "SOA" in out:
+            return True
+        if time.time() > t_end:
+            return False
+        SLEEP(3)
+
+def _resolve_via(dc, name, server="127.0.0.1"):
+    rc, out, err = podman(dc, ["host", "-W", "3", "-t", "A", name, server], timeout=20)
+    lines = [l for l in (out or err).strip().splitlines() if l.strip()]
+    return {"ok": rc == 0, "answer": lines[-1] if lines else ""}
+
+def v_dns_settings_set(a):
+    try:
+        want = json.loads(a["settings"])
+    except ValueError:
+        raise Fail("settings must be a JSON object {setting: value}")
+    if not isinstance(want, dict) or not want:
+        raise Fail("settings must be a non-empty JSON object")
+    spec = dict((x["key"], x) for x in DNS_SETTINGS)
+    bad = [k for k in want if k not in spec]
+    if bad:
+        raise Fail("not a DNS setting here: %s" % ", ".join(bad))
+    edits = dict((k, _dns_setting_value(spec[k], v)) for k, v in want.items())
+    dry = (a.get("dry_run") or "").lower() in ("1", "yes", "true")
+    restart = (a.get("restart") or "rolling")
+    if restart not in ("rolling", "none"):
+        raise Fail("restart must be rolling or none")
+    running, every = _dns_dcs()
+    if not running:
+        raise Fail("no DC is running")
+    out = {"dry_run": dry, "edits": edits, "dcs": [], "skipped": [d for d in every if d not in running]}
+    for d in running:              # write every DC first (cheap, validated by testparm in place)
+        r = _dns_conf(d, {"set": edits, "dry": dry})
+        r["dc"] = d
+        out["dcs"].append(r)
+        if r.get("error"):
+            raise Fail("%s: %s (no DC restarted; DCs before it are already edited: %s)"
+                       % (d, r["error"], ", ".join(x["dc"] for x in out["dcs"][:-1]) or "none"))
+    if dry or restart == "none":
+        out["restart"] = "not restarted" if not dry else "dry run"
+        return out
+    probe = a.get("probe") or ""
+    for r in out["dcs"]:
+        if not r["changed"]:
+            r["restart"] = "unchanged"
+            continue
+        rc, o, e = RUN.run(["podman", "restart", "-t", "20", r["dc"]], timeout=180)
+        if rc != 0:
+            r["restart"] = "failed: " + (e or o).strip()[-200:]
+            out["stopped_at"] = r["dc"]
+            return out
+        if not _dc_answers_zone(r["dc"]):
+            r["restart"] = "restarted, but it does not answer its zone yet — rollout stopped"
+            out["stopped_at"] = r["dc"]
+            return out
+        r["restart"] = "ok"
+        if probe:
+            r["probe"] = _resolve_via(r["dc"], probe)
+    return out
+
+def v_dns_forwarder_test(a):
+    name = a.get("name") or "example.com"
+    if not _HOSTTOK.match(name):
+        raise Fail("not a DNS name: %r" % name)
+    running, _ = _dns_dcs()
+    rows = []
+    for d in running:
+        r = {"dc": d, "via_dc": _resolve_via(d, name)}
+        try:
+            fw = _dns_conf(d, {"keys": ["dns forwarder"]})["values"]["dns forwarder"] or []
+        except Fail:
+            fw = []
+        r["forwarders"] = [dict(_resolve_via(d, name, ip), server=ip) for ip in fw]
+        rows.append(r)
+    return {"name": name, "dcs": rows}
+
+def v_dns_config_files(a):
+    every = all_dcs()
+    dc = a.get("dc") or first_up_dc()
+    if dc not in every:
+        raise Fail("not a DC of this forest: %s" % dc)
+    files = []
+    for p in DNS_CONFIG_FILES:
+        rc, out, err = podman(dc, ["head", "-c", "65536", p], timeout=20)
+        files.append({"path": p, "ok": rc == 0, "content": out if rc == 0 else (err or "").strip()})
+    return {"dc": dc, "dcs": every, "files": files,
+            "notes": {"/etc/resolv.conf": "rewritten by the DC entrypoint at every start "
+                                          "(the DC itself, then the lab forwarder as fallback)",
+                      "/etc/samba/smb.conf": "persistent; [global] DNS settings are edited by the form"}}
+
 # ---- DCs: logs, tracing, RPC, promote/demote, remoting --------------------
 
 def v_dc_list(a):
@@ -7681,6 +7942,20 @@ VERBS = {
                       "help": "Delete a record.",
                       "args": [arg("zone"), arg("name"),
                                arg("type", "enum", choices=DNS_TYPES), arg("data")]},
+    "dns-settings":  {"fn": v_dns_settings, "group": "dns",
+                      "help": "DNS server settings (forwarders, updates, scavenging, zone transfers) on every DC, with the form schema."},
+    "dns-settings-set": {"fn": v_dns_settings_set, "group": "dns", "danger": True,
+                      "help": "Write DNS server settings to every running DC's smb.conf, then a rolling restart (each DC must answer its zone before the next).",
+                      "args": [arg("settings", help_='JSON {"dns forwarder": ["172.16.4.1"], …}; null/"" = back to the default'),
+                               arg("dry_run", required=False, help_="yes = only show the smb.conf diff per DC"),
+                               arg("restart", "enum", required=False, choices=["rolling", "none"], default="rolling"),
+                               arg("probe", required=False, help_="a name to resolve through each DC after its restart")]},
+    "dns-forwarder-test": {"fn": v_dns_forwarder_test, "group": "dns",
+                      "help": "Resolve a name through every DC and directly at each DC's forwarders.",
+                      "args": [arg("name", required=False, default="example.com")]},
+    "dns-config-files": {"fn": v_dns_config_files, "group": "dns",
+                      "help": "Read-only: a DC's DNS-related config files (smb.conf, resolv.conf, krb5.conf, hosts).",
+                      "args": [arg("dc", required=False)]},
     "dc-list":       {"fn": v_dc_list, "group": "dcs", "help": "DCs with state, IP and FSMO roles held."},
     "dc-logs":       {"fn": v_dc_logs, "group": "dcs", "help": "Tail a DC's container log.",
                       "args": [arg("dc", "enum", choices=DC_CHOICES),
