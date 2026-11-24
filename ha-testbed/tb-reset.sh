@@ -13,7 +13,7 @@ SNAP=${1:?usage: tb-reset.sh SNAPSHOT}
 SIM_STATE=$HOME/.local/state/adl-ha/ha-sim
 # anchored to the processes' own argv: an unanchored pattern also matched any shell whose command
 # line merely MENTIONS run-stress.sh (e.g. `tb-reset.sh … && run-stress.sh …`), i.e. its own caller
-if pgrep -f '^python3 -u (.*/)?ha-sim\.py run' >/dev/null || pgrep -f '^(/usr/bin/|/bin/)?bash (.*/)?run-stress\.sh' >/dev/null; then
+if pgrep -f '^python3 -u ([^ ]*/)?ha-sim\.py run' >/dev/null || pgrep -f '^(/usr/bin/|/bin/)?bash ([^ ]*/)?run-stress\.sh( |$)' >/dev/null; then
   echo "stop the controller and any stress run first" >&2; exit 1
 fi
 
