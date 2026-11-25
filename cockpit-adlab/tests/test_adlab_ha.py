@@ -312,5 +312,94 @@ class TestCollectorNeverBlocks(Base):
         self.assertTrue(ha.jread("usn_check.json")["dc3"]["r"]["confirmed"])
 
 
+class TestSysvolGptRescue(Base):
+    """Stress S5 (2026-11-24): a GPO created in the writer's last SYSVOL interval before it died
+    had its folder deleted by the failback pull, then sysvolreset aborted on it forever."""
+    G1, G2, G3 = "{11111111-1111-1111-1111-111111111111}", "{22222222-2222-2222-2222-222222222222}", "{33333333-3333-3333-3333-333333333333}"
+
+    def setUp(self):
+        super().setUp()
+        self.saved = {k: getattr(ha, k) for k in ("run", "dc_exec", "gpo_inventory", "container_state")}
+        self.pol = os.path.join(ha.sysvol_dir("dc3"), "ha.test.lab", "Policies")
+        import shutil
+        shutil.rmtree(ha.sysvol_dir("dc3"), ignore_errors=True)
+        os.makedirs(self.pol)
+        for g in (self.G1, self.G2):
+            os.makedirs(os.path.join(self.pol, g))
+            open(os.path.join(self.pol, g, "GPT.INI"), "w").write(g)
+        self.argv = []
+        self.reset_out = (0, "", "")
+        ha.container_state = lambda dc: "running"
+        ha.dc_exec = lambda dc, cmd, timeout=60: self.reset_out
+
+        def fake_run(argv, timeout=60, inp=None):
+            self.argv.append(argv)
+            if "--list-only" in argv:     # the writer has G1 only (G2 was created in its last minute)
+                return 0, "drwxr-xr-x 4096 2026/11/24 21:00:00 %s\n" % self.G1, ""
+            return 0, "", ""
+        ha.run = fake_run
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(ha, k, v)
+        super().tearDown()
+
+    def test_live_gpo_folders_are_protected_and_reported_rescued(self):
+        ha.gpo_inventory = lambda dc: {"live": [self.G1, self.G2], "deleted": []}
+        ok, why, info = ha.sysvol_pull("dc3", "rsync://10.31.0.11/sysvol/")
+        self.assertTrue(ok, why)
+        rs = [a for a in self.argv if a[0] == "rsync" and "--list-only" not in a][0]
+        prot = [rs[i + 1] for i, x in enumerate(rs) if x == "--filter"]
+        self.assertIn("P /ha.test.lab/Policies/%s/" % self.G2, prot)
+        self.assertEqual(info["rescued"], [self.G2])
+        self.assertEqual(info["gpt_missing"], [])
+
+    def test_contimeout_only_for_rsync_daemon_sources(self):
+        ha.gpo_inventory = lambda dc: {"live": [self.G1], "deleted": []}
+        ha.sysvol_pull("dc3", "local:dc3")
+        ha.sysvol_pull("dc3", "rsync://10.31.0.11/sysvol/")
+        pulls = [a for a in self.argv if a[0] == "rsync" and "--list-only" not in a]
+        self.assertNotIn("--contimeout=5", pulls[0])       # local: a usage error in real rsync
+        self.assertIn("--contimeout=5", pulls[1])
+
+    def test_deleted_gpo_folder_is_not_protected(self):
+        ha.gpo_inventory = lambda dc: {"live": [self.G1], "deleted": [self.G2]}
+        ok, why, info = ha.sysvol_pull("dc3", "rsync://10.31.0.11/sysvol/")
+        rs = [a for a in self.argv if a[0] == "rsync" and "--list-only" not in a][0]
+        self.assertFalse(any(self.G2 in x for x in rs))
+        self.assertEqual(info["rescued"], [])
+
+    def test_sysvolreset_missing_gpt_is_a_warning_not_a_failed_pull(self):
+        ha.gpo_inventory = lambda dc: {"live": [self.G1, self.G3], "deleted": []}
+        self.reset_out = (255, "", "ERROR(<class 'FileNotFoundError'>): Could not access /var/lib/samba/sysvol/"
+                                   "ha.test.lab/Policies/%s: No such file or directory" % self.G3)
+        ok, why, info = ha.sysvol_pull("dc3", "local:dc3")
+        self.assertTrue(ok, why)
+        self.assertEqual(info["gpt_missing"], [self.G3])
+        self.assertEqual(info.get("acl_reset"), "partial")
+
+    def test_other_sysvolreset_failure_still_fails(self):
+        ha.gpo_inventory = lambda dc: {"live": [self.G1], "deleted": []}
+        self.reset_out = (1, "", "set_nt_acl_conn: NT_STATUS_ACCESS_DENIED")
+        ok, why, info = ha.sysvol_pull("dc3", "local:dc3")
+        self.assertFalse(ok)
+
+    def test_strays_removed_only_with_a_tombstone(self):
+        ha.gpo_inventory = lambda dc: {"live": [self.G1], "deleted": [self.G2]}
+        os.makedirs(os.path.join(self.pol, self.G3))          # absent from the directory, no tombstone
+        gone = ha.sysvol_remove_strays("dc3")
+        self.assertEqual(gone, [self.G2])
+        self.assertTrue(os.path.isdir(os.path.join(self.pol, self.G3)))
+        self.assertTrue(os.path.isdir(os.path.join(self.pol, self.G1)))
+
+    def test_hash_excluding_rescued_equals_hash_of_tree_without_them(self):
+        full = ha.sysvol_hash(ha.sysvol_dir("dc3"))
+        ex = ha.sysvol_hash_excluding(ha.sysvol_dir("dc3"), [self.G2])
+        self.assertNotEqual(full, ex)
+        import shutil
+        shutil.rmtree(os.path.join(self.pol, self.G2))
+        self.assertEqual(ex, ha.sysvol_hash(ha.sysvol_dir("dc3")))
+
+
 if __name__ == "__main__":
     unittest.main()

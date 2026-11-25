@@ -54,7 +54,7 @@ report)
   "$RJ" -M "$VM" adlha-load-report <<EOF | grep -v '^\[exit'
 awk -v f=$FROM -v t=$TO '\$1>=f && \$1<=t {k=\$2" "\$3; n[k]++; if(\$4!="ok")e[k]++; print k, \$5 > "/tmp/lat"} END{for(k in n) printf "%s req=%d fail=%d\n", k, n[k], e[k]+0}' /var/log/adl-load/auth.log | sort
 for k in \$(awk '{print \$1"_"\$2}' /tmp/lat 2>/dev/null | sort -u); do
-  sort -n -k3 <(awk -v k="\${k/_/ }" '\$1" "\$2==k{print \$0}' /tmp/lat) | awk -v k=\$k '{a[NR]=\$3} END{if(NR) printf "%s p50=%dms p99=%dms\n", k, a[int(NR*0.5)+1], a[int(NR*0.99)>0?int(NR*0.99):1]}'
+  sort -n -k3 <(awk -v k="\${k/_/ }" '\$1" "\$2==k{print \$0}' /tmp/lat) | awk -v k="\${k/_/ }" '{a[NR]=\$3} END{if(NR){ i=int(NR*0.99); if(i<NR*0.99) i++; if(i<1) i=1; printf "%s p50=%dms p99=%dms\n", k, a[int(NR*0.5)+1], a[i] }}'
 done
 EOF
   ;;

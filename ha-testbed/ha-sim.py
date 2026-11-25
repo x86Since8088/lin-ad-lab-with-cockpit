@@ -399,6 +399,11 @@ class Sim:
                                   epoch=self.st["epoch"], timeout=180)
                         log("rebuild_refresh_partner", dc=d, ok=r3.get("ok"), err=r3.get("error"))
                         time.sleep(30)
+                    # same-name rebuild leaves serverReferenceBL missing on the partners (S2 dbcheck)
+                    for h in HOSTS:
+                        r4 = call(h, "ha-dbcheck-backlinks", {"dc": dc}, epoch=self.st["epoch"], timeout=300)
+                        log("rebuild_dbcheck_backlinks", host=h, ok=r4.get("ok"), err=r4.get("error"),
+                            result=(r4.get("result") or {}).get("checked"))
             if rb != (self.st["placement"].get("rebuild") or {}):
                 self.apply_placement(self.st["holder"], self.st["placement"]["sysvol_writer"]["dc"],
                                      hosts=[h for h in HOSTS if statuses.get(h)], rebuild=rb)
