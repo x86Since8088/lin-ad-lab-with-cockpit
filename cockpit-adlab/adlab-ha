@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -42,7 +43,7 @@ DEFAULT_TIMERS = {"ttl_s": 60, "renew_s": 15, "grace_s": 300, "hold_s": 1800,
 BOOT_T = None   # set by the agent at start
 MUTATING = {"ha-placement-apply", "ha-fsmo-transfer", "ha-fsmo-seize", "ha-sysvol-writer",
             "ha-fence", "ha-unfence", "ha-drain", "ha-undrain", "ha-attest-host-dead",
-            "ha-attest-clear", "ha-dc-remove-dead", "ha-dc-rejoin", "ha-dc-restart"}
+            "ha-attest-clear", "ha-dc-remove-dead", "ha-dc-rejoin", "ha-dc-restart", "ha-dbcheck-backlinks"}
 READ_NONROOT = {"ha-status", "ha-rejoin-check"}
 
 
@@ -398,22 +399,153 @@ def rsyncd_stop():
             pass
 
 
-def sysvol_pull(dc, src):
-    """Pull SYSVOL into local DC dc from src ('local:<dc>' or 'rsync://ip/sysvol/'),
-    then let samba re-derive ownership/ACLs (sysvolreset). -X carries security.NTACL."""
-    dst = sysvol_dir(dc) + "/"
+# GPO inventory from a local DC's own sam.ldb (no network): live GPO containers and
+# tombstoned ones. The DIRECTORY decides which GPOs exist; SYSVOL only carries their files.
+GPO_INV_PROBE = r"""
+import json, re
+from samba import param
+from samba.samdb import SamDB
+from samba.auth import system_session
+import ldb
+lp = param.LoadParm(); lp.load_default()
+db = SamDB(url="/var/lib/samba/private/sam.ldb", lp=lp, session_info=system_session())
+pol = "CN=Policies,CN=System," + str(db.get_default_basedn())
+G = re.compile(r"\{[0-9A-Fa-f-]{36}\}")
+live = sorted(str(r["cn"][0]).upper() for r in db.search(base=pol, scope=ldb.SCOPE_ONELEVEL,
+              expression="(objectClass=groupPolicyContainer)", attrs=["cn"]))
+dead = set()
+for r in db.search(base="CN=Deleted Objects," + str(db.get_default_basedn()), scope=ldb.SCOPE_ONELEVEL,
+                   expression="(&(objectClass=groupPolicyContainer)(isDeleted=TRUE))", attrs=["cn"],
+                   controls=["show_deleted:1"]):
+    m = G.search(str(r["cn"][0]))
+    if m:
+        dead.add(m.group(0).upper())
+print(json.dumps({"live": live, "deleted": sorted(dead - set(live))}))
+"""
+
+
+def gpo_inventory(dc):
+    rc, out, err = run(["podman", "exec", "-i", dc, "python3", "-"], timeout=30, inp=GPO_INV_PROBE)
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def policies_rel():
+    """Policies directory relative to a DC's sysvol dir: <realm lower>/Policies."""
+    return os.path.join(conf()["realm"].lower(), "Policies")
+
+
+def _gpo_dirs(path):
+    try:
+        return {d.upper(): d for d in os.listdir(path) if d.startswith("{")}
+    except OSError:
+        return {}
+
+
+def _source_gpo_dirs(src):
+    """GPO folder names (upper) the pull source has, or None if it cannot be listed."""
     if src.startswith("local:"):
-        source = sysvol_dir(src[6:]) + "/"
-    else:
-        source = src
-    rc, out, err = run(["rsync", "-rlptD", "-X", "-H", "--delete-after", "--exclude=DfsrPrivate",
-                        "--timeout=30", "--contimeout=5", source, dst], timeout=240)
+        return set(_gpo_dirs(os.path.join(sysvol_dir(src[6:]), policies_rel())))
+    rc, out, err = run(["rsync", "--list-only", "--contimeout=5", "--timeout=30",
+                        src.rstrip("/") + "/" + policies_rel() + "/"], timeout=60)
     if rc != 0:
-        return False, (err or out).strip()[:300]
+        return None
+    return {l.split()[-1].upper() for l in out.splitlines() if l.split() and l.split()[-1].startswith("{")}
+
+
+def sysvol_pull(dc, src, inv=None):
+    """Pull SYSVOL into local DC dc from src ('local:<dc>' or 'rsync://ip/sysvol/'),
+    then let samba re-derive ownership/ACLs (sysvolreset). -X carries security.NTACL.
+    Returns (ok, why, info). info: rescued = GPO folders kept because the GPO is LIVE in the
+    directory but the source lacks its folder (a GPO created in the writer's last SYSVOL
+    interval before it died: stress S5, 2026-11-24 — the failback pull used to delete the only
+    copy); gpt_missing = live GPOs whose folder exists nowhere here (sysvolreset aborts on them)."""
+    dst = sysvol_dir(dc) + "/"
+    source = (sysvol_dir(src[6:]) + "/") if src.startswith("local:") else src
+    info = {"rescued": [], "gpt_missing": []}
+    inv = inv if inv is not None else (gpo_inventory(dc) if container_state(dc) == "running" else None)
+    protect = []
+    if inv:
+        # never delete the folder of a GPO the directory says exists: it is kept when the source
+        # lacks it, and synced normally (sender wins for its contents) when the source has it
+        local = _gpo_dirs(os.path.join(sysvol_dir(dc), policies_rel()))
+        for g in inv["live"]:
+            if g in local:
+                protect += ["--filter", "P /%s/%s/" % (policies_rel(), local[g])]
+    # --contimeout is only valid against an rsync DAEMON: with it, every LOCAL pull (dc2 <- dc1)
+    # failed as a usage error (PR #67 -> stress pass 2: dc4 never got 65 GPO folders)
+    daemon = ["--contimeout=5"] if source.startswith("rsync://") else []
+    rc, out, err = run(["rsync", "-rlptD", "-X", "-H", "--delete-after", "--exclude=DfsrPrivate"] + protect +
+                       ["--timeout=30"] + daemon + [source, dst], timeout=240)
+    if rc != 0:
+        return False, (err or out).strip()[:600], info
+    if inv:
+        have = _source_gpo_dirs(src)
+        local = _gpo_dirs(os.path.join(sysvol_dir(dc), policies_rel()))
+        if have is not None:
+            info["rescued"] = sorted(g for g in inv["live"] if g in local and g not in have)
+        info["gpt_missing"] = sorted(g for g in inv["live"] if g not in local)
+        if info["rescued"]:
+            audit("sysvol_gpt_rescued", dc=dc, src=src, gpos=info["rescued"])
     rc2, out2, err2 = dc_exec(dc, "samba-tool ntacl sysvolreset", timeout=180)
     if rc2 != 0:
-        return False, "sysvolreset: " + (err2 or out2).strip()[:200]
-    return True, ""
+        msg = (err2 or out2).strip()
+        m = re.search(r"Could not access [^:]*/Policies/(\{[0-9A-Fa-f-]{36}\})", msg)
+        if m:
+            # a live GPO without its folder anywhere here: sysvolreset aborts on the first one.
+            # The files that ARE here kept their NTACLs (rsync -X), so the pull stands; the gap
+            # is reported (and alarmed), never allowed to block replication or a failback.
+            g = m.group(1).upper()
+            if g not in info["gpt_missing"]:
+                info["gpt_missing"].append(g)
+            info["acl_reset"] = "partial"
+        else:
+            return False, "sysvolreset: " + msg[-600:], info
+    if info["gpt_missing"]:
+        audit("sysvol_gpt_missing", dc=dc, gpos=info["gpt_missing"])
+    return True, "", info
+
+
+def sysvol_hash_excluding(path, gpos):
+    """sysvol_hash without the listed GPO folders (rescued ones the source never had)."""
+    if not gpos:
+        return sysvol_hash(path)
+    skip = {g.upper() for g in gpos}
+    h = hashlib.sha256()
+    if not os.path.isdir(path):
+        return None
+    pol = os.path.join(path, policies_rel())
+    for root, dirs, files in os.walk(path):
+        dirs[:] = sorted(d for d in dirs if d != "DfsrPrivate" and not (root == pol and d.upper() in skip))
+        for fn in sorted(files):
+            fp = os.path.join(root, fn)
+            rel = os.path.relpath(fp, path)
+            h.update(rel.encode() + b"\0")
+            try:
+                with open(fp, "rb") as f:
+                    h.update(hashlib.sha256(f.read()).digest())
+            except OSError:
+                h.update(b"?")
+    return h.hexdigest()
+
+
+def sysvol_remove_strays(wdc):
+    """On the WRITER only: remove folders of GPOs the directory has TOMBSTONED (deleted on a DC
+    whose SYSVOL never reached here). Positive evidence only: a folder whose GPO is merely absent
+    from the directory (not replicated yet) is never touched."""
+    inv = gpo_inventory(wdc)
+    if not inv:
+        return []
+    pol = os.path.join(sysvol_dir(wdc), policies_rel())
+    local = _gpo_dirs(pol)
+    gone = [local[g] for g in inv["deleted"] if g in local and g not in inv["live"]]
+    for d in gone:
+        shutil.rmtree(os.path.join(pol, d), ignore_errors=True)
+    if gone:
+        audit("sysvol_gpt_stray_removed", dc=wdc, folders=gone)
+    return gone
 
 
 def sysvol_cycle():
@@ -448,12 +580,15 @@ def sysvol_cycle():
                 if d == wdc:
                     continue
                 src = ("local:" + wdc) if whost == c["host_id"] else "rsync://%s/sysvol/" % c["peer_hosts"][whost]
-                ok, why = sysvol_pull(d, src)
-                res["pulled"].append({"dc": d, "ok": ok, "err": why})
+                ok, why, info = sysvol_pull(d, src)
+                res["pulled"].append({"dc": d, "ok": ok, "err": why, "rescued": info["rescued"],
+                                      "gpt_missing": info["gpt_missing"]})
     # serving is READ-ONLY and follows the lease only: a manual fence or a drain stops
     # WRITES (GPO edits), but the failback's final pull still needs this copy
     serve_ok = whost == c["host_id"] and lv["valid"] and lv["holder"] == c["host_id"]
     if serve_ok and res["action"] == "replicate":
+        if lv["may_write"] and container_state(wdc) == "running":
+            res["strays_removed"] = sysvol_remove_strays(wdc)
         rsyncd_serve(wdc)
     elif not serve_ok:
         rsyncd_stop()
@@ -770,11 +905,17 @@ def v_sysvol_writer(a, env):
         src = "rsync://%s/sysvol/" % c["peer_hosts"][W["host"]]
     else:
         raise Refused("refused", "no current writer to pull from")
-    ok, why = sysvol_pull(dc, src)
+    ok, why, info = sysvol_pull(dc, src)
     if not ok:
         raise Refused("refused", "pull from writer failed: %s" % why, True)
-    audit("sysvol_writer_" + phase, dc=dc, src=src)
-    return {"dc": dc, "phase": phase, "pulled_from": src, "hash": sysvol_hash(sysvol_dir(dc))}
+    audit("sysvol_writer_" + phase, dc=dc, src=src, rescued=info["rescued"], gpt_missing=info["gpt_missing"])
+    # hash = this DC's SYSVOL WITHOUT the rescued folders, so the controller's check against the
+    # outage writer still compares like with like; the rescued ones reach every DC once this DC
+    # is the writer again (their GPOs are live, so every receiver keeps/pulls them)
+    return {"dc": dc, "phase": phase, "pulled_from": src,
+            "hash": sysvol_hash_excluding(sysvol_dir(dc), info["rescued"]),
+            "hash_full": sysvol_hash(sysvol_dir(dc)),
+            "rescued": info["rescued"], "gpt_missing": info["gpt_missing"]}
 
 
 def v_fence(a, env):
@@ -912,7 +1053,28 @@ def v_dc_restart(a, env):
     return {"restarted": dc}
 
 
-VERBS = {"ha-status": v_status, "ha-dc-restart": v_dc_restart, "ha-health": v_health, "ha-lease-renew": v_lease_renew,
+def v_dbcheck_backlinks(a, env):
+    """After DC `dc` was rebuilt under the same name: every local DC is left missing the
+    serverReferenceBL backlink on dc's computer object (dbcheck: 1 error; stress S2 failed on
+    it, 2026-11-24). Fix exactly that: dbcheck --fix on dc's server object (base scope) only."""
+    dc = a["dc"]
+    if not re.match(r"^[A-Za-z0-9-]{1,15}$", dc):
+        raise Refused("bad_request", "not a DC name: %r" % dc)
+    out = []
+    for d in sorted(conf()["dcs"]):
+        if container_state(d) != "running":
+            continue
+        rc, o, e = dc_exec(d, "dn=$(ldbsearch -H /var/lib/samba/private/sam.ldb -b \"$(ldbsearch -H "
+                              "/var/lib/samba/private/sam.ldb -s base -b '' configurationNamingContext | "
+                              "sed -n 's/^configurationNamingContext: //p')\" '(&(objectClass=server)(cn=%s))' dn | "
+                              "sed -n 's/^dn: //p' | head -1); [ -n \"$dn\" ] && samba-tool dbcheck \"$dn\" "
+                              "--scope=base --cross-ncs --fix --yes 2>&1 | tail -2" % dc, timeout=120)
+        out.append({"dc": d, "rc": rc, "out": (o or e).strip()[-200:]})
+    audit("dbcheck_backlinks", rebuilt=dc, result=out)
+    return {"rebuilt": dc, "checked": out}
+
+
+VERBS = {"ha-dbcheck-backlinks": v_dbcheck_backlinks, "ha-status": v_status, "ha-dc-restart": v_dc_restart, "ha-health": v_health, "ha-lease-renew": v_lease_renew,
          "ha-placement-apply": v_placement_apply, "ha-fsmo-transfer": v_fsmo_transfer,
          "ha-fsmo-seize": v_fsmo_seize, "ha-sysvol-writer": v_sysvol_writer, "ha-fence": v_fence,
          "ha-unfence": v_unfence, "ha-drain": v_drain, "ha-undrain": v_undrain,
