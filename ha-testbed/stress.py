@@ -176,27 +176,66 @@ def S3():
     D.record("S3-agent-killed", ok=bool(s) and froze and not pulls_from_a, b_froze_or_moved=froze, healthy_after_s=took)
 
 
+S4_CHUNK = 250          # records per ldbadd: well inside one 500-RID pool
+S4_JOB_S = 480         # one runner job stays under the VM runner's 600 s TIMEOUT
+
+
+def _s4_writer(vm, dc, tag, users, groups, comps, deadline):
+    """Bulk-add through sam.ldb in chunks, resuming after RID-pool exhaustion.
+    One ldbadd of all 12 500 records stopped after 688 (2026-11-27): a DC's 500-RID pool runs
+    out and the next pool arrives asynchronously from the RID master, so the add fails meanwhile.
+    Each chunk is retried from the first record not yet added until the deadline."""
+    lines = []
+    for i in range(users):
+        lines.append("dn: CN=s4%s-u%05d,CN=Users,DC=ha,DC=test,DC=lab\nobjectClass: user\nsAMAccountName: s4%su%05d\n" % (tag, i, tag, i))
+    for i in range(groups):
+        lines.append("dn: CN=s4%s-g%05d,CN=Users,DC=ha,DC=test,DC=lab\nobjectClass: group\nsAMAccountName: s4%sg%05d\n" % (tag, i, tag, i))
+    for i in range(comps):
+        lines.append("dn: CN=S4%sC%04d,CN=Computers,DC=ha,DC=test,DC=lab\nobjectClass: computer\nsAMAccountName: S4%sC%04d$\nuserAccountControl: 4096\n" % (tag.upper(), i, tag.upper(), i))
+    d = "/tmp/s4-%s.d" % tag
+    body = "rm -rf %s; mkdir -p %s\n" % (d, d)
+    for k in range(0, len(lines), S4_CHUNK):
+        body += "cat > %s/%05d.ldif <<'L'\n%sL\n" % (d, k // S4_CHUNK, "\n".join(lines[k:k + S4_CHUNK]))
+    body += "ls %s | wc -l\n" % d
+    D.rootjob("adlha-s4-prep-" + tag, body, vm=vm, timeout=300)
+    loop = r"""d=%s; end=$((SECONDS+%d)); retries=0
+for f in $(ls $d 2>/dev/null | sort); do
+  while [ -s $d/$f ]; do
+    [ $SECONDS -ge $end ] && break 2
+    podman cp $d/$f %s:/tmp/s4c.ldif
+    out=$(podman exec %s ldbadd -H /var/lib/samba/private/sam.ldb /tmp/s4c.ldif 2>&1)
+    n=$(echo "$out" | sed -n 's/^Added \([0-9]*\) records.*/\1/p' | tail -1); n=${n:-0}
+    total=$(grep -c '^dn:' $d/$f)
+    if [ "$n" -ge "$total" ]; then rm -f $d/$f; break; fi
+    awk -v skip="$n" 'BEGIN{RS="";ORS="\n\n"} NR>skip' $d/$f > $d/$f.t && mv $d/$f.t $d/$f
+    retries=$((retries+1)); echo "retry $f added=$n/$total: $(echo "$out" | grep -v '^Added' | tail -1 | cut -c1-120)" | tail -1 >&2
+    sleep 5
+  done
+done
+echo "left $(ls $d | wc -l) retries $retries"
+""" % (d, S4_JOB_S, dc, dc)
+    retries, last = 0, ""
+    while now() < deadline:
+        rc, out, err = D.rootjob("adlha-s4-" + tag, loop, vm=vm, timeout=S4_JOB_S + 120)
+        m = [l for l in out.splitlines() if l.startswith("left ")]
+        last = (m[-1] if m else out.strip()[-200:])
+        if m:
+            retries += int(m[-1].split()[3])
+            if m[-1].split()[1] == "0":
+                return {"done": True, "retries": retries, "last": last}
+    return {"done": False, "retries": retries, "last": last}
+
+
 def S4(users):
+    import threading
     groups, comps = users // 5, users // 20
     t0 = now()
-    procs = []
-    for vm, dc, tag in (("adl-ha-a", "dc2", "a"), ("adl-ha-b", "dc4", "b")):
-        body = ("cat > /tmp/s4-%s.ldif <<'L'\n" % tag)
-        lines = []
-        for i in range(users):
-            lines.append("dn: CN=s4%s-u%05d,CN=Users,DC=ha,DC=test,DC=lab\nobjectClass: user\nsAMAccountName: s4%su%05d\n" % (tag, i, tag, i))
-        for i in range(groups):
-            lines.append("dn: CN=s4%s-g%05d,CN=Users,DC=ha,DC=test,DC=lab\nobjectClass: group\nsAMAccountName: s4%sg%05d\n" % (tag, i, tag, i))
-        for i in range(comps):
-            lines.append("dn: CN=S4%sC%04d,CN=Computers,DC=ha,DC=test,DC=lab\nobjectClass: computer\nsAMAccountName: S4%sC%04d$\nuserAccountControl: 4096\n" % (tag.upper(), i, tag.upper(), i))
-        body += "\n".join(lines) + "L\n"
-        body += ("t=$(date +%%s); podman cp /tmp/s4-%s.ldif %s:/tmp/s4.ldif && podman exec %s ldbadd -H /var/lib/samba/private/sam.ldb /tmp/s4.ldif 2>&1 | tail -1; "
-                 "echo took $(( $(date +%%s)-t ))s\n" % (tag, dc, dc))
-        procs.append(subprocess.Popen([D.RJ, "-t", "7200", "-M", vm, "adlha-s4-" + tag], stdin=subprocess.PIPE,
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
-        procs[-1].stdin.write(body)
-        procs[-1].stdin.close()
-    outs = [p.communicate(timeout=7300)[0] for p in procs]
+    res = {}
+    ths = [threading.Thread(target=lambda a=a: res.__setitem__(a[2], _s4_writer(*a, users, groups, comps, t0 + 7200)))
+           for a in (("adl-ha-a", "dc2", "a"), ("adl-ha-b", "dc4", "b"))]
+    [t.start() for t in ths]
+    [t.join() for t in ths]
+    outs = [json.dumps(res.get(t)) for t in ("a", "b")]
     t_written = now()
     want = 2 * (users + groups + comps)
 
@@ -207,10 +246,12 @@ def S4(users):
             return int([l for l in out.splitlines() if l.strip().isdigit()][0])
         except IndexError:
             return 0
-    got, t_conv = D.wait_for(lambda: (lambda c: c if c >= want else None)(counted()), 7200, step=30)
+    got, t_conv = D.wait_for(lambda: (lambda c: c if c >= want else None)(counted()), 7200, step=30) \
+        if all((res.get(t) or {}).get("done") for t in ("a", "b")) else (None, None)
     s = D.snapshot()
     fails = sum(x["fails"] for x in s["dcs"].values())
-    D.record("S4", ok=bool(got) and fails == 0, users=users, groups=groups, computers=comps, objects_expected=want,
+    D.record("S4", ok=bool(got) and fails == 0 and all((res.get(t) or {}).get("done") for t in ("a", "b")),
+             writers=res, users=users, groups=groups, computers=comps, objects_expected=want,
              objects_on_dc1=got or counted(), write_s=round(t_written - t0, 1), converged_after_write_s=t_conv,
              repl_failures=fails, writer_out=[o.strip()[-120:] for o in outs])
 
