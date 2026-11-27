@@ -47,6 +47,23 @@ EOF
   done
 fi
 
+# the snapshot must itself be dbcheck-clean: S2 judges dbcheck after its run, and an error carried by
+# the snapshot fails S2 on every pass (2026-11-27: ha-baseline had dc3 missing DC4's serverReferenceBL
+# from a rebuild before the snapshot was taken; passes 2 and 3 both failed S2 on it)
+echo "== dbcheck (the snapshot must be clean)"
+dirty=0
+for pair in adl-ha-a:dc1 adl-ha-a:dc2 adl-ha-b:dc3 adl-ha-b:dc4; do
+  vm=${pair%%:*}; dc=${pair#*:}
+  out=$("$RJ" -t 900 -M "$vm" "adlha-reset-dbcheck-$dc" <<<"podman exec $dc samba-tool dbcheck --cross-ncs 2>&1 | grep -E '^ERROR|^Checked [0-9]+ objects' | head -6")
+  echo "$out" | grep -E '^(ERROR|Checked)' | sed "s/^/   $dc: /"
+  echo "$out" | grep -qE '^Checked [0-9]+ objects \(0 errors\)' || dirty=1
+done
+if [ "$dirty" = 1 ]; then
+  echo "snapshot $SNAP is not dbcheck-clean: fix it (ha-dbcheck-backlinks for a rebuilt DC), then retake it" \
+       "with tb.sh snapshot $SNAP; controller NOT started" >&2
+  exit 2
+fi
+
 echo "== auth load"
 "$HERE/tb-load.sh" start >/dev/null 2>&1 && echo loadgen started
 echo "== controller: fresh state, detached"
