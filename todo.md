@@ -149,7 +149,7 @@ until the stress program (design §12) passes and the owner reviews the results.
   - 2026-11-23: pass 1 (2026-11-11) S1 49/50, S10 100/100, S2 failed (USN false positives, fixed PR #59). Failover
     classification fixed (design F11/F12): S1 ×10 samples `classify-1` 10/10 (median 60 s, tail 159 s) and, after the
     sam.ldb repsFrom read, `classify-2` 10/10 in 51–57 s. Testbed snapshot `ha-baseline` (2026-11-19). Next: full
-    pass from `ha-baseline` (`tb-reset.sh ha-baseline && run-stress.sh stress-2`), three clean passes in a row.
+    pass from `ha-baseline-bl` (`tb-reset.sh ha-baseline-bl && run-stress.sh stress-N`; `ha-baseline` carried backlink errors, F17), three clean passes in a row.
   - Testbed gap: B's isolated edy has no DNS listener on sh0 (10.31.0.12) and A's DCs cannot reach A's edy (macvlan),
     so testbed DCs have no working forwarder. Not needed by the stress rows; fix with the edy-proxy-go dev session.
 - [ ] **Phase 4: edy controller** (edy-proxy-go session, not this repo; feature requests relayed 2026-11-11 to the
