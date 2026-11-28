@@ -446,6 +446,15 @@ def main():
         prof = "stress"
         if "--timers" in sys.argv:
             prof = sys.argv[sys.argv.index("--timers") + 1]
+        # ONE controller per testbed (2026-11-28: a second one ran unseen for 8 h and the two
+        # fought over the lease: "lease epoch 3 < host epoch 434"). The lock lives beside STATE,
+        # not in it: tb-reset.sh removes STATE while a stale controller may still hold it open.
+        import fcntl
+        lock = open(os.path.join(os.path.dirname(os.path.abspath(STATE)), "ha-sim.lock"), "a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            sys.exit("another ha-sim controller holds %s" % lock.name)
         Sim(TIMERS[prof]).run()
     elif cmd == "state":
         print(json.dumps(load(), indent=1, sort_keys=True))

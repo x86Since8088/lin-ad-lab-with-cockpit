@@ -12,8 +12,10 @@ RJ=/home/eddie/.claude/skills/root-job-runner/scripts/rj
 SNAP=${1:?usage: tb-reset.sh SNAPSHOT}
 SIM_STATE=$HOME/.local/state/adl-ha/ha-sim
 # anchored to the processes' own argv: an unanchored pattern also matched any shell whose command
-# line merely MENTIONS run-stress.sh (e.g. `tb-reset.sh … && run-stress.sh …`), i.e. its own caller
-if pgrep -f '^python3 -u ([^ ]*/)?ha-sim\.py run' >/dev/null || pgrep -f '^(/usr/bin/|/bin/)?bash ([^ ]*/)?run-stress\.sh( |$)' >/dev/null; then
+# line merely MENTIONS run-stress.sh (e.g. `tb-reset.sh … && run-stress.sh …`), i.e. its own caller.
+# The interpreter may be a full path: stress.py starts the controller as /usr/bin/python3 -u /…/ha-sim.py
+# (2026-11-28: the old pattern missed that one, and a second controller ran beside the new one)
+if pgrep -f '^([^ ]*/)?python3 -u ([^ ]*/)?ha-sim\.py run' >/dev/null || pgrep -f '^(/usr/bin/|/bin/)?bash ([^ ]*/)?run-stress\.sh( |$)' >/dev/null; then
   echo "stop the controller and any stress run first" >&2; exit 1
 fi
 
