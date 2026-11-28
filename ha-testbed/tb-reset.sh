@@ -49,23 +49,6 @@ EOF
   done
 fi
 
-# the snapshot must itself be dbcheck-clean: S2 judges dbcheck after its run, and an error carried by
-# the snapshot fails S2 on every pass (2026-11-27: ha-baseline had dc3 missing DC4's serverReferenceBL
-# from a rebuild before the snapshot was taken; passes 2 and 3 both failed S2 on it)
-echo "== dbcheck (the snapshot must be clean)"
-dirty=0
-for pair in adl-ha-a:dc1 adl-ha-a:dc2 adl-ha-b:dc3 adl-ha-b:dc4; do
-  vm=${pair%%:*}; dc=${pair#*:}
-  out=$("$RJ" -t 900 -M "$vm" "adlha-reset-dbcheck-$dc" <<<"podman exec $dc samba-tool dbcheck --cross-ncs 2>&1 | grep -E '^ERROR|^Checked [0-9]+ objects' | head -6")
-  echo "$out" | grep -E '^(ERROR|Checked)' | sed "s/^/   $dc: /"
-  echo "$out" | grep -qE '^Checked [0-9]+ objects \(0 errors\)' || dirty=1
-done
-if [ "$dirty" = 1 ]; then
-  echo "snapshot $SNAP is not dbcheck-clean: fix it (ha-dbcheck-backlinks for a rebuilt DC), then retake it" \
-       "with tb.sh snapshot $SNAP; controller NOT started" >&2
-  exit 2
-fi
-
 echo "== auth load"
 "$HERE/tb-load.sh" start >/dev/null 2>&1 && echo loadgen started
 echo "== controller: fresh state, detached"
@@ -79,3 +62,26 @@ for i in $(seq 1 60); do
   sleep 5
 done
 python3 "$HERE/drills.py" check | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s["mode"], s["holder"], "epoch", s["epoch"]); [print(" ", k, v["state"], v["roles"], "fails", v["fails"], "sv", v["sv"]) for k, v in sorted(s["dcs"].items())]'
+
+# the snapshot must itself be dbcheck-clean: S2 judges dbcheck after its run, and an error carried by
+# the snapshot fails S2 on every pass (2026-11-27: ha-baseline had dc2/dc3 missing serverReferenceBL
+# backlinks from rebuilds before the snapshot was taken; passes 2 and 3 both failed S2 on it).
+# Checked once the controller reports healthy: the DCs run --restart=no under the agent, so after a
+# VM boot one may not be running before the controller places it (2026-11-28: dc1 was down, dbcheck
+# printed nothing and the old grep, under set -e, ended this script silently).
+echo "== dbcheck (the snapshot must be clean)"
+dirty=0
+for pair in adl-ha-a:dc1 adl-ha-a:dc2 adl-ha-b:dc3 adl-ha-b:dc4; do
+  vm=${pair%%:*}; dc=${pair#*:}
+  out=$("$RJ" -t 900 -M "$vm" "adlha-reset-dbcheck-$dc" <<<"podman exec $dc samba-tool dbcheck --cross-ncs 2>&1 | grep -E '^ERROR|^Checked [0-9]+ objects|^Error' | head -6" || true)
+  shown=$(echo "$out" | grep -E '^(ERROR|Checked|Error)' || true)
+  echo "${shown:-no dbcheck result: ${out:0:200}}" | sed "s/^/   $dc: /"
+  echo "$out" | grep -qE '^Checked [0-9]+ objects \(0 errors\)' || dirty=1
+done
+if [ "$dirty" = 1 ]; then
+  pkill -f '^([^ ]*/)?python3 -u ([^ ]*/)?ha-sim\.py run' || true
+  "$HERE/tb-load.sh" stop >/dev/null 2>&1 || true
+  echo "snapshot $SNAP is not dbcheck-clean (or a DC gave no result): fix it (ha-dbcheck-backlinks for a" \
+       "rebuilt DC), then retake it with tb.sh snapshot NAME; controller and load STOPPED" >&2
+  exit 2
+fi
